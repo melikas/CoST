@@ -115,7 +115,7 @@ class CoSTModel(nn.Module):
         logits /= self.T
 
         # labels: positive key indicators - first dim of each batch
-        labels = torch.zeros(logits.shape[0], dtype=torch.long).cuda()
+        labels = torch.zeros(logits.shape[0], dtype=torch.long, device=logits.device)
         loss = F.cross_entropy(logits, labels)
 
         return loss
@@ -162,10 +162,11 @@ class CoSTModel(nn.Module):
         _, k_s = self.encoder_q(x_k)
         k_s = F.normalize(k_s, dim=-1)
 
-        q_s_freq = fft.rfft(q_s, dim=1)
-        k_s_freq = fft.rfft(k_s, dim=1)
-        q_s_amp, q_s_phase = self.convert_coeff(q_s_freq)
-        k_s_amp, k_s_phase = self.convert_coeff(k_s_freq)
+        with torch.autocast(device_type='cuda', enabled=False):
+            q_s_freq = fft.rfft(q_s.float(), dim=1)
+            k_s_freq = fft.rfft(k_s.float(), dim=1)
+            q_s_amp, q_s_phase = self.convert_coeff(q_s_freq)
+            k_s_amp, k_s_phase = self.convert_coeff(k_s_freq)
 
         seasonal_loss = self.instance_contrastive_loss(q_s_amp, k_s_amp) + \
                         self.instance_contrastive_loss(q_s_phase,k_s_phase)
@@ -206,6 +207,7 @@ class CoST:
                  output_dims: int = 320,
                  hidden_dims: int = 64,
                  depth: int = 10,
+                 backbone: str = 'tcn',
                  device: 'str' ='cuda',
                  lr: float = 0.001,
                  batch_size: int = 16,
@@ -229,6 +231,7 @@ class CoST:
             kernels=kernels,
             length=max_train_length,
             hidden_dims=hidden_dims, depth=depth,
+            backbone=backbone,
         ).to(self.device)
 
         self.cost = CoSTModel(
@@ -296,7 +299,8 @@ class CoST:
 
                 optimizer.zero_grad()
 
-                loss = self.cost(x_q, x_k)
+                with torch.autocast(device_type='cuda', dtype=torch.bfloat16):
+                    loss = self.cost(x_q, x_k)
 
                 loss.backward()
                 optimizer.step()

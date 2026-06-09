@@ -60,10 +60,11 @@ class BandedFourierLayer(nn.Module):
     def forward(self, input):
         # input - b t d
         b, t, _ = input.shape
-        input_fft = fft.rfft(input, dim=1)
-        output_fft = torch.zeros(b, t // 2 + 1, self.out_channels, device=input.device, dtype=torch.cfloat)
-        output_fft[:, self.start:self.end] = self._forward(input_fft)
-        return fft.irfft(output_fft, n=input.size(1), dim=1)
+        with torch.autocast(device_type='cuda', enabled=False):
+            input_fft = fft.rfft(input.float(), dim=1)
+            output_fft = torch.zeros(b, t // 2 + 1, self.out_channels, device=input.device, dtype=torch.cfloat)
+            output_fft[:, self.start:self.end] = self._forward(input_fft)
+            return fft.irfft(output_fft, n=input.size(1), dim=1)
 
     def _forward(self, input):
         output = torch.einsum('bti,tio->bto', input[:, self.start:self.end], self.weight)
@@ -76,12 +77,50 @@ class BandedFourierLayer(nn.Module):
         nn.init.uniform_(self.bias, -bound, bound)
 
 
+class TransformerFeatureExtractor(nn.Module):
+    """Transformer backbone alternative to the dilated-conv encoder (CoST Table 4).
+
+    Keeps the same channels-first interface as DilatedConvEncoder, mapping
+    (B, hidden_dims, T) -> (B, output_dims, T), so the rest of CoSTEncoder
+    (TFD/SFD) is unchanged. Convolutions are position-aware on their own, so here
+    we add a sinusoidal positional encoding before the self-attention layers.
+    """
+    def __init__(self, hidden_dims, output_dims, depth=10, n_heads=8,
+                 dropout=0.1, max_len=2048):
+        super().__init__()
+        n_heads = n_heads if output_dims % n_heads == 0 else 1
+        self.input_proj = nn.Linear(hidden_dims, output_dims)
+        self.register_buffer('pe', self._sinusoidal_pe(max_len, output_dims),
+                             persistent=False)
+        layer = nn.TransformerEncoderLayer(
+            d_model=output_dims, nhead=n_heads, dim_feedforward=4 * output_dims,
+            dropout=dropout, activation='gelu', batch_first=True,
+        )
+        self.transformer = nn.TransformerEncoder(layer, num_layers=depth)
+
+    @staticmethod
+    def _sinusoidal_pe(max_len, d):
+        pe = torch.zeros(max_len, d)
+        pos = torch.arange(max_len, dtype=torch.float32).unsqueeze(1)
+        div = torch.exp(torch.arange(0, d, 2, dtype=torch.float32) * (-math.log(10000.0) / d))
+        pe[:, 0::2] = torch.sin(pos * div)
+        pe[:, 1::2] = torch.cos(pos * div[: pe[:, 1::2].shape[1]])
+        return pe
+
+    def forward(self, x):                    # x: B x hidden_dims x T
+        x = x.transpose(1, 2)                # B x T x hidden_dims
+        x = self.input_proj(x)               # B x T x output_dims
+        x = x + self.pe[:x.size(1)].unsqueeze(0).to(x.dtype)
+        x = self.transformer(x)              # B x T x output_dims
+        return x.transpose(1, 2)             # B x output_dims x T
+
+
 class CoSTEncoder(nn.Module):
     def __init__(self, input_dims, output_dims,
                  kernels: List[int],
                  length: int,
                  hidden_dims=64, depth=10,
-                 mask_mode='binomial'):
+                 mask_mode='binomial', backbone='tcn'):
         super().__init__()
 
         component_dims = output_dims // 2
@@ -91,13 +130,21 @@ class CoSTEncoder(nn.Module):
         self.component_dims = component_dims
         self.hidden_dims = hidden_dims
         self.mask_mode = mask_mode
+        self.backbone = backbone
         self.input_fc = nn.Linear(input_dims, hidden_dims)
 
-        self.feature_extractor = DilatedConvEncoder(
-            hidden_dims,
-            [hidden_dims] * depth + [output_dims],
-            kernel_size=3
-        )
+        if backbone == 'transformer':
+            self.feature_extractor = TransformerFeatureExtractor(
+                hidden_dims, output_dims, depth=depth
+            )
+        elif backbone == 'tcn':
+            self.feature_extractor = DilatedConvEncoder(
+                hidden_dims,
+                [hidden_dims] * depth + [output_dims],
+                kernel_size=3
+            )
+        else:
+            raise ValueError(f"backbone must be 'tcn' or 'transformer', got: {backbone}")
 
         self.repr_dropout = nn.Dropout(p=0.1)
 
