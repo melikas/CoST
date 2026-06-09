@@ -1,0 +1,15 @@
+# Large datasets - exclude from version control
+datasets/*.csv
+datasets/HRD_RAW_MinuteLevel.csv
+
+# Python cache
+__pycache__/
+*.pyc
+.pytest_cache/
+
+# IDE
+.vscode/
+.idea/
+
+# Results (optional - اگر نخواهی push کنی)
+# results_hrd/
