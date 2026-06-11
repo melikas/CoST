@@ -1,0 +1,51 @@
+{
+  "backbone": "transformer",
+  "pe": "tpe",
+  "window_level": {
+    "auc_roc": 0.5614896536353315,
+    "accuracy": 0.5784061696658098,
+    "f1": 0.6646216768916156,
+    "threshold": 0.27499999999999997
+  },
+  "participant_level": {
+    "auc_roc": 0.6590909090909091,
+    "accuracy": 0.6666666666666666,
+    "f1": 0.7567567567567568,
+    "threshold": 0.27499999999999997
+  },
+  "n_test_windows": 778,
+  "n_test_participants": 27,
+  "n_pretrain_windows": 4389,
+  "n_finetune_windows": 2025,
+  "pretrain_seconds": 612.496474981308,
+  "seq_len": 672,
+  "n_features": 15,
+  "config": {
+    "sensor_csv": "datasets/HRD_RAW_MinuteLevel.csv",
+    "label_col": "depression_status_endpoint",
+    "window_hours": 168,
+    "bin_minutes": 15,
+    "max_missing": 0.3,
+    "max_window_missing": 0.3,
+    "no_zscore": false,
+    "test_frac": 0.3,
+    "val_frac": 0.25,
+    "backbone": "transformer",
+    "pe": "tpe",
+    "repr_dims": 240,
+    "hidden_dims": 48,
+    "depth": 6,
+    "kernels": null,
+    "alpha": 0.0005,
+    "max_train_length": null,
+    "batch_size": 64,
+    "lr": 0.001,
+    "iters": 600,
+    "epochs": null,
+    "seed": 42,
+    "gpu": 0,
+    "max_threads": null,
+    "output_dir": "results_hrd",
+    "run_id": "62749320"
+  }
+}

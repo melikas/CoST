@@ -208,6 +208,7 @@ class CoST:
                  hidden_dims: int = 64,
                  depth: int = 10,
                  backbone: str = 'tcn',
+                 pe: str = 'sinusoidal',
                  device: 'str' ='cuda',
                  lr: float = 0.001,
                  batch_size: int = 16,
@@ -231,7 +232,7 @@ class CoST:
             kernels=kernels,
             length=max_train_length,
             hidden_dims=hidden_dims, depth=depth,
-            backbone=backbone,
+            backbone=backbone, pe=pe,
         ).to(self.device)
 
         self.cost = CoSTModel(

@@ -48,6 +48,74 @@ The detailed descriptions about the arguments are as following:
 
 (For descriptions of more arguments, run `python train.py -h`.)
 
+## Positional Encoding Experiments (HRD)
+
+This fork adds swappable **positional encodings (PE)** to the CoST Transformer
+backbone and extends **Time2Vec** to the TCN backbone, trained on the HRD
+wearable data for depression-endpoint classification via
+[train_hrd.py](train_hrd.py).
+
+**Code added**
+
+| File | Purpose |
+|------|---------|
+| [models/positional_encoding.py](models/positional_encoding.py) | All PE variants, the `Time2Vec` embedding, and the PE-aware self-attention / encoder layer. |
+| [models/encoder.py](models/encoder.py) | `TransformerFeatureExtractor` takes a `pe` argument; `CoSTEncoder` injects Time2Vec into the TCN hidden stream. |
+| [cost.py](cost.py) / [train_hrd.py](train_hrd.py) | `CoST(...)` and the `--pe` flag forward the choice to the encoder. |
+| [scripts/run_pe_experiments.sh](scripts/run_pe_experiments.sh) | Runs the full variant sweep. |
+| [scripts/collect_results.py](scripts/collect_results.py) | Aggregates every `metrics.json` into one comparison table. |
+| [scripts/test_pe_variants.py](scripts/test_pe_variants.py) | CPU smoke test for all variants. |
+
+**Supported encodings**
+
+*Absolute* (added to the embeddings): `sinusoidal` (Transformer baseline),
+`learnable`, `tape` (tAPE), `time2vec`. *Attention* (injected inside each
+self-attention layer): `rpe`, `erpe`, `tupe`, `convspe`, `tpe`.
+
+| Backbone | Valid `--pe` | Default |
+|----------|-------------|---------|
+| `transformer` | the 8 methods above **+** `time2vec` | `sinusoidal` |
+| `tcn` | `none` (baseline), `time2vec` | `none` |
+
+The TCN is position-aware through its dilated convolutions, so its baseline uses
+no PE; `time2vec` adds a learnable time embedding to the hidden stream.
+
+**Run a single variant**
+
+```bash
+python train_hrd.py --sensor-csv datasets/HRD_RAW_MinuteLevel.csv --backbone transformer --pe tupe
+python train_hrd.py --sensor-csv datasets/HRD_RAW_MinuteLevel.csv --backbone tcn --pe none       # TCN baseline
+python train_hrd.py --sensor-csv datasets/HRD_RAW_MinuteLevel.csv --backbone tcn --pe time2vec    # TCN + Time2Vec
+```
+
+Each run writes to `results_hrd/<run-id>/<backbone>_<pe>_seed<seed>/` (run-id is
+`$SLURM_JOB_ID` on the cluster, else `local`), containing `metrics.json` and
+`pretrain_loss.npy`, so variants never overwrite one another.
+
+**Run the full sweep** (Transformer×8 + Transformer/Time2Vec + TCN baseline + TCN/Time2Vec):
+
+```bash
+bash scripts/run_pe_experiments.sh datasets/HRD_RAW_MinuteLevel.csv results_hrd 42
+```
+
+**Compare results** (one table, sorted by participant-level AUC):
+
+```bash
+python scripts/collect_results.py --results-dir results_hrd --csv pe_summary.csv
+```
+
+**Verify the implementation** (CPU, seconds — builds, pretrains and encodes every variant):
+
+```bash
+python scripts/test_pe_variants.py
+```
+
+**Add a new PE:** implement it in
+[models/positional_encoding.py](models/positional_encoding.py) (an absolute term
+in `add_absolute_pe`, or a branch in `PESelfAttention.forward`) and list it in
+`ABSOLUTE_PES` / `ATTENTION_PES` plus the `--pe` choices in
+[train_hrd.py](train_hrd.py). No other wiring is needed.
+
 ## Main Results
 We perform experiments on five real-world public benchmark datasets, comparing against both state-of-the-art representation learning and end-to-end forecasting approaches. 
 CoST achieves state-of-the-art performance, beating the best performing end-to-end forecasting approach by 39.3% and 18.22% (MSE) in the multivariate and univariate settings

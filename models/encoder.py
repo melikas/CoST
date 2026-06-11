@@ -10,6 +10,12 @@ from einops import reduce, rearrange, repeat
 import numpy as np
 
 from .dilated_conv import DilatedConvEncoder
+from .positional_encoding import (
+    SUPPORTED_PES,
+    Time2VecPE,
+    PETransformerEncoderLayer,
+    add_absolute_pe,
+)
 
 
 def generate_continuous_mask(B, T, n=5, l=0.1):
@@ -82,36 +88,41 @@ class TransformerFeatureExtractor(nn.Module):
 
     Keeps the same channels-first interface as DilatedConvEncoder, mapping
     (B, hidden_dims, T) -> (B, output_dims, T), so the rest of CoSTEncoder
-    (TFD/SFD) is unchanged. Convolutions are position-aware on their own, so here
-    we add a sinusoidal positional encoding before the self-attention layers.
+    (TFD/SFD) is unchanged. Convolutions are position-aware on their own, so the
+    Transformer needs an explicit positional encoding; ``pe`` selects which one
+    (see ``models.positional_encoding.SUPPORTED_PES``). Absolute PEs are added to
+    the embeddings; attention PEs act inside every self-attention layer.
     """
     def __init__(self, hidden_dims, output_dims, depth=10, n_heads=8,
-                 dropout=0.1, max_len=2048):
+                 dropout=0.1, max_len=2048, pe='sinusoidal'):
         super().__init__()
+        pe = pe.lower()
+        if pe not in SUPPORTED_PES:
+            raise ValueError(f"pe must be one of {SUPPORTED_PES}, got: {pe}")
         n_heads = n_heads if output_dims % n_heads == 0 else 1
+        self.pe = pe
+        self.d_model = output_dims
+        self.max_len = max_len
         self.input_proj = nn.Linear(hidden_dims, output_dims)
-        self.register_buffer('pe', self._sinusoidal_pe(max_len, output_dims),
-                             persistent=False)
-        layer = nn.TransformerEncoderLayer(
-            d_model=output_dims, nhead=n_heads, dim_feedforward=4 * output_dims,
-            dropout=dropout, activation='gelu', batch_first=True,
-        )
-        self.transformer = nn.TransformerEncoder(layer, num_layers=depth)
-
-    @staticmethod
-    def _sinusoidal_pe(max_len, d):
-        pe = torch.zeros(max_len, d)
-        pos = torch.arange(max_len, dtype=torch.float32).unsqueeze(1)
-        div = torch.exp(torch.arange(0, d, 2, dtype=torch.float32) * (-math.log(10000.0) / d))
-        pe[:, 0::2] = torch.sin(pos * div)
-        pe[:, 1::2] = torch.cos(pos * div[: pe[:, 1::2].shape[1]])
-        return pe
+        self.in_drop = nn.Dropout(dropout)
+        # parameters used only by specific absolute PEs
+        self.lpe = nn.Embedding(max_len, output_dims) if pe == 'learnable' else None
+        self.t2v = Time2VecPE(output_dims, max_len) if pe == 'time2vec' else None
+        self.layers = nn.ModuleList([
+            PETransformerEncoderLayer(pe, output_dims, n_heads, max_len, dropout)
+            for _ in range(depth)
+        ])
+        self.norm = nn.LayerNorm(output_dims)
 
     def forward(self, x):                    # x: B x hidden_dims x T
         x = x.transpose(1, 2)                # B x T x hidden_dims
         x = self.input_proj(x)               # B x T x output_dims
-        x = x + self.pe[:x.size(1)].unsqueeze(0).to(x.dtype)
-        x = self.transformer(x)              # B x T x output_dims
+        x = add_absolute_pe(x, self.pe, self.d_model,
+                            learnable_pe=self.lpe, time2vec_pe=self.t2v)
+        x = self.in_drop(x)
+        for layer in self.layers:
+            x = layer(x)
+        x = self.norm(x)
         return x.transpose(1, 2)             # B x output_dims x T
 
 
@@ -120,7 +131,7 @@ class CoSTEncoder(nn.Module):
                  kernels: List[int],
                  length: int,
                  hidden_dims=64, depth=10,
-                 mask_mode='binomial', backbone='tcn'):
+                 mask_mode='binomial', backbone='tcn', pe='sinusoidal'):
         super().__init__()
 
         component_dims = output_dims // 2
@@ -131,13 +142,24 @@ class CoSTEncoder(nn.Module):
         self.hidden_dims = hidden_dims
         self.mask_mode = mask_mode
         self.backbone = backbone
+        self.pe = pe.lower()
         self.input_fc = nn.Linear(input_dims, hidden_dims)
 
+        # The TCN is position-aware through its convolutions, so it takes no PE by
+        # default ('none'); Time2Vec can still be added on the hidden stream. The
+        # Transformer always needs a PE and selects it via the `pe` argument.
+        self.tcn_time2vec = None
         if backbone == 'transformer':
             self.feature_extractor = TransformerFeatureExtractor(
-                hidden_dims, output_dims, depth=depth
+                hidden_dims, output_dims, depth=depth, pe=self.pe
             )
         elif backbone == 'tcn':
+            if self.pe not in ('none', 'time2vec'):
+                raise ValueError(
+                    f"TCN backbone supports pe in ('none', 'time2vec'), got: {self.pe}"
+                )
+            if self.pe == 'time2vec':
+                self.tcn_time2vec = Time2VecPE(hidden_dims, length)
             self.feature_extractor = DilatedConvEncoder(
                 hidden_dims,
                 [hidden_dims] * depth + [output_dims],
@@ -184,6 +206,11 @@ class CoSTEncoder(nn.Module):
 
         mask &= nan_mask
         x[~mask] = 0
+
+        # optional Time2Vec time-encoding for the TCN backbone (the Transformer
+        # adds its own positional encoding inside the feature extractor)
+        if self.tcn_time2vec is not None:
+            x = x + self.tcn_time2vec(x.size(1), x.device, x.dtype).unsqueeze(0)
 
         # conv encoder
         x = x.transpose(1, 2)  # B x Ch x T

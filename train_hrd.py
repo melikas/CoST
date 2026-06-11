@@ -14,6 +14,7 @@ Run:  python train_hrd.py --sensor-csv datasets/HRD_RAW_MinuteLevel.csv --backbo
 import argparse
 import json
 import math
+import os
 import time
 from pathlib import Path
 
@@ -102,6 +103,14 @@ def parse_args():
                    help="Fraction of the fine-tune cohort used to pick the decision threshold")
     # CoST encoder / pretraining
     p.add_argument("--backbone", default="tcn", choices=["tcn", "transformer"])
+    p.add_argument(
+        "--pe", default=None,
+        choices=["sinusoidal", "learnable", "tape", "rpe", "erpe", "tupe",
+                 "convspe", "tpe", "time2vec", "none"],
+        help="Positional encoding. Transformer accepts all 8 PE methods plus "
+             "time2vec (default: sinusoidal). TCN accepts only 'none' (baseline, "
+             "default) or 'time2vec'.",
+    )
     p.add_argument("--repr-dims", type=int, default=320)
     p.add_argument("--hidden-dims", type=int, default=64)
     p.add_argument("--depth", type=int, default=10)
@@ -120,11 +129,25 @@ def parse_args():
     p.add_argument("--gpu", type=int, default=0, help="GPU index, or a negative value to force CPU")
     p.add_argument("--max-threads", type=int, default=None)
     p.add_argument("--output-dir", default="./results_hrd")
+    p.add_argument("--run-id", default=None,
+                   help="Sub-folder grouping a sweep's runs under --output-dir "
+                        "(default: $SLURM_JOB_ID, or 'local' off-cluster).")
     return p.parse_args()
 
 
 def main():
     args = parse_args()
+    # Resolve the per-backbone default PE: sinusoidal for the Transformer, none
+    # (the position-aware convolutions need no PE) for the TCN.
+    if args.pe is None:
+        args.pe = "sinusoidal" if args.backbone == "transformer" else "none"
+    if args.backbone == "tcn" and args.pe not in ("none", "time2vec"):
+        raise SystemExit(
+            f"--pe {args.pe} is not valid for the TCN backbone "
+            "(use 'none' or 'time2vec')."
+        )
+    if args.backbone == "transformer" and args.pe == "none":
+        raise SystemExit("--pe none is not valid for the Transformer backbone.")
     out_dir = Path(args.output_dir)
     out_dir.mkdir(parents=True, exist_ok=True)
     dev = "cpu" if args.gpu < 0 else args.gpu
@@ -173,11 +196,12 @@ def main():
         hidden_dims=args.hidden_dims,
         depth=args.depth,
         backbone=args.backbone,
+        pe=args.pe,
         device=device,
         lr=args.lr,
         batch_size=args.batch_size,
     )
-    print(f"[pretrain] CoST backbone={args.backbone} on {int(pretrain_mask.sum())} windows ...")
+    print(f"[pretrain] CoST backbone={args.backbone} pe={args.pe} on {int(pretrain_mask.sum())} windows ...")
     loss_log = model.fit(X[pretrain_mask], n_epochs=args.epochs, n_iters=args.iters, verbose=True)
     pretrain_seconds = time.time() - t_start
 
@@ -208,8 +232,13 @@ def main():
     pid_prob, pid_lbl = participant_aggregate(pids[test_mask], test_prob, y[test_mask])
     pid = binary_metrics(pid_lbl, pid_prob, thr)
 
+    # results_hrd/<run_id>/<backbone>_<pe>_seed<seed>/{metrics.json, pretrain_loss.npy}
+    run_id = args.run_id or os.environ.get("SLURM_JOB_ID") or "local"
+    variant_dir = out_dir / run_id / f"{args.backbone}_{args.pe}_seed{args.seed}"
+    variant_dir.mkdir(parents=True, exist_ok=True)
     result = {
         "backbone": args.backbone,
+        "pe": args.pe,
         "window_level": win,
         "participant_level": pid,
         "n_test_windows": int(test_mask.sum()),
@@ -221,17 +250,17 @@ def main():
         "n_features": int(X.shape[-1]),
         "config": vars(args),
     }
-    (out_dir / f"metrics_{args.backbone}_seed{args.seed}.json").write_text(
+    (variant_dir / "metrics.json").write_text(
         json.dumps(result, indent=2), encoding="utf-8"
     )
-    np.save(out_dir / f"pretrain_loss_{args.backbone}_seed{args.seed}.npy", np.asarray(loss_log))
+    np.save(variant_dir / "pretrain_loss.npy", np.asarray(loss_log))
 
     print("\n========== HELD-OUT TEST RESULTS ==========")
-    print(f"backbone = {args.backbone}")
+    print(f"backbone = {args.backbone}  pe = {args.pe}")
     print(f"window-level       AUC={win['auc_roc']:.3f}  F1={win['f1']:.3f}  Acc={win['accuracy']:.3f}")
     print(f"participant-level  AUC={pid['auc_roc']:.3f}  F1={pid['f1']:.3f}  Acc={pid['accuracy']:.3f}")
     print(f"decision threshold = {thr:.3f}  (tuned on val)")
-    print(f"saved -> {out_dir / f'metrics_{args.backbone}_seed{args.seed}.json'}")
+    print(f"saved -> {variant_dir / 'metrics.json'}")
     print(f"total time = {(time.time() - t_start) / 60:.1f} min")
 
 
