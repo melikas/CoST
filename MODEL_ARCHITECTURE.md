@@ -9,7 +9,7 @@ All numeric examples use the *real* configuration from
 
 ---
 
-## 0. Notation and the two real configurations
+## 0. Notation and configurations
 
 | Symbol | Meaning | TCN run | Transformer run |
 |--------|---------|--------:|----------------:|
