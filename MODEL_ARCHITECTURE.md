@@ -354,13 +354,4 @@ Transformer config differs only in widths: step 2 `15→48`, step 5
 **Classifier (downstream):** StandardScaler `(μ,σ ∈ ℝ^{320})`,
 LogisticRegression `w∈ℝ^{320}, b∈ℝ`.
 
----
-
-### Figure-drawing summary (suggested boxes, left→right)
-
-`X (N×672×15)` → **InputFC** `15→Ch` → **Mask** →
-**Backbone** {TCN: 11×DilatedConvBlock | Transformer: PE + 6×EncoderLayer} `Ch→Co` →
-split into **TFD** (9 causal AR-conv experts → mean, `Co→d`) and
-**SFD** (rFFT → per-freq complex linear `Co→d` → irFFT) →
-**[Trend ‖ Season]** last step → `z (Co)` →
 {pretrain: **proj head** + **MoCo/InfoNCE** (trend) and **freq instance-contrastive** (season) | downstream: **StandardScaler → LogReg → p**}.
