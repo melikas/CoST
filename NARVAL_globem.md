@@ -30,7 +30,7 @@ Useful constants for copy-paste:
 # NARVAL: open a session on the cluster (asks for password + MFA code)
 ssh melikas@narval.alliancecan.ca
 ```
-scp -r ./cost.py ./train_hrd.py ./data_preprocessing.py ./hrd_rhythm.py ./decomposition_recovery.py ./utils.py ./models ./scripts ./requirements.txt melikas@narval.alliancecan.ca:~/projects/def-plago/melikas/projects/rhythmssl_project/
+scp -r ./cost.py ./train_hrd.py ./data_preprocessing.py ./hrd_rhythm.py ./cosinor.py ./decomposition_recovery.py ./globem_preprocessing.py ./utils.py ./models ./scripts ./requirements.txt melikas@narval.alliancecan.ca:~/projects/def-plago/melikas/projects/rhythmssl_project_GLOBEM/
 
 Multifactor authentication (MFA) is mandatory. If you have not set it up:
 https://ccdb.alliancecan.ca/multi_factor_authentications
@@ -39,40 +39,38 @@ Type `exit` any time to close the Narval session and return to your PC.
 
 ---
 
-## Step 1 — Upload your project (LOCAL → Narval)
-
-Do this from your PC. It copies the code **and** the dataset to Narval.
-
-```powershell
-# LOCAL: go to the project folder
-cd c:\Users\umroot\Documents\CoST
+#
 ```
 
 # LOCAL
-scp scripts/run_debug.sh melikas@narval.alliancecan.ca:~/projects/def-plago/melikas/projects/rhythmssl_project/scripts/
+scp -r ./cost.py ./train_hrd.py ./data_preprocessing.py ./hrd_rhythm.py ./cosinor.py ./globem_preprocessing.py ./datasets ./decomposition_recovery.py ./utils.py ./models ./scripts ./requirements.txt melikas@rorqual.alliancecan.ca:~/projects/def-plago/melikas/projects/rhythmssl_project/
 
 
-
-
-```bash
-# LOCAL: create the destination folder on Narval (one time)
-ssh melikas@narval.alliancecan.ca "mkdir -p ~/projects/def-plago/melikas/projects/rhythmssl_project"
-```
-ssh melikas@rorqual.alliancecan.ca "mkdir -p ~/projects/def-plago/melikas/projects/rhythmssl_project"
-
-Now upload. **Prefer `rsync`** — it skips junk (`.git`, caches, old results) and
-can resume if interrupted:
+### >>> USE THIS, not the scp lines above <<<
 
 ```bash
-# LOCAL: upload everything needed (code + datasets/HRD_RAW_MinuteLevel.csv)
-rsync -avP \
-  --exclude='.git' --exclude='__pycache__' --exclude='*.pyc' --exclude='results_hrd' \
-  ./ melikas@narval.alliancecan.ca:~/projects/def-plago/melikas/projects/rhythmssl_project/
+# LOCAL, from the repo root. Sends the WHOLE tree minus junk, names no file by hand,
+# then verifies on the cluster that every required module actually landed.
+bash scripts/upload.sh narval            # code + datasets/
+bash scripts/upload.sh narval --code      # code only, skips the ~4 GB datasets/
 ```
-scp -r ./ melikas@rorqual.alliancecan.ca:~/projects/def-plago/melikas/projects/rhythmssl_project/
 
-scp -r ./cost.py ./cosinor.py ./train_hrd.py ./train_hrd_energy.py ./data_preprocessing.py ./hrd_rhythm.py ./decomposition_recovery.py ./utils.py ./models ./scripts ./requirements.txt melikas@nibi.alliancecan.ca:~/projects/def-plago/melikas/projects/rhythmssl_project/
-
+> **This is where three sweeps were lost.** The `scp` line that used to sit here —
+> targeting `rhythmssl_project_GLOBEM/` — listed files by name and did **not** include
+> `cosinor.py`. Runs 66404249, 66440129 and 66465766 (195 variants, many GPU-hours) each
+> trained to completion and silently dropped the "Cosinor (paper)" baseline with
+> `ModuleNotFoundError: No module named 'cosinor'`, while every other edited file
+> (`hrd_rhythm.py`, `run.sh`, `collect_results.py`) uploaded fine — which is why the runs
+> looked healthy. `scripts/run.sh` now refuses to start if a project module is missing.
+>
+> The old command, corrected, for reference only:
+>
+> ```bash
+> scp -r ./cost.py ./train_hrd.py ./data_preprocessing.py ./hrd_rhythm.py ./cosinor.py \
+>        ./globem_preprocessing.py ./datasets ./decomposition_recovery.py ./utils.py \
+>        ./models ./scripts ./requirements.txt \
+>        melikas@narval.alliancecan.ca:~/projects/def-plago/melikas/projects/rhythmssl_project_GLOBEM/
+> ```
 
 What the flags mean: `-a` keep file structure, `-v` show progress, `-P` resume
 partial files, `--exclude=...` do **not** upload those (the `.git` folder is huge
@@ -83,10 +81,18 @@ partial files, `--exclude=...` do **not** upload those (the `.git` folder is hug
 >
 > ```bash
 > # LOCAL: simpler but copies extra junk; the dataset still uploads fully
-> scp -r ./cost.py ./train_hrd.py ./data_preprocessing.py ./hrd_rhythm.py ./decomposition_recovery.py ./utils.py \
+> scp -r ./cost.py ./train_hrd.py ./data_preprocessing.py ./hrd_rhythm.py ./cosinor.py \
+>        ./decomposition_recovery.py ./globem_preprocessing.py ./utils.py \
 >        ./models ./scripts ./datasets ./requirements.txt \
 >        melikas@narval.alliancecan.ca:~/projects/def-plago/melikas/projects/rhythmssl_project/
 > ```
+
+> **Every one of these lists must name `cosinor.py`.** It is the paper-cosinor baseline
+> engine, imported by `hrd_rhythm.py` as a plain project module. Runs 66404249 and 66440129
+> (130/130 variants) lost the "Cosinor (paper)" row to `ModuleNotFoundError: No module named
+> 'cosinor'` purely because these `scp` lists omitted the file — the job itself succeeded, so
+> the loss showed up only as `n/a` in `summary_models.csv`. Prefer the `rsync ./` command
+> above, which uploads the whole tree and cannot miss a module.
 
 The dataset is ~4 GB, so the first upload takes several minutes.
 
@@ -98,58 +104,45 @@ The dataset is ~4 GB, so the first upload takes several minutes.
 # NARVAL: go into the project and confirm the dataset is there
 ssh melikas@narval.alliancecan.ca
 ssh melikas@rorqual.alliancecan.ca
-ssh melikas@nibi.alliancecan.ca
-cd ~/projects/def-plago/melikas/projects/rhythmssl_project
-ls -lh datasets/HRD_RAW_MinuteLevel.csv
+
 ```
 
 ---
 
-## Step 3 — Submit a job (NARVAL)
-
-`sbatch` puts your job in the queue; the cluster runs it when a GPU is free.
-You do **not** wait at the terminal — the job runs in the background.
-
-```bash
-# NARVAL: run the BASELINE experiment (TCN + Transformer/sinusoidal)
-cd ~/projects/def-plago/melikas/projects/rhythmssl_project
+# NARVAL
+ssh melikas@narval.alliancecan.ca
+cd ~/projects/def-plago/melikas/projects/rhythmssl_project_GLOBEM
 sbatch scripts/run.sh
+squeue -u melikas
+
+nar: 67041999
+117122
+scp -r melikas@narval.alliancecan.ca:~/projects/def-plago/melikas/projects/rhythmssl_project_GLOBEM/results_hrd/117122 "c:\Users\umroot\Documents\CoST - GLOBEM\results_hrd\"
+scp -r melikas@narval.alliancecan.ca:~/projects/def-plago/melikas/projects/rhythmssl_project_GLOBEM/results_hrd/66474858 "c:\Users\umroot\Documents\CoST - GLOBEM\results_hrd\"
+
+
+
+"ssh melikas@narval.alliancecan.ca
+cd ~/projects/def-plago/melikas/projects/rhythmssl_project_GLOBEM
+
+module purge
+module load StdEnv/2023 python/3.11
+pip download --no-deps CosinorPy -d wheels
+
+ls wheels/          # باید CosinorPy-3.1-py3-none-any.whl را ببینید
+python -c "import CosinorPy; print('OK')"
+"
+## Watch the job live 
+tail -f logs/cost_hrd-65772176.out
 ```
-ror: 
+logs/cost_hrd-65772176.out
 
-nibi: 19024283
-
-
-It prints something like `Submitted batch job 62977394`. **Write down that
-number** — it is your `<jobid>`.
-
-**Want all positional-encoding variants instead** (8 PEs + Time2Vec + TCN variants)?
-Open `scripts/run.sh`, find the block marked `OPTION E`, remove the `#` at the
-start of its two lines (and comment out OPTION A above it), then `sbatch scripts/run.sh`.
-
----
-
-## Step 4 — Watch the job live / see errors (NARVAL)
-
-This job writes **both normal output and errors into one file**:
-`logs/cost_hrd-<jobid>.out` (there is no separate `.err` file).
-
-```bash
-# NARVAL: follow the log live as the job runs (press Ctrl+C to stop watching)
-tail -f logs/cost_hrd-18115719.out
-```
-logs/rhythmssl_project-16829002.out
-
-`tail -f` keeps printing new lines as they appear. Stopping it with `Ctrl+C`
-does **not** stop the job — only stops watching. To read the whole log at once:
 
 ```bash
 # NARVAL: open the full log, scroll with arrows, press q to quit
 less logs/cost_hrd-<jobid>.out
 ```
 
-If the job crashed, the Python error message (traceback) is at the bottom of
-this same `.out` file.
 
 ---
 
@@ -174,7 +167,7 @@ scontrol show job <jobid>
 
 ```bash
 # NARVAL: cancel one job by its id
-scancel 18944108
+scancel 63756625
 
 # NARVAL: cancel ALL of your jobs at once
 scancel -u melikas
@@ -200,16 +193,15 @@ rsync -avP \
   ./results_hrd/
 ```
 
-scp -r melikas@rorqual.alliancecan.ca:~/projects/def-plago/melikas/projects/rhythmssl_project/results_hrd/16829002 c:\Users\umroot\Documents\CoST - Rorqual\results_hrd\
+scp -r melikas@rorqual.alliancecan.ca:~/projects/def-plago/melikas/projects/rhythmssl_project/results_hrd/16439461 c:\Users\umroot\Documents\CoST\results_hrd\
+
+# LOCAL
+scp -r melikas@narval.alliancecan.ca:~/projects/def-plago/melikas/projects/rhythmssl_project_GLOBEM/results_hrd/66372999 "c:\Users\umroot\Documents\CoST - GLOBEM\results_hrd\"
+
+# LOCAL — دقت کن: بدون _GLOBEM
+scp -r melikas@narval.alliancecan.ca:~/projects/def-plago/melikas/projects/rhythmssl_project/results_hrd/66372999 "c:\Users\umroot\Documents\CoST - GLOBEM\results_hrd\"
 
 
-scp -r melikas@nibi.alliancecan.ca:~/projects/def-plago/melikas/projects/rhythmssl_project/results_hrd/18975686 "c:\Users\umroot\Documents\CoST - Rorqual\results_hrd\"
-
-scp -r melikas@nibi.alliancecan.ca:~/projects/def-plago/melikas/projects/rhythmssl_project/results_hrd_energy/18975686 "c:\Users\umroot\Documents\CoST - Rorqual\results_hrd_energy\"
-
-
-
-Then build one comparison table of every variant:
 
 ```powershell
 # LOCAL: print a sorted table and also save a CSV

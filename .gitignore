@@ -1,6 +1,25 @@
-# Large datasets - exclude from version control
+# ---------------------------------------------------------------------------
+# Participant data -- NEVER commit. HRD_RAW_MinuteLevel.csv is minute-level
+# heart rate / sleep / screen / call data with depression labels for 166 people
+# and is covered by the study's data agreement, not by this repository.
+# ---------------------------------------------------------------------------
 datasets/*.csv
 datasets/HRD_RAW_MinuteLevel.csv
+*.csv.gz
+*.parquet
+
+# Model weights: encoder.pt is ~235 MB each, well over GitHub's 100 MB hard limit
+*.pt
+*.pth
+*.ckpt
+
+# Run outputs: results_hrd/ alone is ~13 GB across ~18k files. Keep the code in
+# git and the results on the cluster / in the scratch copy.
+results_hrd/
+results_hrd_energy/
+results_globem/
+logs/
+slurm-*.out
 
 # Python cache
 __pycache__/
@@ -10,6 +29,3 @@ __pycache__/
 # IDE
 .vscode/
 .idea/
-
-# Results (optional - اگر نخواهی push کنی)
-# results_hrd/

@@ -1,0 +1,19 @@
+# Shell scripts MUST keep LF: SLURM refuses a batch script with CRLF
+# ("Batch script contains DOS line breaks (\r\n)"), and this repo is edited on
+# Windows with core.autocrlf=true, which would otherwise rewrite them on every
+# checkout. eol=lf overrides autocrlf for these paths.
+*.sh text eol=lf
+
+# Same reason for anything else executed by a shell on the cluster.
+*.slurm  text eol=lf
+*.sbatch text eol=lf
+
+# Let git normalise text files in the repo, but never touch data or binaries.
+*.py  text
+*.md  text
+*.csv -text
+*.npy binary
+*.npz binary
+*.pt  binary
+*.png binary
+*.pdf binary

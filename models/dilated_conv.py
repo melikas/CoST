@@ -1,7 +1,6 @@
 import torch
 from torch import nn
 import torch.nn.functional as F
-import numpy as np
 
 class SamePadConv(nn.Module):
     def __init__(self, in_channels, out_channels, kernel_size, dilation=1, groups=1):

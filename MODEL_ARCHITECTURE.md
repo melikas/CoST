@@ -110,16 +110,35 @@ $$ h(t) = W_{in}\,x(t) + b_{in},\qquad H \in ℝ^{B×T×Ch}. $$
 - TCN: `15→64` → `64×672×64`.  Transformer: `15→48` → `64×672×48`.
 
 ### 3.2 NaN handling + masking
-NaN rows → 0. During training a **binomial mask** `M∈{0,1}^{B×T}`
-(`p=0.5`, per timestep) zeroes whole timesteps: `H[b,t,:]←0 if M[b,t]=0`.
-At eval the mask is `all_true` (no masking). Masking is **time-wise**, not
-channel-wise.
+NaN rows → 0, giving the non-wear mask `N∈{0,1}^{B×T}` (`N[b,t]=0` where any
+channel is NaN). The applied mask is `M∧N`, and `H[b,t,:]←0` wherever it is 0.
+Masking is **time-wise**, not channel-wise.
 
-### 3.3 (TCN-only, optional) Time2Vec
+`M` is selected by `--mask-mode`, and the default is **`none`** (`M≡1`), so in
+the default configuration **only the non-wear mask `N` is applied — there is no
+masking augmentation**. This matches upstream salesforce/CoST, whose encoder
+hard-defaulted its `mask` argument to `'all_true'` while the training loop never
+passed one: its `mask_mode='binomial'` was unreachable, so no published CoST
+number was produced with a masking augmentation. Every result in this repo up to
+and including run `19229424` was likewise produced with `M≡1`.
+
+`--mask-mode binomial` opts in to the TS2Vec-style mask (`M[b,t]∼Bernoulli(p)`
+per timestep, `p=--mask-keep-prob`, default `0.5`); `continuous` opts in to
+contiguous span dropout. Both apply **during training only** — at eval
+`mask=None` resolves to `none`. Enabling either changes SSL results and is not
+free here: `M` multiplies on top of the real non-wear gaps in `N`, and the SFD
+branch (§ seasonal) contrasts the rFFT **amplitude and phase** of the
+representation, which random timestep dropout perturbs directly.
+
+### 3.3 (optional) Time2Vec — fed as an input feature (Kazemi et al. 2019)
 Only if `pe='time2vec'` (the reported TCN run uses `pe='none'`, so this is
-skipped). When on: `H ← H + t2v`, with channel 0 linear and 1.. periodic:
-`v = t·w + b`, `t2v[:,0]=v[:,0]`, `t2v[:,1:]=sin(v[:,1:])`,
-`w,b∈ℝ^{Ch}` learnable.
+skipped). Faithful to the paper, Time2Vec is **fed as input** (not added):
+`t2v(τ)∈ℝ^{T×m}` is **concatenated** to the sensor channels *before* `input_fc`,
+so `x' = [x ‖ t2v(τ)]` and `input_fc: ℝ^{n_sensor+m} → ℝ^{Ch}`. With `τ=t`
+(0…T-1, time-from-start), `v=τ·w+b`, `t2v[:,0]=v[:,0]` (linear),
+`t2v[:,1:]=sin(v[:,1:])`, `w,b∈ℝ^{m}` learnable, `m=time2vec_dim` (=k+1,
+default 64). Works with either backbone; the Transformer then uses **vanilla
+attention** (no extra PE) since Time2Vec carries the time signal as input.
 
 Then transpose to **channels-first** `H ∈ ℝ^{B×Ch×T}` for the backbone.
 
@@ -171,9 +190,12 @@ Add absolute PE then dropout(0.1):
 $$ PE[t,2i]=\sin\!\Big(\tfrac{t}{10000^{2i/240}}\Big),\quad PE[t,2i+1]=\cos\!\Big(\tfrac{t}{10000^{2i/240}}\Big),\qquad E \leftarrow E + PE. $$
 
 Other supported PEs (selectable via `--pe`): absolute family
-`{learnable, tape, time2vec}` added here; attention family
+`{learnable, tape}` added here; attention family
 `{rpe, erpe, tupe, convspe, tpe}` injected inside attention (3B.2). `tape`
 scales the sinusoid by `d/T`; `learnable` is an `Embedding(2048,240)`.
+`time2vec` is **not** added here — it is fed as an input feature upstream
+(concatenated before `input_fc`, §3.3), so with `--pe time2vec` the Transformer
+runs vanilla attention with no absolute PE.
 
 ### 3B.2 `PETransformerEncoderLayer` ×6 (pre-norm)
 Each layer, with `LN`=LayerNorm:
@@ -190,7 +212,11 @@ Attention-PE variants modify the score matrix before softmax, e.g.
 - `rpe`: `+ Q·R` with relative-key table `R∈ℝ^{(2T-1)×30}`;
 - `erpe`: `+ bias[h, i−j]`, `bias∈ℝ^{8×(2T-1)}`, added **after** softmax;
 - `tupe`: `(QKᵀ + (P W_{pq})(P W_{pk})ᵀ)/√(2·30)`;
-- `convspe`: stochastic positional kernel from depthwise Conv1d over noise;
+- `convspe`: stochastic positional kernel from depthwise Conv1d over noise.
+  **Training** uses the paper's Monte-Carlo estimate over `R=16` fresh noise
+  realizations (the resampling is the method). **Eval** substitutes that
+  estimator's exact expectation `Cq Ckᵀ` — its `R→∞` limit — so evaluation is
+  deterministic and unbiased; see `PESelfAttention._convspe_pos`;
 - `tpe`: `+ exp(−‖x_i−x_j‖²/2σ²)` Gaussian bias, `σ=exp(logσ)`.
 
 **Feed-forward** (`ff_mult=4`):
@@ -240,8 +266,9 @@ band-pass filter bank.
 
 ## 6. Downstream representation (`encode` / `_eval_with_pooling`)
 
-At inference (mask = all_true), take the **last timestep** of each component and
-concatenate:
+At inference (`encode` puts the net in eval mode, so no masking augmentation is
+applied regardless of `--mask-mode`; only the non-wear mask `N` of §3.2 acts),
+take the **last timestep** of each component and concatenate:
 
 $$ z = \big[\,\text{Trend}[:,T{-}1,:]\ \Vert\ \text{Season}[:,T{-}1,:]\,\big]\in ℝ^{B×Co}. $$
 
@@ -259,6 +286,11 @@ Total loss is **temporal (trend) MoCo loss + α · seasonal frequency loss**.
 `head_q, head_k = Linear(d→d)→ReLU→Linear(d→d)` (`d=160` TCN / `120` Transf.).
 `encoder_k`, `head_k` are momentum copies (no gradient).
 
+> **The momentum encoder is used by the trend branch only.** `encoder_k`/`head_k`
+> and the queue feed §7.2; the seasonal branch (§7.3) encodes **both** views with
+> the trainable `encoder_q` and has no queue. Only §7.2 is MoCo — the model as a
+> whole is *not* a symmetric two-branch MoCo, and describing it that way is wrong.
+
 ### 7.2 Trend / temporal loss — MoCo InfoNCE
 Pick random time index `r`. From the two views:
 
@@ -273,10 +305,50 @@ Then `k` is enqueued (FIFO, size 256). Key encoder EMA update:
 `θ_k ← m·θ_k + (1−m)·θ_q`, `m=0.999`.
 
 ### 7.3 Seasonal / frequency loss
+**Both views are encoded by `encoder_q`** — `q_s` from `x_q` and `k_s` from `x_k`
+(`_, k_s = self.encoder_q(x_k)`, a *third* encoder pass per step). The superscripts
+`q`/`k` below denote the two **augmented views**, not the two encoders: there is no
+momentum encoder and no queue here, and gradients flow through *both* sides.
+
+This is intentional and matches `salesforce/CoST` upstream. `L_inst` is a
+within-batch instance-discrimination loss, symmetric in its two arguments; the EMA
+encoder exists in MoCo only to keep stale *queued* keys consistent, and with no
+queue there is nothing to stabilise — routing one side through a frozen EMA copy
+would instead zero out half of the symmetric objective's gradient path.
+
 Normalize seasonal outputs of both views, FFT over time, split into amplitude and
 phase:
 
 $$ A,\;\phi:\quad \text{amp}=\sqrt{(\Re+\epsilon)^2+(\Im+\epsilon)^2},\quad \text{phase}=\operatorname{atan2}(\Im,\ \Re+\epsilon). $$
+
+The phase is then embedded on the **unit circle**, `φ ↦ [\sin φ ; \cos φ]`
+(`--phase-encoding circular`, the default), optionally weighted per channel by
+that channel's amplitude (`--phase-encoding circular_amp`, see below). This is required because the
+contrastive loss below scores pairs with a **dot product**, and on a raw `atan2`
+angle that is not a similarity between angles at all: `⟨φ_i,φ_j⟩` depends on
+*where* the angles sit, not how far apart they are. Two **identical** phases
+score `0` at `φ=0` but `π²` at `φ=π`, and the pair `(π−ε, −π+ε)` — the same
+angle either side of the branch cut — scores the most negative value possible.
+With `C=160` channels ~64% of near-identical view pairs have at least one
+channel straddling the cut. After the embedding the dot product becomes
+`Σ_c cos(φ^q_c − φ^k_c)`: a function of the angular difference alone,
+`2π`-periodic and monotone in the gap. `--phase-encoding raw` restores upstream
+CoST's uncorrected angle, for reproducing archived runs only.
+
+**`circular_amp`** additionally weights each channel by its own amplitude,
+`φ_c ↦ w_c·[\sin φ_c ; \cos φ_c]`, so the score becomes an amplitude-weighted
+phase coherence `Σ_c w^q_c w^k_c \cos(φ^q_c − φ^k_c)`. Motivation: unweighted,
+every channel carries unit norm, so a channel with amplitude ≈ 0 — where the
+phase is undefined noise — counts as much as a strong rhythm. The weight is
+**RMS-normalised** (`mean(w²)=1`), not L2-normalised: the loss applies
+`log_softmax` to these dot products with no temperature, so the embedding norm
+*is* the effective temperature. L2 would collapse `‖emb‖` from `√C` to `1` — a
+`√160 ≈ 12.6×` logit shrink that flattens the softmax and starves the phase
+branch of gradient. RMS keeps `‖emb‖=√C` exactly, so the mode changes only the
+*relative* channel weighting and reduces to `circular` bit-for-bit when the
+amplitudes are equal. The weight is **detached**: amplitude is already trained
+by its own contrastive term, and letting the phase loss push on it too would let
+the model lower that loss by shrinking amplitudes instead of aligning phases.
 
 Apply the **instance-wise contrastive loss** (TS2Vec style) separately to
 amplitude and phase. For stacked views `z=[z_1;z_2]∈ℝ^{2B×T×·}`, per timestep
@@ -321,14 +393,18 @@ test windows).
 | 4 | transpose | to channels-first | `64×64×672` |
 | 5 | TCN | 11 dilated ConvBlocks 64→…→320 | `64×320×672` |
 | 6 | TFD | 9 causal AR experts, mean | `64×672×160` |
-| 7 | SFD | rFFT→complex linear→irFFT | `64×672×160` |
+| 7a | SFD rFFT | rFFT over time (`T=672→337`) | `64×337×160` (complex) |
+| 7b | SFD | complex linear `Co→d` → irFFT (`337→672`) | `64×672×160` |
 | 8 | repr | last-step concat `[trend‖season]` | `64×320` |
 | 9 | head | Linear 160→160→160 (+L2 norm) | `64×160` |
-|10 | loss | MoCo InfoNCE + α·seasonal | scalar |
+|9b | seas. key | `x_k` re-encoded by **`encoder_q`** (not `encoder_k`) | `64×672×160` |
+|10a| seas. loss | rFFT season → amp, phase (`T=672→337`) | `64×337×160` each |
+|10b| loss | MoCo InfoNCE (trend) + α·seasonal (amp/phase) | scalar |
 
-Transformer config differs only in widths: step 2 `15→48`, step 5
-`TransformerFeatureExtractor 48→240` (`64×240×672`), steps 6–7 `→160?` no →
-`d=120` so `64×672×120`, step 8 `64×240`, step 9 `120→120`.
+Transformer config differs only in widths (the freq dim stays `337`): step 2
+`15→48`, step 5 `TransformerFeatureExtractor 48→240` (`64×240×672`), steps 6–7b
+use `d=120` so `64×672×120` (with `64×337×120` complex at 7a), step 8 `64×240`,
+step 9 `120→120`, step 10a amp/phase `64×337×120` each.
 
 ---
 

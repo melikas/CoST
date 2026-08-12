@@ -19,14 +19,30 @@ import time
 from pathlib import Path
 
 import numpy as np
+import torch
+from torch import nn
+from torch.utils.data import TensorDataset, DataLoader
+from scipy.stats import rankdata
+from sklearn.covariance import LedoitWolf
+from sklearn.decomposition import PCA
 from sklearn.linear_model import LogisticRegression
-from sklearn.metrics import accuracy_score, f1_score, roc_auc_score
+from sklearn.metrics import (accuracy_score, f1_score, roc_auc_score,
+                             balanced_accuracy_score, matthews_corrcoef)
 from sklearn.model_selection import train_test_split
 from sklearn.pipeline import make_pipeline
 from sklearn.preprocessing import StandardScaler
 
+from baselines.supervised import supervised_baseline_row
 from cost import CoST
-from data_preprocessing import prepare_hrd_dataset
+from models.positional_encoding import CALENDAR_PES
+from tasks._eval_protocols import (binary_metrics, best_threshold,
+                                   calibration_metrics, operating_point_report,
+                                   participant_aggregate, participant_bootstrap_auc,
+                                   prevalence_transport, prior_shift,
+                                   threshold_at_sensitivity)
+from data_processing.data_preprocessing import prepare_hrd_dataset
+from models.dilated_conv import DilatedConvEncoder
+from models.encoder import TransformerFeatureExtractor
 from utils import init_dl_program
 
 
@@ -49,38 +65,356 @@ def stratified_pid_holdout(unique_pids, pid_label, frac, seed):
     return set(rest), set(held)
 
 
-def participant_aggregate(pids, probs, labels):
-    """Mean window probability per participant + the participant label."""
-    uniq = np.unique(pids)
-    pid_prob = np.array([probs[pids == p].mean() for p in uniq], dtype=np.float64)
-    pid_lbl = np.array([int(labels[pids == p][0]) for p in uniq], dtype=int)
-    return pid_prob, pid_lbl
+def balanced_pid_holdout(unique_pids, pid_label, n_per_class, seed):
+    """Hold out EXACTLY `n_per_class` participants of each label (0 and 1) as the test
+    set -- a class-balanced test cohort. The held-out participants appear in NEITHER the
+    pretrain nor the fine-tune pool (the caller builds pretrain = all non-test windows).
+    Returns (rest_pids, test_pids)."""
+    rng = np.random.default_rng(seed)
+    by_class = {0: [], 1: []}
+    for p in sorted(unique_pids):
+        c = pid_label.get(p)
+        if c in (0, 1):
+            by_class[c].append(p)
+    held = set()
+    for c in (0, 1):
+        pool = by_class[c]
+        if len(pool) < n_per_class:
+            print(f"[split] WARNING: only {len(pool)} consistent participants with label {c} "
+                  f"(< requested {n_per_class}); holding out all of them.")
+        k = min(n_per_class, len(pool))
+        if k:
+            held.update(rng.choice(np.array(pool), size=k, replace=False).tolist())
+    rest = set(sorted(unique_pids)) - held
+    return rest, held
 
 
-def best_threshold(y_true, y_prob):
-    best_thr, best_f1 = 0.5, -1.0
-    for thr in np.linspace(0.05, 0.95, 37):
-        score = f1_score(y_true, (y_prob >= thr).astype(int), zero_division=0)
-        if score > best_f1:
-            best_f1, best_thr = score, float(thr)
-    return best_thr
+
+def _md_table(headers, rows):
+    """Minimal markdown table; None/NaN render as an em dash."""
+    def cell(v):
+        if v is None or (isinstance(v, float) and not np.isfinite(v)):
+            return "--"
+        return f"{v:.3f}" if isinstance(v, float) else str(v)
+    out = ["| " + " | ".join(headers) + " |",
+           "|" + "|".join(["---"] * len(headers)) + "|"]
+    for r in rows:
+        out.append("| " + " | ".join(cell(v) for v in r) + " |")
+    return "\n".join(out) + "\n"
 
 
-def binary_metrics(y_true, y_prob, thr):
-    y_pred = (y_prob >= thr).astype(int)
-    auroc = roc_auc_score(y_true, y_prob) if len(np.unique(y_true)) > 1 else 0.5
-    return {
-        "auc_roc": float(auroc),
-        "accuracy": float(accuracy_score(y_true, y_pred)),
-        "f1": float(f1_score(y_true, y_pred, zero_division=0)),
-        "threshold": float(thr),
-    }
+def write_run_report(variant_dir, args, result, split_seed, model_seed):
+    """Human-readable companion to metrics.json, written once per run.
+
+    Everything here is already in metrics.json. The point of the file is that the CAVEATS
+    travel with the numbers: the headline threshold metrics come from a class-balanced test
+    cohort at a tuned threshold, so they are never shown alone -- always beside their
+    prevalence-transported values and the fixed operating points. The provenance table
+    likewise records the knobs that silently change what the numbers mean (the two seeds, the
+    masking mode, the seasonal phase encoding), so a report can be read years later without
+    guessing which code version produced it."""
+    pid = result.get("participant_level", {}) or {}
+    win = result.get("window_level", {}) or {}
+    prevs = list(pid.get("at_prevalence", {}))
+    L = []
+
+    L.append(f"# CoST on HRD -- run report\n")
+    # getattr throughout: the two trees do not expose an identical flag set (e.g. no
+    # --season-pool in the GLOBEM fork), and the report must never be what crashes a run.
+    _sp = getattr(args, "season_pool", None)
+    L.append(f"**backbone** `{args.backbone}` | **pe** `{args.pe}` | "
+             f"**pool** `{getattr(args, 'pool', '?')}`"
+             + (f" / season `{_sp}`" if _sp else "")
+             + f" | **disentangle** "
+               f"{'yes' if getattr(args, 'disentangle', True) else 'no (plain SSL)'}\n")
+
+    L.append("\n## Reproducibility / provenance\n")
+    rows = [
+        ("`--split-seed`", split_seed,
+         "which participants are test/val, CV folds, bootstrap resampling"),
+        ("`--model-seed`", model_seed,
+         "weight init, augmentation stream, loader order, probe estimators"),
+        ("`--mask-mode`", f"`{getattr(args, 'mask_mode', 'none')}`",
+         "training-time timestep masking (`none` = upstream CoST, no augmentation)"),
+        ("`--phase-encoding`", f"`{getattr(args, 'phase_encoding', 'circular')}`",
+         {"raw": "upstream CoST's raw atan2 angle -- the dot product is NOT a similarity "
+                 "between angles (see circular_phase)",
+          "circular": "[sin, cos], so phase similarity is a function of the angular gap alone",
+          "circular_amp": "[sin, cos] weighted by each channel's amplitude -- weak channels, "
+                          "whose phase is undefined noise, stop counting as much as real rhythms",
+          }.get(getattr(args, "phase_encoding", "circular"), "seasonal phase comparison")),
+    ]
+    L.append(_md_table(["knob", "value", "what it controls"], rows))
+    if split_seed == model_seed:
+        L.append(f"\n> Both seeds are {split_seed}, so cohort variance and optimisation "
+                 f"variance are **confounded** in this run: a seed-to-seed difference cannot "
+                 f"be attributed to either. Cross `--split-seed` x `--model-seed` to separate "
+                 f"them.\n")
+    if args.pe == "convspe":
+        L.append("\n> `convspe` draws random features while training (the SPE method) but is "
+                 "evaluated at the exact expectation of that estimator, so `encode()` is "
+                 "deterministic and repeated evaluations agree bit for bit.\n")
+
+    L.append("\n## Cohort\n")
+    tp = pid.get("test_prevalence", float("nan"))
+    cp = pid.get("cohort_prevalence", float("nan"))
+    L.append(f"- participants: {result.get('n_participants_total','?')} total = "
+             f"{result.get('n_labeled_participants','?')} labelled "
+             f"[{result.get('n_test_participants','?')} test + "
+             f"{result.get('n_probe_participants','?')} probe] + "
+             f"{result.get('n_unlabeled_participants','?')} unlabelled (pretrain-only)\n")
+    L.append(f"- test cohort is **{tp:.0%} positive by construction** "
+             f"(`--test-per-class {getattr(args, 'test_per_class', '?')}`); "
+             f"observed cohort base rate is **{cp:.1%}**\n")
+
+    L.append("\n## Headline (participant level)\n")
+    L.append(_md_table(
+        ["metric", "value", "transfers to another prevalence?"],
+        [("AUROC", pid.get("auc_roc"), "yes -- ranking statistic"),
+         ("balanced accuracy", pid.get("balanced_accuracy"), "yes -- (sens+spec)/2"),
+         ("sensitivity", pid.get("sensitivity"), "yes -- within-class rate"),
+         ("specificity", pid.get("specificity"), "yes -- within-class rate"),
+         ("accuracy", pid.get("accuracy"), "**no** -- quoted at the cohort's 50%"),
+         ("F1", pid.get("f1"), "**no** -- quoted at the cohort's 50%"),
+         ("MCC", pid.get("mcc"), "**no** -- quoted at the cohort's 50%")]))
+    ci = pid.get("auc_ci") or {}
+    if ci:
+        L.append(f"\nAUROC 95% CI (bootstrap over participants, the independent unit): "
+                 f"[{ci.get('lo', float('nan')):.3f}, {ci.get('hi', float('nan')):.3f}] "
+                 f"over {ci.get('n_participants','?')} participants.\n")
+    L.append(f"\nDecision threshold {pid.get('threshold', float('nan')):.3f}, chosen to maximise "
+             f"balanced accuracy on validation / out-of-fold predictions (never on test).\n")
+
+    if prevs:
+        L.append("\n## The same model at other base rates\n")
+        L.append("Sensitivity and specificity are unchanged -- only the prevalence-dependent "
+                 "metrics move. Computed exactly by Bayes' rule, no refitting.\n\n")
+        L.append(_md_table(
+            ["prevalence", "PPV", "NPV", "F1", "accuracy", "MCC"],
+            [(f"{float(k):.1%}", v.get("ppv"), v.get("npv"), v.get("f1"),
+              v.get("accuracy"), v.get("mcc"))
+             for k, v in pid["at_prevalence"].items()]))
+
+    ops = pid.get("operating_points") or {}
+    if ops:
+        p0 = prevs[0] if prevs else None
+        L.append("\n## Fixed operating points\n")
+        L.append("Thresholds committed to WITHOUT seeing the test cohort: `nominal_0.5` a "
+                 "priori, the `sens*_on_val` points from validation / out-of-fold predictions. "
+                 "`tuned_balanced_acc` is the headline threshold, shown for continuity.\n\n")
+        hdr = ["operating point", "thr", "sens", "spec", "F1 @50%"]
+        if p0 is not None:
+            hdr += [f"PPV @{float(p0):.1%}", f"F1 @{float(p0):.1%}"]
+        rows = []
+        for name, m in ops.items():
+            row = [f"`{name}`", m.get("threshold"), m.get("sensitivity"),
+                   m.get("specificity"), m.get("f1")]
+            if p0 is not None:
+                t = m.get("at_prevalence", {}).get(p0, {})
+                row += [t.get("ppv"), t.get("f1")]
+            rows.append(tuple(row))
+        L.append(_md_table(hdr, rows))
+
+    cal = pid.get("calibration") or {}
+    if cal:
+        L.append("\n## Calibration\n")
+        L.append("Whether the SCORES mean anything, not just how they rank. Lower is better.\n\n")
+        rows = [("as measured (balanced cohort)", cal.get("brier"), cal.get("ece"), cal.get("mce"))]
+        for k, v in (pid.get("calibration_at_prevalence") or {}).items():
+            rows.append((f"prior-shifted to {float(k):.1%}", v.get("brier"),
+                         v.get("ece"), v.get("mce")))
+        L.append(_md_table(["scores", "Brier", "ECE", "MCE"], rows))
+
+    if win:
+        L.append("\n## Window level (secondary)\n")
+        shared = [k for k in ("auc_roc", "balanced_accuracy", "sensitivity", "specificity",
+                              "accuracy", "f1", "mcc") if k in win and k in pid]
+        if shared and all(win[k] == pid[k] for k in shared):
+            L.append("> **These are identical to the participant-level numbers above** -- in "
+                     "this configuration the participant aggregation is a no-op, so the two "
+                     "sections are the same measurement under two names, not two units.\n\n")
+        L.append(_md_table(["metric", "window level", "participant level"],
+                           [(k, win.get(k), pid.get(k)) for k in shared]))
+
+    L.append("\n_Full numbers, including reliability bins and every operating point, are in "
+             "`metrics.json`._\n")
+    report = "".join(L)
+    (Path(variant_dir) / "report.md").write_text(report, encoding="utf-8")
+    return report
+
+
+class _AnomalyProbe:
+    """Semi-supervised alternative to the LR probe: fits a robust (Ledoit-Wolf shrinkage)
+    Gaussian on ONLY the non-depressed (y==0) side of the training fold -- learning what
+    "normal" circadian/activity structure looks like -- then scores every window by its
+    Mahalanobis distance to that healthy distribution, RANK-normalised to (0, 1] so it
+    plugs into the existing threshold search (`best_threshold` scans a [0.05, 0.95] grid)
+    exactly like a probability. Higher score = further from "normal" = more depression-like.
+    fit()/predict_proba() match the sklearn interface used everywhere else, so this is a
+    drop-in swap for the LogisticRegression probe -- no other code needs to change."""
+
+    def __init__(self):
+        self.scaler = StandardScaler()
+        self.cov = LedoitWolf()
+
+    def fit(self, X, y):
+        Xn = self.scaler.fit_transform(np.asarray(X)[np.asarray(y) == 0])   # non-dep side only
+        self.cov.fit(Xn)
+        return self
+
+    def predict_proba(self, X):
+        d = self.cov.mahalanobis(self.scaler.transform(X))     # squared Mahalanobis distance
+        score = rankdata(d) / len(d)                            # -> (0, 1], rank-normalised
+        return np.stack([1 - score, score], axis=1)
+
+
+def _clamp_pca(n_pca, n_samples, n_features):
+    """Largest usable PCA width: sklearn requires n_components <= min(n_samples, n_features).
+
+    The pool here is tens of participants, so a requested 50 would raise inside a CV fold that
+    only has ~60 training rows. Returns 0 when PCA is disabled."""
+    if not n_pca or n_pca <= 0:
+        return 0
+    return max(1, min(int(n_pca), int(n_samples) - 1, int(n_features)))
+
+
+def _make_probe(mode, C, seed, n_pca=0):
+    """Probe factory: 'supervised' = the standard 2-class LR probe; 'anomaly' = the
+    non-depressed-only Mahalanobis probe above. Same fit/predict_proba interface either way.
+
+    `n_pca` > 0 inserts PCA between the scaler and the classifier. It sits INSIDE the pipeline
+    on purpose: probe_cv_within_pool refits the pipeline per fold, so the components are
+    re-estimated on each fold's training participants only and never see the held-out ones."""
+    if mode == "anomaly":
+        return _AnomalyProbe()
+    steps = [StandardScaler()]
+    if n_pca and n_pca > 0:
+        steps.append(PCA(n_components=int(n_pca), random_state=seed))
+    steps.append(LogisticRegression(C=C, max_iter=3000,
+                                    class_weight="balanced", random_state=seed))
+    return make_pipeline(*steps)
+
+
+def probe_cv_within_pool(reprs, y, pids, pid_label, pool_pids, probe_sel,
+                         n_folds, C, seed, probe_mode="supervised", n_pca=0,
+                         fold_seed=None):
+    """Participant-level k-fold CV WITHIN the probe pool -- the held-out test set is never
+    touched. Each fold trains the logistic probe on the other folds' participants and
+    predicts the held-out fold, so every pool participant gets one out-of-fold (OOF)
+    prediction. The decision threshold is tuned on the *pooled OOF* predictions (far more
+    stable than a single val split, and it uses all pool participants), and those OOF
+    predictions also give an internal-CV estimate of probe quality. The RETURNED probe is
+    refit on ALL pool participants -- more training data than a single train/val split.
+
+    `seed` seeds the probe ESTIMATORS (PCA / LR); `fold_seed` seeds the fold ASSIGNMENT, i.e.
+    which participants land in which fold. They are separate so a crossed --split-seed /
+    --model-seed design keeps the fold partition on the split side. `fold_seed=None` keeps
+    both on `seed`, the historical behaviour.
+
+    Returns (clf_all, thr, cv_metrics)."""
+    from sklearn.model_selection import StratifiedKFold
+    fold_seed = seed if fold_seed is None else fold_seed
+    pool_pids = np.array(sorted(pool_pids))
+    labels = np.array([int(pid_label[p]) for p in pool_pids])
+    # clamp folds to the smaller class so StratifiedKFold never fails on a tiny class
+    min_class = int(min((labels == 0).sum(), (labels == 1).sum()))
+    n_folds = max(2, min(int(n_folds), max(2, min_class)))
+
+    skf = StratifiedKFold(n_splits=n_folds, shuffle=True, random_state=fold_seed)
+    oof_prob, oof_lbl = [], []
+    for tr, va in skf.split(pool_pids, labels):
+        tr_mask = np.isin(pids, pool_pids[tr]) & probe_sel
+        va_mask = np.isin(pids, pool_pids[va]) & probe_sel
+        # Clamp per fold: the smallest fold decides how many components are admissible.
+        k = _clamp_pca(n_pca, int(tr_mask.sum()), reprs.shape[1])
+        clf = _make_probe(probe_mode, C, seed, k); clf.fit(reprs[tr_mask], y[tr_mask])
+        pp, pl = participant_aggregate(pids[va_mask],
+                                       clf.predict_proba(reprs[va_mask])[:, 1], y[va_mask])
+        oof_prob.append(pp); oof_lbl.append(pl)
+    oof_prob, oof_lbl = np.concatenate(oof_prob), np.concatenate(oof_lbl)
+    thr = best_threshold(oof_lbl, oof_prob)
+    cv_metrics = binary_metrics(oof_lbl, oof_prob, thr)      # internal OOF-CV over the pool
+    cv_metrics["n_folds"] = int(n_folds)
+    cv_metrics["n_pool_participants"] = int(len(pool_pids))
+    # Persisted so a FIXED operating point (e.g. "threshold at 80% sensitivity") can be chosen
+    # from out-of-fold predictions rather than from the test cohort, and so that choice stays
+    # auditable after the run. These never touch test -- the pool excludes it by construction.
+    cv_metrics["oof_prob"] = [float(v) for v in oof_prob]
+    cv_metrics["oof_label"] = [int(v) for v in oof_lbl]
+
+    pool_mask = np.isin(pids, pool_pids) & probe_sel
+    clf_all = _make_probe(probe_mode, C, seed,
+                          _clamp_pca(n_pca, int(pool_mask.sum()), reprs.shape[1]))
+    clf_all.fit(reprs[pool_mask], y[pool_mask])
+    return clf_all, thr, cv_metrics
+
+
+
+def save_loss_curves(iters, train_loss, val_loss, variant_dir, tag):
+    """Save 'pretrain loss over iterations' and 'val loss over iterations' as two PNGs."""
+    import matplotlib
+    matplotlib.use("Agg")
+    import matplotlib.pyplot as plt
+    aligned = len(iters) == len(train_loss) and len(iters) > 0
+    x = list(iters) if aligned else list(range(1, len(train_loss) + 1))
+    xlabel = "iteration" if aligned else "epoch"
+
+    fig, ax = plt.subplots(figsize=(7, 4.5))
+    ax.plot(x, train_loss, marker="o", ms=3, lw=1.8, color="#0072B2")
+    ax.set_xlabel(xlabel); ax.set_ylabel("contrastive loss")
+    ax.set_title(f"Pretrain loss over {xlabel}s  -  {tag}"); ax.grid(alpha=0.25)
+    fig.tight_layout()
+    fig.savefig(variant_dir / "pretrain_loss.png", dpi=200, bbox_inches="tight")
+    plt.close(fig)
+
+    if val_loss:
+        fig, ax = plt.subplots(figsize=(7, 4.5))
+        ax.plot(x[:len(val_loss)], val_loss, marker="o", ms=3, lw=1.8, color="#D55E00")
+        ax.set_xlabel(xlabel); ax.set_ylabel("held-out contrastive loss")
+        ax.set_title(f"Validation loss over {xlabel}s  -  {tag}"); ax.grid(alpha=0.25)
+        fig.tight_layout()
+        fig.savefig(variant_dir / "val_loss.png", dpi=200, bbox_inches="tight")
+        plt.close(fig)
 
 
 def paper_kernels(seq_len):
     """CoST mixture-of-AR-experts kernels: powers of 2 up to floor(log2(T/2))."""
     L = max(0, int(math.floor(math.log2(max(seq_len // 2, 1)))))
     return [2 ** i for i in range(L + 1)]
+
+
+def save_signal_embedding(model, X, pids, test_pids, pid_label, variant_dir,
+                          sensor_cols, n_sensors):
+    """Save ONE depressed + ONE non-depressed held-out TEST window: the raw token
+    signal (before embedding) and the encoder's per-timestep representation (after
+    embedding, ``model.net(x, tcn_output=True)``). Read back by
+    ``plot_position_similarity.py --signalviz`` to compare, across PE techniques and
+    both groups, what the embedding does to the signal. Deterministic (sorted pid)."""
+    import numpy as _np
+    dep = sorted(p for p in test_pids if pid_label.get(p) == 1)
+    non = sorted(p for p in test_pids if pid_label.get(p) == 0)
+    if not dep or not non:
+        print("[signal-embed] no depressed/non-depressed test pid; skipping")
+        return
+    pid_d, pid_n = dep[0], non[0]
+    idx_d = _np.where(pids == pid_d)[0][-1]                 # last (most recent) window of each
+    idx_n = _np.where(pids == pid_n)[0][-1]
+    org = model.net.training
+    model.net.eval()
+    with torch.no_grad():
+        xb = torch.from_numpy(X[[idx_d, idx_n]]).float().to(model.device)
+        emb = model.net(xb, tcn_output=True).cpu().numpy()  # (2, T, output_dims)
+    model.net.train(org)
+    _np.savez_compressed(
+        variant_dir / "signal_embedding.npz",
+        sig_dep=X[idx_d, :, :n_sensors].astype("float32"),  # (T, n_sensors) before embedding
+        sig_non=X[idx_n, :, :n_sensors].astype("float32"),
+        emb_dep=emb[0].astype("float32"),                   # (T, output_dims) after embedding
+        emb_non=emb[1].astype("float32"),
+        sensor_cols=_np.array(list(sensor_cols), dtype=object),
+        pid_dep=str(pid_d), pid_non=str(pid_n),
+    )
+    print(f"[signal-embed] saved dep={pid_d} / non={pid_n} -> {variant_dir/'signal_embedding.npz'}")
 
 
 # ---------------------------------------------------------------------------
@@ -90,33 +424,163 @@ def parse_args():
     p = argparse.ArgumentParser(description="CoST on HRD: depression-endpoint classification")
     p.add_argument("--sensor-csv", required=True, help="Path to HRD_RAW_MinuteLevel.csv")
     p.add_argument("--label-col", default="depression_status_endpoint")
+
+    # --- GLOBEM (--dataset globem). Ignored entirely on the default HRD path. ---------
+    p.add_argument("--dataset", choices=["hrd", "globem"], default="hrd",
+                   help="'hrd' = minute-level HRD_RAW_MinuteLevel.csv (default); 'globem' = "
+                        "segment-level GLOBEM_REDUCED.csv (12 features, 4 segments/day).")
+    p.add_argument("--window-days", type=int, default=28,
+                   help="[globem] window length in days (x4 segments -> T). Default 28 -> T=112.")
+    p.add_argument("--stride-days", type=int, default=7,
+                   help="[globem] slide between consecutive windows, in days.")
+    p.add_argument("--globem-anchor-weekday", type=int, default=0,
+                   help="[globem] weekday every window starts on (0=Mon .. 6=Sun; -1 disables).")
+    p.add_argument("--globem-label", choices=["weekly", "endpoint"], default="weekly",
+                   help="[globem] 'weekly' = per-window time-varying LABEL_WEEKLY; "
+                        "'endpoint' = one end-of-study label per participant.")
+    p.add_argument("--cohort", choices=["consistent", "labeled"], default="consistent",
+                   help="Participants forming the split: 'consistent' = only baseline==endpoint "
+                        "(clean label, fewer people); 'labeled' = EVERY participant with an "
+                        "endpoint label (more samples, but status-changers add label noise).")
+    p.add_argument("--probe-unit", choices=["last", "all", "persubject"], default="last",
+                   help="What counts as one probe sample. 'last' = the participant's most recent "
+                        "window (default, no pseudo-replication but discards the other windows); "
+                        "'all' = every window carries its participant's label (uses all data but "
+                        "the effective n is still the participant count); 'persubject' = one row "
+                        "per participant holding [mean|std] of that participant's window "
+                        "embeddings (all data AND correct n). Pair 'persubject' with --probe-pca.")
+    p.add_argument("--probe-pca", type=int, default=0,
+                   help="PCA components between the scaler and the classifier; 0 disables it. "
+                        "Fitted inside each CV fold on that fold's training participants only. "
+                        "Automatically clamped to min(n_train-1, n_features). ~20 is a sensible "
+                        "value for 'persubject', where the feature vector doubles in width.")
+    p.add_argument("--probe-last-window", action="store_true",
+                   help="DEPRECATED alias for '--probe-unit last', which is already the default; "
+                        "kept only so older command lines and notes do not fail. If --probe-unit "
+                        "is also given explicitly, --probe-unit wins and a note is printed. "
+                        "Pretraining is unaffected either way (it always uses all windows).")
+    p.add_argument("--probe-c", type=float, default=1.0,
+                   help="Inverse L2 strength of the logistic probe. Use a small value (e.g. 0.1) "
+                        "for --probe-unit last/persubject, where only ~1 sample per participant "
+                        "is available.")
+    p.add_argument("--probe-mode", choices=["supervised", "anomaly"], default="supervised",
+                   help="'supervised' (default) = standard 2-class logistic-regression probe. "
+                        "'anomaly' = semi-supervised alternative: fits a robust Gaussian on ONLY "
+                        "the non-depressed training participants (what 'normal' rhythm looks "
+                        "like) and scores everyone by Mahalanobis distance to it -- depression "
+                        "as a deviation from the learned norm, rather than a discriminated class.")
+    p.add_argument("--cv-folds", type=int, default=1,
+                   help="Participant-level k-fold CV WITHIN the probe pool (test untouched): tunes "
+                        "the threshold on pooled out-of-fold predictions and trains the final probe "
+                        "on ALL probe participants. 1 = single train/val split (no CV).")
     p.add_argument("--window-hours", type=int, default=168)
     p.add_argument("--bin-minutes", type=int, default=15)
     p.add_argument("--max-missing", type=float, default=0.30,
                    help="Drop participants with more than this fraction of wear-channel missingness")
     p.add_argument("--max-window-missing", type=float, default=0.30,
-                   help="Drop windows with more than this fraction of empty time-bins")
+                   help="Algorithm-1 (Yan et al. 2022) threshold: drop a window if ANY sensor "
+                        "channel has more than this fraction of missing time-bins, or if a "
+                        "channel's first/last bin is missing")
     p.add_argument("--no-zscore", action="store_true", help="Disable per-participant z-scoring")
-    p.add_argument("--test-frac", type=float, default=0.30,
-                   help="Fraction of CONSISTENT participants held out for the test set")
+    p.add_argument("--save-encoder", action="store_true",
+                   help="Write encoder.pt (~235 MB per variant). Off by default; needed only "
+                        "to redo a latent analysis without retraining.")
+    p.add_argument("--with-clock-features", action="store_true",
+                   help="Opt-in: append the clock/time channels (time-of-day & "
+                        "day-of-week sin/cos + linear ramp) and inject them as a "
+                        "temporal positional encoding. OFF by default -- time is "
+                        "excluded from the model entirely (neither an input feature "
+                        "nor a positional encoding).")
+    p.add_argument("--test-per-class", type=int, default=18,
+                   help="Hold out EXACTLY this many CONSISTENT participants of each class "
+                        "(depressed / non-depressed) as a class-balanced test set; they are "
+                        "excluded from both pretrain and fine-tune. Default 18 -> 36 test pids.")
+    p.add_argument("--test-frac", type=float, default=0.35,
+                   help="(deprecated) old fraction-based test holdout; ignored when "
+                        "--test-per-class is used")
+    p.add_argument("--target-prevalence", type=float, nargs="+", default=None,
+                   help="Base rate(s) at which to ALSO report PPV/NPV/F1/accuracy/MCC. The "
+                        "test cohort is balanced by construction, so the headline threshold "
+                        "metrics are quoted at an implied 50%% prevalence and do not transfer; "
+                        "sensitivity/specificity/AUROC do. Defaults to the observed cohort "
+                        "prevalence. Pass e.g. 0.05 0.1 0.2 to bracket a deployment rate.")
     p.add_argument("--val-frac", type=float, default=0.25,
                    help="Fraction of the fine-tune cohort used to pick the decision threshold")
+    p.add_argument("--pretrain-val-frac", type=float, default=0.10,
+                   help="Fraction of pretrain windows held out to monitor the SSL validation loss")
     # CoST encoder / pretraining
-    p.add_argument("--backbone", default="tcn", choices=["tcn", "transformer"])
+    p.add_argument("--backbone", default="tcn",
+                    choices=["tcn", "transformer", "vit", "vit_plain"])
     p.add_argument(
         "--pe", default=None,
         choices=["sinusoidal", "learnable", "tape", "rpe", "erpe", "tupe",
-                 "convspe", "tpe", "time2vec", "none"],
-        help="Positional encoding. Transformer accepts all 8 PE methods plus "
-             "time2vec (default: sinusoidal). TCN accepts only 'none' (baseline, "
-             "default) or 'time2vec'.",
+                 "convspe", "tpe", "time2vec", "factorized", "circular", "none"],
+        help="Positional encoding. Transformer accepts all 8 index-based PE methods plus "
+             "time2vec and the two wall-clock ones (default: sinusoidal). TCN accepts "
+             "'none' (baseline, default), 'time2vec', 'factorized' or 'circular' -- the "
+             "input-side encodings, which is what lets a reference-frame contrast be read "
+             "on both backbones.",
     )
+    p.add_argument("--time2vec-dim", type=int, default=16,
+                   help="Time2Vec vector size k+1 (1 linear + k learnable-frequency "
+                        "sines), concatenated to the input when --pe time2vec "
+                        "(Kazemi et al. 2019, fed as input). Default 16: with only 4 "
+                        "sensor channels a larger block (e.g. 64) swamps the input and "
+                        "collapses SSL; the t2v features are also standardised in "
+                        "Time2VecPE.forward. Paper tries k in {16,32,64}.")
     p.add_argument("--repr-dims", type=int, default=320)
     p.add_argument("--hidden-dims", type=int, default=64)
     p.add_argument("--depth", type=int, default=10)
+    p.add_argument("--pool", choices=["last", "mean", "max", "meanmax"], default="mean",
+                   help="How the frozen representation is collapsed over the 7-day window "
+                        "before the linear probe: 'mean' (default) / 'max' summarise the WHOLE "
+                        "window; 'last' = final timestep only (original CoST forecasting "
+                        "readout); 'meanmax' = mean+max concatenated.")
+    p.add_argument("--season-pool", choices=["spec", "spec_amp", "spec_phase", "same"],
+                   default="spec",
+                   help="Readout of the SEASONAL half only. Default 'spec' reads amplitude "
+                        "AND phase at the chronobiological harmonics (circaseptan, circadian, "
+                        "12/8/6h). 'same' = use --pool for it too, which is the ABLATION: the "
+                        "seasonal branch is an irFFT, so time-averaging it returns exactly the "
+                        "f=0 (DC/MESOR) coefficient and every rhythm integrates to zero.")
     p.add_argument("--kernels", type=int, nargs="+", default=None,
                    help="AR-expert kernel sizes (default: CoST powers-of-2 from window length)")
-    p.add_argument("--alpha", type=float, default=0.0005)
+    p.add_argument("--alpha", type=float, default=0.0005,
+                   help="Seasonal-loss weight (fixed mode only; ignored under --loss-balance gradnorm)")
+    p.add_argument("--jitter-sigma", type=float, default=0.1,
+                   help="Std of the additive-noise (jitter) augmentation. Lower preserves phase "
+                        "estimation (CoST default 0.1; try 0.05 to strengthen seasonal phase).")
+    p.add_argument("--phase-encoding", choices=["circular", "circular_amp", "raw"],
+                   default="circular",
+                   help="How the seasonal (SFD) loss compares FFT phases. 'circular' (default) "
+                        "embeds each angle as [sin, cos] so the contrastive dot product becomes "
+                        "cos(phi_i - phi_j) -- a true function of the angular gap. "
+                        "'circular_amp' additionally weights each channel by its own amplitude "
+                        "(amplitude-weighted phase coherence), so channels whose phase is "
+                        "undefined noise stop counting as much as real rhythms; it is a strict "
+                        "generalisation of 'circular' and preserves the logit scale. 'raw' is "
+                        "upstream CoST's raw atan2 angle, where the +/-pi branch cut makes two "
+                        "IDENTICAL phases look maximally dissimilar; keep it only to reproduce "
+                        "archived runs.")
+    p.add_argument("--mask-mode", choices=["none", "binomial", "continuous"], default="none",
+                   help="Training-time timestep-masking augmentation. 'none' (default) matches "
+                        "upstream CoST, which never applied one -- its encoder's mask argument "
+                        "hard-defaulted to 'all_true', so no published CoST run was masked. "
+                        "'binomial'/'continuous' are opt-in and change SSL results: the mask "
+                        "stacks on real non-wear gaps and adds broadband noise to the rFFT "
+                        "amplitude/phase the seasonal loss fits. A/B one seed before a sweep.")
+    p.add_argument("--mask-keep-prob", type=float, default=0.5,
+                   help="Keep-probability of the binomial training mask; only has an effect "
+                        "with --mask-mode binomial. Higher = LESS masking, better temporal "
+                        "alignment / phase (CoST's nominal value 0.5; try 0.75).")
+    p.add_argument("--loss-balance", choices=["fixed", "gradnorm"], default="fixed",
+                   help="How trend vs seasonal losses are weighted: 'fixed' = weight seasonal "
+                        "by --alpha (original CoST); 'gradnorm' = adaptively balance the two so "
+                        "the seasonal branch is not starved.")
+    p.add_argument("--disentangle", action=argparse.BooleanOptionalAction, default=True,
+                   help="--disentangle = CoST (trend MoCo + seasonal FFT). --no-disentangle = a plain "
+                        "single-representation self-supervised encoder: NO trend/seasonal split, one MoCo "
+                        "on the encoder output, and no disentanglement eval files (prediction only).")
     p.add_argument("--max-train-length", type=int, default=None,
                    help="Crop length for pretraining; defaults to the window length T "
                         "(the CoST Fourier layer is sized to this, so it must equal T)")
@@ -125,9 +589,52 @@ def parse_args():
     p.add_argument("--iters", type=int, default=None, help="Pretraining iterations")
     p.add_argument("--epochs", type=int, default=None, help="Pretraining epochs")
     # misc
-    p.add_argument("--seed", type=int, default=42)
+    p.add_argument("--seed", type=int, default=42,
+                   help="Shared fallback for --split-seed and --model-seed. Setting only this "
+                        "reproduces the historical behaviour where one seed drives BOTH.")
+    # Splitting the seed in two: with a single --seed, changing 'the seed' changes WHICH
+    # participants are in the test set AND the weight init / augmentation / loader order at
+    # once, so the usual "mean +/- sd over seeds" is a mixture of split variance and
+    # optimisation variance and cannot be read as either. With ~36 test participants the
+    # split term is expected to dominate. Cross the two to separate them: hold --split-seed
+    # fixed and vary --model-seed for optimisation noise; hold --model-seed fixed and vary
+    # --split-seed for cohort sensitivity; run the grid for the interaction.
+    p.add_argument("--split-seed", type=int, default=None,
+                   help="Seed for WHO goes where: test/val participant splits, the pretrain "
+                        "val holdout, CV fold assignment and the participant bootstrap. "
+                        "Defaults to --seed.")
+    p.add_argument("--model-seed", type=int, default=None,
+                   help="Seed for HOW the model trains: weight init, augmentation stream, "
+                        "loader shuffling, probe estimators and the analysis embeddings. "
+                        "Defaults to --seed.")
     p.add_argument("--gpu", type=int, default=0, help="GPU index, or a negative value to force CPU")
     p.add_argument("--max-threads", type=int, default=None)
+    p.add_argument("--no-rhythm-viz", action="store_true",
+                   help="Skip the HRD test-set rhythm analysis (t-SNE + amplitude/"
+                        "phase profiles + separability table) saved per variant.")
+    p.add_argument("--paper-cosinor-topk", type=int, default=2,
+                   help="Dominant periods per channel for the paper-cosinor LR baseline "
+                        "(exact CosinorPy clone). 2 mirrors the paper's top-two-period tables. "
+                        "Feature dim = n_sensors * topk * 12.")
+    # Optional second downstream, REUSING this run's frozen encoder (no extra pretraining):
+    # probe the daily self-reported emotional_energy (1-5) on the SAME held-out test
+    # participants. Leakage-free (test was already excluded from pretraining) and cheap.
+    p.add_argument("--energy-probe", action="store_true",
+                   help="After pretraining, also probe daily emotional_energy (mode-B sliding "
+                        "windows) reusing the frozen encoder; writes to --energy-output-dir.")
+    p.add_argument("--energy-stride", type=int, default=3,
+                   help="Keep every k-th labelled day for the energy probe (default 3). "
+                        "Consecutive trailing windows share 6 of 7 days, so the inputs are "
+                        "highly redundant; k=3 keeps a ~21:1 sample-to-feature ratio while "
+                        "cutting the windowing time and the ~0.5 GiB array to a third. Use "
+                        "1 for every labelled day (the previous behaviour).")
+    p.add_argument("--energy-pool", choices=["last", "mean", "max", "meanmax"], default="last",
+                   help="Window pooling for the energy probe (default 'last', closest to the "
+                        "labelled day). Independent of the depression --pool.")
+    p.add_argument("--energy-threshold", type=float, default=4.0,
+                   help="emotional_energy >= this = 'high-energy day' (default 4 -> ~47%% positive).")
+    p.add_argument("--energy-output-dir", default="./results_hrd_energy",
+                   help="Where the emotional-energy report.md/metrics.json go (mirrors --run-id).")
     p.add_argument("--output-dir", default="./results_hrd")
     p.add_argument("--run-id", default=None,
                    help="Sub-folder grouping a sweep's runs under --output-dir "
@@ -140,46 +647,131 @@ def main():
     # Resolve the per-backbone default PE: sinusoidal for the Transformer, none
     # (the position-aware convolutions need no PE) for the TCN.
     if args.pe is None:
-        args.pe = "sinusoidal" if args.backbone == "transformer" else "none"
-    if args.backbone == "tcn" and args.pe not in ("none", "time2vec"):
+        if args.backbone == "transformer":
+            args.pe = "sinusoidal"
+        elif args.backbone == "vit_plain":
+            args.pe = "learnable"
+        else:
+            args.pe = "none"
+    # The calendar PEs are allowed on the TCN too: convolutions carry RELATIVE position but
+    # have no access to absolute calendar phase, which is exactly what they add.
+    if args.backbone == "tcn" and args.pe not in ("none", "time2vec") + CALENDAR_PES:
         raise SystemExit(
             f"--pe {args.pe} is not valid for the TCN backbone "
-            "(use 'none' or 'time2vec')."
+            "(use 'none', 'time2vec', 'factorized' or 'circular')."
+        )
+    if args.pe in CALENDAR_PES and args.with_clock_features:
+        raise SystemExit(
+            f"--pe {args.pe} replaces the clock covariates with its own calendar encoding; "
+            "drop --with-clock-features."
         )
     if args.backbone == "transformer" and args.pe == "none":
         raise SystemExit("--pe none is not valid for the Transformer backbone.")
+    if args.backbone == "vit" and args.pe != "none":
+        raise SystemExit(
+            "--pe must be 'none' for the vit backbone: it uses an intrinsic "
+            "Learnable-Fourier(time) + discrete(channel) encoding, not a swappable PE."
+        )
+    if args.backbone == "vit_plain" and args.pe != "learnable":
+        raise SystemExit(
+            "--pe must be 'learnable' for the vit_plain backbone: it is the original "
+            "ViT (Dosovitskiy et al. 2021) with a single learnable absolute positional "
+            "embedding, not a swappable PE."
+        )
+    # Deprecated alias: it means exactly --probe-unit last, which is already the default, so it
+    # only ever matters when the two disagree. Say so at startup rather than silently picking
+    # one, because the choice changes what a probe sample is and is not visible in the metrics.
+    if args.probe_last_window and args.probe_unit != "last":
+        print(f"[probe] NOTE: --probe-last-window is deprecated and is being ignored, because "
+              f"--probe-unit {args.probe_unit} was given explicitly.")
+    if args.probe_pca and args.probe_unit == "all":
+        print("[probe] NOTE: --probe-pca with --probe-unit all fits the components on windows, "
+              "not participants; it is intended for --probe-unit persubject.")
+
+    # Resolve the two seeds; both fall back to --seed, so a run that passes neither behaves
+    # exactly as before. split_seed decides WHO goes where, model_seed decides HOW it trains.
+    split_seed = args.seed if args.split_seed is None else args.split_seed
+    model_seed = args.seed if args.model_seed is None else args.model_seed
+    if split_seed != model_seed:
+        print(f"[seed] split_seed={split_seed} (cohort) | model_seed={model_seed} "
+              f"(init/augmentation/probe) -- crossed design")
+
     out_dir = Path(args.output_dir)
     out_dir.mkdir(parents=True, exist_ok=True)
     dev = "cpu" if args.gpu < 0 else args.gpu
-    device = init_dl_program(dev, seed=args.seed, max_threads=args.max_threads)
+    device = init_dl_program(dev, seed=model_seed, max_threads=args.max_threads)
     t_start = time.time()
 
     # 1. data -------------------------------------------------------------
-    data = prepare_hrd_dataset(
-        args.sensor_csv,
-        window_hours=args.window_hours,
-        bin_minutes=args.bin_minutes,
-        label_col=args.label_col,
-        max_missing=args.max_missing,
-        max_window_missing=args.max_window_missing,
-        z_score=not args.no_zscore,
-    )
+    if args.dataset == "globem":
+        from data_processing.globem_preprocessing import prepare_globem_dataset
+        # 4 segments/day -> a segment is a 6 h "bin"; pinning bin_minutes here keeps every
+        # downstream time-aware component (bins_per_day=4, rhythm/decomp labels) correct.
+        args.bin_minutes = 24 * 60 // 4
+        label_col = (args.label_col if args.label_col != "depression_status_endpoint"
+                     else "LABEL_ENDPOINT")
+        data = prepare_globem_dataset(
+            args.sensor_csv,
+            window_days=args.window_days,
+            stride_days=args.stride_days,
+            label_col=label_col,
+            z_score=not args.no_zscore,
+            clock_features=args.with_clock_features,
+            weekly_labels=(args.globem_label == "weekly"),
+            anchor_weekday=args.globem_anchor_weekday,
+        )
+    else:
+      data = prepare_hrd_dataset(
+          args.sensor_csv,
+          window_hours=args.window_hours,
+          bin_minutes=args.bin_minutes,
+          label_col=args.label_col,
+          max_missing=args.max_missing,
+          max_window_missing=args.max_window_missing,
+          z_score=not args.no_zscore,
+          clock_features=args.with_clock_features,
+          calendar_index=args.pe in CALENDAR_PES,
+          # Keep the parsed CSV only when the energy probe will re-read it below.
+          cache_raw=args.energy_probe,
+      )
     X, y, pids = data["X"], data["y"], data["pids"]
-    consistent_pids = data["consistent_pids"]
+    # cohort for the split: 'consistent' = only baseline==endpoint (clean label); 'labeled' =
+    # every participant with an endpoint label (more samples; status-changers add label noise).
+    cohort_pids = data["labeled_pids"] if args.cohort == "labeled" else data["consistent_pids"]
     pid_label = {p: int(y[pids == p][0]) for p in np.unique(pids)}
+    # A labeled participant can survive the label table yet produce zero windows (all windows
+    # dropped by the per-window wear-missing filter). Such a pid is in cohort_pids but NOT in
+    # pid_label -> keep only cohort participants that actually have windows, else the probe's
+    # pid_label[p] lookup KeyErrors on it.
+    cohort_pids = {p for p in cohort_pids if p in pid_label}
+    # latest (last-week) window of each participant: windows are appended chronologically, so a
+    # pid's last index is its most recent window -- the one closest to the endpoint label.
+    last_window_mask = np.zeros(len(pids), bool)
+    for p in np.unique(pids):
+        last_window_mask[np.where(pids == p)[0][-1]] = True
 
     # 2. leakage-safe split ----------------------------------------------
-    rest_cons, test_pids = stratified_pid_holdout(
-        consistent_pids, pid_label, args.test_frac, args.seed
+    # Class-balanced test set: exactly args.test_per_class depressed + the same number
+    # non-depressed, held out from BOTH pretrain and fine-tune (pretrain = all non-test).
+    rest_cons, test_pids = balanced_pid_holdout(
+        cohort_pids, pid_label, args.test_per_class, split_seed
     )
     if not test_pids:
-        raise RuntimeError("Test holdout is empty; check --test-frac and the consistent cohort.")
-    test_mask = np.isin(pids, list(test_pids))
-    pretrain_mask = ~test_mask                                  # ALL non-test windows
-    finetune_mask = np.isin(pids, list(rest_cons))              # 70% consistent cohort
-    print(f"[split] pretrain windows={int(pretrain_mask.sum())} | "
-          f"fine-tune windows={int(finetune_mask.sum())} ({len(rest_cons)} pids) | "
-          f"test windows={int(test_mask.sum())} ({len(test_pids)} pids)")
+        raise RuntimeError(f"Test holdout is empty; check --test-per-class and the '{args.cohort}' cohort.")
+    test_mask = np.isin(pids, list(test_pids))                  # all windows of test pids
+    pretrain_mask = ~test_mask                                  # ALL non-test windows (test excluded)
+    finetune_mask = np.isin(pids, list(rest_cons))              # cohort minus test
+    n_pos = sum(pid_label.get(p) == 1 for p in test_pids)
+    # participants != windows: unlabeled pids are used in pretraining ONLY (SSL is label-free).
+    all_pids = np.unique(pids)
+    n_labeled = len(set(cohort_pids) & set(all_pids))
+    n_unlabeled = len(all_pids) - n_labeled
+    pretrain_w, ft_w = int(pretrain_mask.sum()), int(finetune_mask.sum())
+    print(f"[split] participants: {len(all_pids)} total = {n_labeled} labeled "
+          f"[{len(test_pids)} test ({n_pos} dep/{len(test_pids)-n_pos} non) + {len(rest_cons)} probe] "
+          f"+ {n_unlabeled} unlabeled (pretrain-only)")
+    print(f"[split] windows: pretrain={pretrain_w} (= {ft_w} labeled-non-test + {pretrain_w-ft_w} unlabeled) "
+          f"| test-pids' windows={int(test_mask.sum())}")
 
     # 3. CoST self-supervised pretraining --------------------------------
     seq_len = X.shape[1]
@@ -187,8 +779,12 @@ def main():
     # The CoST seasonal (Fourier) layer is sized to max_train_length, so it must
     # equal the window length T; clamp any larger request down to T.
     max_train_length = seq_len if args.max_train_length is None else min(args.max_train_length, seq_len)
+    # clock/time-feature channels are appended after the sensors; route them into
+    # the encoder's temporal-encoding path (not input_fc / the seasonal branch).
+    n_time_features = int(X.shape[-1]) - int(data["n_sensors"])
     model = CoST(
         input_dims=X.shape[-1],
+        n_time_features=n_time_features,
         kernels=kernels,
         alpha=args.alpha,
         max_train_length=max_train_length,
@@ -197,70 +793,472 @@ def main():
         depth=args.depth,
         backbone=args.backbone,
         pe=args.pe,
+        time2vec_dim=args.time2vec_dim,
+        loss_balance=args.loss_balance,
+        bins_per_day=(24 * 60 // args.bin_minutes),
+        disentangle=args.disentangle,
+        jitter_sigma=args.jitter_sigma,
+        mask_mode=args.mask_mode,
+        mask_prob=args.mask_keep_prob,
+        phase_mode=args.phase_encoding,
         device=device,
         lr=args.lr,
         batch_size=args.batch_size,
     )
-    print(f"[pretrain] CoST backbone={args.backbone} pe={args.pe} on {int(pretrain_mask.sum())} windows ...")
-    loss_log = model.fit(X[pretrain_mask], n_epochs=args.epochs, n_iters=args.iters, verbose=True)
+    # Hold out a small slice of pretrain windows to monitor the SSL validation loss. The
+    # holdout is by PARTICIPANT, not by window: windows of one person share their physiology
+    # (and are already per-participant z-scored), so a window-level split would put the same
+    # people on both sides and the val loss would measure "can I contrast windows of someone I
+    # trained on" instead of generalisation to a new person. That loss drives the
+    # best-checkpoint restore in CoST.fit(), so a contaminated signal selects the checkpoint.
+    # (Not a test leak either way -- pretrain_mask already excludes every test participant.)
+    rng = np.random.default_rng(split_seed)
+    pre_pids = np.unique(pids[pretrain_mask])
+    rng.shuffle(pre_pids)
+    n_val_pids = int(round(args.pretrain_val_frac * len(pre_pids)))
+    pre_val_mask = np.zeros_like(pretrain_mask)
+    if n_val_pids >= 1:
+        cand = pretrain_mask & np.isin(pids, pre_pids[:n_val_pids])
+        # CoST.fit builds the val loader with drop_last=True, so a holdout smaller than one
+        # batch yields zero batches (no val loss, no best-checkpoint). Keep all windows for
+        # training in that case rather than silently losing them.
+        if int(cand.sum()) >= args.batch_size:
+            pre_val_mask = cand
+    pre_train_mask = pretrain_mask & ~pre_val_mask
+    print(f"[pretrain] CoST backbone={args.backbone} pe={args.pe} on {int(pre_train_mask.sum())} "
+          f"windows from {len(np.unique(pids[pre_train_mask]))} pids "
+          f"(+{int(pre_val_mask.sum())} windows from "
+          f"{len(np.unique(pids[pre_val_mask])) if pre_val_mask.any() else 0} disjoint pids "
+          f"held out for val loss) ...")
+    loss_log = model.fit(X[pre_train_mask],
+                         valid_data=X[pre_val_mask] if pre_val_mask.any() else None,
+                         n_epochs=args.epochs, n_iters=args.iters, verbose=True)
     pretrain_seconds = time.time() - t_start
 
     # 4. representations + classifier ------------------------------------
-    reprs = model.encode(X, mode="forecasting").squeeze(1)      # (N, repr_dims)
+    # pooled over the whole window (args.pool; default mean) rather than the last timestep.
+    # The seasonal half uses --season-pool ('spec' by default; 'same' falls back to args.pool).
+    season_pool = None if args.season_pool == "same" else args.season_pool
+    reprs = model.encode(X, mode="forecasting", pool=args.pool,
+                         season_pool=season_pool).squeeze(1)                 # (N, repr_dims)
 
     ft_pids = sorted(rest_cons)
-    rem_pids, val_pids = stratified_pid_holdout(ft_pids, pid_label, args.val_frac, args.seed)
-    train_mask = np.isin(pids, list(rem_pids))
-    val_mask = np.isin(pids, list(val_pids)) if val_pids else train_mask
+    # --probe-unit decides what ONE probe sample is. All three modes keep the participant-level
+    # split; they differ only in how a participant's windows reach the classifier.
+    #
+    #   last        one row per participant: its most recent window (closest to the endpoint
+    #               survey). No pseudo-replication, but ~96% of the test windows go unused.
+    #   all         every window is a sample carrying its participant's label. Uses all data,
+    #               but the probe sees ~26 correlated copies per person, so the effective n is
+    #               the participant count while the fit and its regularisation behave as if it
+    #               were the window count, and participants with longer records dominate.
+    #   persubject  one row per participant holding [mean | std] of that participant's window
+    #               embeddings. Keeps every window (through the summary) AND keeps n equal to
+    #               the participant count. The std half carries within-person variability,
+    #               which a single window cannot express.
+    #
+    # persubject builds the aggregate for every window row and then selects one row per
+    # participant, so all rows of a participant are identical and the existing mask machinery
+    # (train/val/test, CV folds, participant_aggregate) keeps working untouched.
+    if args.probe_unit == "persubject":
+        agg = np.zeros((len(pids), reprs.shape[1] * 2), dtype=reprs.dtype)
+        for p in np.unique(pids):
+            m = pids == p
+            agg[m] = np.concatenate([reprs[m].mean(axis=0), reprs[m].std(axis=0)])
+        reprs = agg
+        probe_sel = last_window_mask          # representative row; every row of a pid is equal
+    elif args.probe_unit == "last":
+        probe_sel = last_window_mask
+    else:                                      # "all"
+        probe_sel = np.ones(len(pids), bool)
+    print(f"[probe] unit={args.probe_unit} -> {int(probe_sel.sum())} probe rows "
+          f"of dim {reprs.shape[1]}" + (f", PCA<={args.probe_pca}" if args.probe_pca else ""))
 
-    clf = make_pipeline(
-        StandardScaler(),
-        LogisticRegression(max_iter=3000, class_weight="balanced", random_state=args.seed),
-    )
-    clf.fit(reprs[train_mask], y[train_mask])
+    # A single participant-level train/val split of the probe pool. Used by the probe in
+    # non-CV mode, and ALWAYS by the auxiliary supervised/rhythm analyses below (which need
+    # their own held-out split for early stopping / threshold selection).
+    rem_pids, val_pids = stratified_pid_holdout(ft_pids, pid_label, args.val_frac, split_seed)
+    train_mask = np.isin(pids, list(rem_pids)) & probe_sel
+    val_mask = (np.isin(pids, list(val_pids)) & probe_sel) if val_pids else train_mask
+
+    # Same participant split, but WITHOUT probe_sel. `probe_sel` exists to stop one
+    # participant-level depression label from being pseudo-replicated across ~26 correlated
+    # windows; the DRS probe (RQ1) predicts a per-window harmonic reference instead, so its
+    # target varies row by row and there is nothing to pseudo-replicate. Restricting it would
+    # only throw away ~96% of the fitting data -- and asymmetrically, since test_mask is
+    # already unrestricted. The participant-disjoint split is what protects that analysis, and
+    # it is preserved here.
+    train_mask_all = np.isin(pids, list(rem_pids))
+    val_mask_all = np.isin(pids, list(val_pids)) if val_pids else train_mask_all
+
+    if args.cv_folds >= 2:
+        # k-fold CV WITHIN the probe pool: threshold from pooled out-of-fold predictions
+        # (stable, uses all pool participants) + final probe refit on ALL pool participants.
+        clf, thr, cv_metrics = probe_cv_within_pool(
+            reprs, y, pids, pid_label, ft_pids, probe_sel,
+            args.cv_folds, args.probe_c, model_seed, probe_mode=args.probe_mode,
+            n_pca=args.probe_pca, fold_seed=split_seed)
+        n_probe_train = int((np.isin(pids, ft_pids) & probe_sel).sum())   # refit on all pool
+        print(f"[probe] {cv_metrics['n_folds']}-fold CV within {cv_metrics['n_pool_participants']} "
+              f"pool participants: internal OOF AUC={cv_metrics['auc_roc']:.3f} "
+              f"BAcc={cv_metrics['balanced_accuracy']:.3f} MCC={cv_metrics['mcc']:.3f}; "
+              f"threshold={thr:.3f}; final probe refit on all pool participants.")
+    else:
+        # single split: probe fit on the train split, threshold tuned on the val split
+        clf = _make_probe(args.probe_mode, args.probe_c, model_seed,
+                          _clamp_pca(args.probe_pca, int(train_mask.sum()), reprs.shape[1]))
+        clf.fit(reprs[train_mask], y[train_mask])
+        val_pid_prob, val_pid_lbl = participant_aggregate(
+            pids[val_mask], clf.predict_proba(reprs[val_mask])[:, 1], y[val_mask])
+        thr = best_threshold(val_pid_lbl, val_pid_prob)
+        cv_metrics = None
+        n_probe_train = int(train_mask.sum())
 
     def predict(mask):
         return clf.predict_proba(reprs[mask])[:, 1]
 
-    # threshold chosen on the participant-aggregated validation split
-    val_pid_prob, val_pid_lbl = participant_aggregate(pids[val_mask], predict(val_mask), y[val_mask])
-    thr = best_threshold(val_pid_lbl, val_pid_prob)
-
-    # 5. evaluate on the held-out test set -------------------------------
-    test_prob = predict(test_mask)
-    win = binary_metrics(y[test_mask], test_prob, thr)
-    pid_prob, pid_lbl = participant_aggregate(pids[test_mask], test_prob, y[test_mask])
+    # 5. evaluate on the held-out test set (last-week window per pid, or all windows).
+    # With one window per pid, participant_aggregate is a no-op (win == pid).
+    eval_mask = test_mask & probe_sel
+    test_prob = predict(eval_mask)
+    win = binary_metrics(y[eval_mask], test_prob, thr)
+    pid_prob, pid_lbl = participant_aggregate(pids[eval_mask], test_prob, y[eval_mask])
     pid = binary_metrics(pid_lbl, pid_prob, thr)
+    # Bootstrap CI over PARTICIPANTS for both. At participant level each row is already one
+    # person, so this is an ordinary bootstrap; at window level it keeps a person's windows
+    # together. With ~36 test participants the interval is wide -- that is the honest width,
+    # and it is what the AUROC should be quoted with.
+    # Resampled over the TEST participants, so it belongs to the split side: a given cohort
+    # gets the same CI resampling regardless of which model_seed is being evaluated on it.
+    uniq_eval = np.unique(pids[eval_mask])
+    win["auc_ci"] = participant_bootstrap_auc(y[eval_mask], test_prob, pids[eval_mask],
+                                              seed=split_seed)
+    pid["auc_ci"] = participant_bootstrap_auc(pid_lbl, pid_prob, uniq_eval, seed=split_seed)
+
+    # --- prevalence transport, fixed operating points, calibration --------------------
+    # The test cohort is 50/50 by construction (--test-per-class) and `thr` was tuned to
+    # maximise balanced accuracy. AUROC, sensitivity, specificity and balanced accuracy
+    # survive that unchanged; accuracy / F1 / MCC / PPV above are quoted at an implied 50%
+    # base rate and do NOT transfer to a deployment population. Everything below exists so
+    # the headline numbers cannot be read as if they did.
+    labeled_cohort = [p for p in sorted(set(cohort_pids) & set(all_pids))
+                      if pid_label.get(p) in (0, 1)]
+    cohort_prev = float(np.mean([pid_label[p] for p in labeled_cohort])) if labeled_cohort else 0.5
+    prevalences = list(args.target_prevalence) if args.target_prevalence else [round(cohort_prev, 4)]
+    # Operating points fixed WITHOUT looking at test: the two sensitivity-anchored thresholds
+    # come from val / out-of-fold predictions, and 0.5 is committed to a priori.
+    if cv_metrics is not None:
+        sel_prob = np.asarray(cv_metrics["oof_prob"]); sel_lbl = np.asarray(cv_metrics["oof_label"])
+    else:
+        sel_prob, sel_lbl = np.asarray(val_pid_prob), np.asarray(val_pid_lbl)
+    fixed_thr = {"tuned_balanced_acc": float(thr), "nominal_0.5": 0.5}
+    for s in (0.80, 0.90):
+        fixed_thr[f"sens{int(s * 100)}_on_val"] = threshold_at_sensitivity(sel_lbl, sel_prob, s)
+
+    for m, yt, yp in ((win, y[eval_mask], test_prob), (pid, pid_lbl, pid_prob)):
+        m["at_prevalence"] = {f"{p:g}": prevalence_transport(m["sensitivity"], m["specificity"], p)
+                              for p in prevalences}
+        m["calibration"] = calibration_metrics(yt, yp)
+        # The probe uses class_weight='balanced', so its scores are anchored at a 50% prior;
+        # prior_shift re-anchors them before calibration is quoted at the target base rate.
+        m["calibration_at_prevalence"] = {
+            f"{p:g}": calibration_metrics(yt, prior_shift(yp, 0.5, p)) for p in prevalences}
+        m["operating_points"] = operating_point_report(yt, yp, fixed_thr, prevalences)
+    pid["cohort_prevalence"] = cohort_prev
+    pid["test_prevalence"] = float(np.mean(pid_lbl)) if len(pid_lbl) else float("nan")
+
+    _p0 = prevalences[0]
+    _tp = pid["at_prevalence"][f"{_p0:g}"]
+    print(f"[prevalence] test cohort is {pid['test_prevalence']:.0%} positive by construction; "
+          f"observed cohort base rate {cohort_prev:.1%}")
+    print(f"[prevalence] participant-level @thr={thr:.2f}: sens={pid['sensitivity']:.3f} "
+          f"spec={pid['specificity']:.3f} (transfer) | F1={pid['f1']:.3f} acc={pid['accuracy']:.3f} "
+          f"(at 50% only)")
+    print(f"[prevalence] the same model at {_p0:.1%} prevalence: PPV={_tp['ppv']:.3f} "
+          f"NPV={_tp['npv']:.3f} F1={_tp['f1']:.3f} acc={_tp['accuracy']:.3f}")
+    print(f"[calibration] Brier={pid['calibration']['brier']:.4f} "
+          f"ECE={pid['calibration']['ece']:.4f}")
 
     # results_hrd/<run_id>/<backbone>_<pe>_seed<seed>/{metrics.json, pretrain_loss.npy}
     run_id = args.run_id or os.environ.get("SLURM_JOB_ID") or "local"
-    variant_dir = out_dir / run_id / f"{args.backbone}_{args.pe}_seed{args.seed}"
+    clock_tag = "_clock" if args.with_clock_features else ""
+    dis_tag = "" if args.disentangle else "_plain"     # plain SSL (no disentangler) baseline
+    # Tag only non-default seasonal readouts, so the 'same' (MESOR-only) ablation cannot
+    # overwrite the default 'spec' run of the same variant.
+    sp_tag = "" if args.season_pool == "spec" else f"_sp-{args.season_pool}"
+    # Crossed runs need distinct folders, but the common case (one seed for both) must keep
+    # producing the historical `_seed<n>` name so archived result paths stay valid.
+    seed_tag = (f"_seed{model_seed}" if split_seed == model_seed
+                else f"_seed{model_seed}_split{split_seed}")
+    variant_dir = (out_dir / run_id /
+                   f"{args.backbone}_{args.pe}{dis_tag}{seed_tag}{clock_tag}{sp_tag}")
     variant_dir.mkdir(parents=True, exist_ok=True)
     result = {
         "backbone": args.backbone,
         "pe": args.pe,
         "window_level": win,
         "participant_level": pid,
-        "n_test_windows": int(test_mask.sum()),
-        "n_test_participants": int(len(np.unique(pids[test_mask]))),
+        # internal k-fold CV within the probe pool (test untouched); null when --cv-folds<2
+        "cv_internal": cv_metrics,
+        # --- participants (the true statistical unit) ---
+        "n_participants_total": int(len(all_pids)),
+        "n_labeled_participants": int(n_labeled),
+        "n_test_participants": int(len(test_pids)),
+        "n_probe_participants": int(len(rest_cons)),
+        # WHICH participants, not just how many. The split is a deterministic function of
+        # --seed, but reproducing it after the fact needs the post-windowing pid pool, so it
+        # was not recoverable from a finished run. Recorded here so seed-to-seed differences
+        # (e.g. the cosinor baseline moving 0.525 -> 0.608 across seeds in run 18975686) can
+        # be traced to the actual test cohort.
+        "test_pids": sorted(map(str, test_pids)),
+        "test_pids_depressed": sorted(str(p) for p in test_pids if pid_label.get(p) == 1),
+        "n_unlabeled_participants": int(n_unlabeled),
+        # --- samples ACTUALLY used (== participants when --probe-last-window) ---
+        "n_probe_train_samples": int(n_probe_train),
+        "n_test_samples": int(eval_mask.sum()),
+        # --- windows (reference): pretrain excludes ALL test-pid windows; unlabeled pids
+        #     appear in pretrain only (SSL is label-free) ---
         "n_pretrain_windows": int(pretrain_mask.sum()),
-        "n_finetune_windows": int(finetune_mask.sum()),
+        "n_test_pid_windows": int(test_mask.sum()),
+        "n_finetune_pid_windows": int(finetune_mask.sum()),
         "pretrain_seconds": pretrain_seconds,
+        "n_params": int(sum(p.numel() for p in model.net.parameters())),
+        "n_params_trainable": int(sum(p.numel() for p in model.cost.parameters()
+                                      if p.requires_grad)),
         "seq_len": int(seq_len),
         "n_features": int(X.shape[-1]),
-        "config": vars(args),
+        "gradnorm_final_weights": ([float(w) for w in model.loss_w_log[-1]]
+                                   if getattr(model, "loss_w_log", None) else None),
+        # Record the RESOLVED seeds, not the raw None defaults, so a collector can group runs
+        # by cohort (split_seed) vs optimisation (model_seed) without re-deriving the fallback.
+        "config": {**vars(args), "split_seed": split_seed, "model_seed": model_seed},
     }
+    # Human-readable companion, so the balanced-cohort / tuned-threshold / seed-confounding
+    # caveats travel WITH the numbers instead of living only in the code.
+    write_run_report(variant_dir, args, result, split_seed, model_seed)
+    print(f"[report] {variant_dir/'report.md'}")
     (variant_dir / "metrics.json").write_text(
         json.dumps(result, indent=2), encoding="utf-8"
     )
-    np.save(variant_dir / "pretrain_loss.npy", np.asarray(loss_log))
+    np.save(variant_dir / "pretrain_loss.npy", np.asarray(model.loss_log))
+    np.save(variant_dir / "loss_iters.npy", np.asarray(model.iters_log))
+    # Encoder weights, ~235 MB each -- 59% of that is the complex SFD table alone (337x320x160
+    # at 8 bytes). Keeping every variant of a 52-task sweep costs ~12 GB, so this is OFF by
+    # default and run.sh enables it for one seed: enough to redo any latent analysis without a
+    # 3.4 h retrain, at a quarter of the storage.
+    if args.save_encoder:
+        model.save(variant_dir / "encoder.pt")
+    if getattr(model, "loss_w_log", None):                      # GradNorm task-weight trajectory
+        np.save(variant_dir / "gradnorm_weights.npy", np.asarray(model.loss_w_log))
+    if model.val_loss_log:
+        np.save(variant_dir / "val_loss.npy", np.asarray(model.val_loss_log))
+    # one depressed + one non-depressed test window: raw signal + encoded rep, for the
+    # cross-technique before/after-embedding figure (plot_position_similarity.py --signalviz)
+    try:
+        save_signal_embedding(model, X, pids, test_pids, pid_label, variant_dir,
+                              data["sensor_cols"], data["n_sensors"])
+    except Exception as e:
+        print(f"[signal-embed] skipped ({e})")
+    save_loss_curves(model.iters_log, model.loss_log, model.val_loss_log,
+                     variant_dir, tag=f"{args.backbone} / {args.pe}")
 
     print("\n========== HELD-OUT TEST RESULTS ==========")
     print(f"backbone = {args.backbone}  pe = {args.pe}")
-    print(f"window-level       AUC={win['auc_roc']:.3f}  F1={win['f1']:.3f}  Acc={win['accuracy']:.3f}")
-    print(f"participant-level  AUC={pid['auc_roc']:.3f}  F1={pid['f1']:.3f}  Acc={pid['accuracy']:.3f}")
-    print(f"decision threshold = {thr:.3f}  (tuned on val)")
+    print(f"window-level       AUC={win['auc_roc']:.3f}  F1={win['f1']:.3f}  Acc={win['accuracy']:.3f}"
+          f"  BAcc={win['balanced_accuracy']:.3f}  MCC={win['mcc']:.3f}")
+    print(f"participant-level  AUC={pid['auc_roc']:.3f}  F1={pid['f1']:.3f}  Acc={pid['accuracy']:.3f}"
+          f"  BAcc={pid['balanced_accuracy']:.3f}  MCC={pid['mcc']:.3f}")
+    _ci = pid.get("auc_ci") or {}
+    if np.isfinite(_ci.get("lo", float("nan"))):
+        print(f"participant AUC 95% CI = [{_ci['lo']:.3f}, {_ci['hi']:.3f}]  "
+              f"(bootstrap over {_ci['n_participants']} test participants)")
+    print(f"decision threshold = {thr:.3f}  (tuned on {'pooled OOF CV' if cv_metrics else 'val split'})")
     print(f"saved -> {variant_dir / 'metrics.json'}")
+
+    # --- Optional: emotional-energy downstream, REUSING this pretrained encoder --------
+    # No second pretraining -- the frozen `model` is probed for daily emotional_energy on the
+    # SAME held-out test participants (already excluded from pretraining -> leakage-free).
+    # Sliding trailing windows, one per labelled day. Non-fatal: never abort the depression run.
+    if args.energy_probe:
+        try:
+            from data_processing.data_preprocessing import (prepare_hrd_energy_sliding,
+                                                clear_hrd_cache)
+            from tasks.energy import run_energy_tasks
+            print("[energy] emotional-energy probe (reusing frozen encoder, sliding windows) ...")
+            _t = time.time()
+            edata = prepare_hrd_energy_sliding(
+                args.sensor_csv, window_hours=args.window_hours,
+                bin_minutes=args.bin_minutes, build_pretrain=False,
+                max_missing=args.max_missing,          # same cleaning as the depression path,
+                                                       # so the cached CSV parse is reused
+                energy_stride=args.energy_stride,
+                clock_features=args.with_clock_features,   # match the encoder's channel count
+                calendar_index=args.pe in CALENDAR_PES)
+            clear_hrd_cache()                          # last consumer -- free the ~1 GiB tables
+            Xe, eee, pe = edata["X"], edata["ee"], edata["pids"]
+            print(f"[energy] {len(Xe):,} probe windows (every {args.energy_stride} labelled "
+                  f"day(s)) in {time.time() - _t:.0f}s")
+            labe = np.isfinite(eee)
+            # test = the SAME participants held out of pretraining; train/val from the rest
+            te_pids_e = set(test_pids) & set(pe[labe])
+            rest = np.array(sorted(set(pe[labe]) - te_pids_e))
+            rng_e = np.random.default_rng(split_seed); rng_e.shuffle(rest)   # a split -> split_seed
+            n_val = max(1, int(round(0.15 * len(rest))))
+            va_pids_e, tr_pids_e = set(rest[:n_val]), set(rest[n_val:])
+            te_e = np.isin(pe, list(te_pids_e)) & labe
+            va_e = np.isin(pe, list(va_pids_e)) & labe
+            tr_e = np.isin(pe, list(tr_pids_e)) & labe
+            # The "_energy" suffix is load-bearing, do not drop it. This directory holds the
+            # SAME file names as the depression variant directory (metrics.json,
+            # hrd_rhythm.json, hrd_rhythm_separability.*, frequency_*, the t-SNE/UMAP PNGs),
+            # because run_energy_tasks and run_hrd_rhythm_analysis are shared between the two
+            # downstreams. With identical directory names, copying one results tree into the
+            # other silently overwrites 13 depression files with their energy counterparts and
+            # reports no error. Making the directory name unique means the two trees can be
+            # merged, moved or mis-copied without any file ever colliding.
+            e_out = (Path(args.energy_output_dir) / run_id /
+                     f"{args.backbone}_{args.pe}{dis_tag}{seed_tag}{clock_tag}{sp_tag}_energy")
+            mode_desc = ("**Mode B (sliding), encoder REUSED from the depression run**: one "
+                         "trailing 7-day window per labelled day ([D-6, D] -> EE(D)); test = the "
+                         "participants already held out of pretraining, so leakage-free.")
+            _t = time.time()
+            run_energy_tasks(model, Xe, eee, pe, data["n_sensors"], tr_e, va_e, te_e,
+                             args.energy_pool, args.energy_threshold, model_seed,
+                             e_out, mode_desc,
+                             {**vars(args), "split_seed": split_seed, "model_seed": model_seed},
+                             season_pool=season_pool)
+            print(f"[energy] probe tasks done in {time.time() - _t:.0f}s")
+            # Same rhythm figures as depression, but split by energy PER DAY (high- vs
+            # low-energy days). subject_aggregate=False: each window is its own unit (a person
+            # spans both classes), so the per-subject figures/trajectory are skipped. Only in
+            # disentangle mode (needs the trend/seasonal branches). Non-fatal.
+            if args.disentangle and not args.no_rhythm_viz:
+                try:
+                    from tasks.rhythm import run_hrd_rhythm_analysis
+                    y_e = (eee >= args.energy_threshold).astype(int)
+                    # Rhythm analysis runs on a NON-OVERLAPPING subsample of the energy windows,
+                    # because it builds the seasonal amplitude/phase views at 337x120 = 40,440
+                    # features per window: ~3.2 GB per view over 20k windows, ~13 GB across the
+                    # four of them, which is what OOM-killed 17 of 28 tasks in array 18535364.
+                    # Target spacing is one window per window_hours/24 days (the same
+                    # non-overlapping spacing the depression path uses). The probe windows are
+                    # ALREADY --energy-stride days apart, so step only the remaining factor --
+                    # stepping the full 7 again would subsample 21 days apart and needlessly
+                    # shrink the figures. Sorted by day explicitly, not by construction order.
+                    stride = max(1, math.ceil((args.window_hours // 24) / args.energy_stride))
+                    days_e = edata["days"]
+                    sub = np.zeros(len(pe), bool)
+                    for _p in np.unique(pe):
+                        _i = np.where(pe == _p)[0]
+                        sub[_i[np.argsort(days_e[_i], kind="stable")][::stride]] = True
+                    print(f"[energy] rhythm figures split by high-vs-low-energy day "
+                          f"({int(sub.sum()):,} of {len(pe):,} windows, every {stride}th day) ...")
+                    _t = time.time()
+                    run_hrd_rhythm_analysis(
+                        model, Xe[sub], y_e[sub], pe[sub], tr_e[sub], te_e[sub], e_out,
+                        seq_len=seq_len, bin_minutes=args.bin_minutes, seed=model_seed,
+                        sensor_cols=data["sensor_cols"],
+                        label_names={0: f"low-energy day (EE<{args.energy_threshold:g})",
+                                     1: f"high-energy day (EE>={args.energy_threshold:g})"},
+                        batch_size=args.batch_size, val_mask=va_e[sub], pool=args.energy_pool,
+                        probe_c=args.probe_c, paper_cosinor_topk=args.paper_cosinor_topk,
+                        baseline_by_pid=None, subject_aggregate=False,
+                        label_noun="emotional energy", table_tag="energy",
+                        headline_unit="all")   # a per-day label: every window is a sample
+                    print(f"[energy] rhythm figures -> {e_out} ({time.time() - _t:.0f}s)")
+                except Exception as e:
+                    import traceback
+                    print(f"[energy] rhythm figures FAILED (non-fatal): {e}")
+                    traceback.print_exc()
+        except Exception as e:
+            import traceback
+            print(f"[energy] FAILED (non-fatal): {e}")
+            traceback.print_exc()
+
+    # Steps 6a-6c are DISENTANGLEMENT diagnostics: they read a trend branch and a
+    # seasonal branch out of the latent. In plain mode there is a single representation
+    # (no branches), so these are meaningless and are skipped -- the plain run produces
+    # only the prediction result (metrics.json) so it can be compared, on the SAME
+    # downstream probe, against the disentangled CoST run. This is the whole point of the
+    # ablation: does the trend/seasonal-disentangled embedding predict better than a plain
+    # single-representation SSL embedding, or is learning just as good without it?
+    if not args.disentangle:
+        print("[plain] single-representation SSL (no trend/seasonal branch): "
+              "disentanglement/rhythm eval skipped -> prediction metrics.json only.")
+    else:
+        # 6a. supervised end-to-end baselines (plain TCN + Transformer-sinusoidal, no SSL):
+        #     same backbone size as this run, trained directly on the label, added as baseline
+        #     rows in the separability table next to Cosinor. Non-fatal.
+        baseline_rows = []
+        try:
+            for bb, pe_, nm in [("tcn", "none", "TCN (supervised)"),
+                                ("transformer", "sinusoidal", "Transformer-sin (supervised)")]:
+                print(f"[baseline] training supervised {nm} ...")
+                baseline_rows.append(supervised_baseline_row(
+                    X, y, pids, train_mask, val_mask, eval_mask, bb, pe_, nm,
+                    n_time_features, args.hidden_dims, args.depth, args.repr_dims,
+                    device=device, seed=model_seed, batch_size=args.batch_size))
+        except Exception as e:
+            import traceback
+            print(f"[baseline] supervised baselines FAILED (non-fatal): {e}")
+            traceback.print_exc()
+            baseline_rows = []
+
+        # 6b. on-real-data rhythm analysis (test set): t-SNE coloured by endpoint +
+        #    seasonal amplitude/phase profiles + a per-representation separability
+        #    table. Non-fatal: a failure here must not discard the results above.
+        if not args.no_rhythm_viz:
+            try:
+                from tasks.rhythm import run_hrd_rhythm_analysis
+                print("[rhythm] HRD test-set amplitude/phase analysis ...")
+                run_hrd_rhythm_analysis(
+                    model, X, y, pids, train_mask, test_mask, variant_dir,
+                    seq_len=seq_len, bin_minutes=args.bin_minutes, seed=model_seed,
+                    sensor_cols=data["sensor_cols"],
+                    label_names={0: "non-depressed (0)", 1: "depressed (1)"},
+                    batch_size=args.batch_size, val_mask=val_mask, baseline_rows=baseline_rows,
+                    window_ids=data.get("window_ids"), pool=args.pool,
+                    probe_sel=probe_sel, probe_c=args.probe_c,
+                    paper_cosinor_topk=args.paper_cosinor_topk,
+                    baseline_by_pid=data.get("baseline_by_pid"),
+                    table_tag="depression", headline_unit=args.probe_unit,
+                )
+                print(f"[rhythm] saved figures + table -> {variant_dir}")
+            except Exception as e:
+                import traceback
+                print(f"[rhythm] FAILED (non-fatal): {e}")
+                traceback.print_exc()
+                try:                          # surface the reason IN the results folder, not only the SLURM log
+                    (variant_dir / "hrd_rhythm.FAILED.txt").write_text(
+                        f"run_hrd_rhythm_analysis failed: {type(e).__name__}: {e}\n\n"
+                        + traceback.format_exc(), encoding="utf-8")
+                except Exception:
+                    pass
+
+        # 6c. trend/seasonal Decomposition Recovery Score (DRS): read-only probe of the
+        #     frozen latents against per-channel harmonic-regression references. Non-fatal.
+        if not args.no_rhythm_viz:
+            try:
+                from tasks.decomposition import run_decomposition_recovery
+                print("[decomp] trend/seasonal recovery (DRS) ...")
+                agg = run_decomposition_recovery(
+                    model, X, train_mask_all, test_mask, variant_dir,
+                    seq_len=seq_len, bin_minutes=args.bin_minutes,
+                    sensor_cols=data["sensor_cols"], seed=model_seed, batch_size=args.batch_size,
+                    val_mask=val_mask_all, pids=pids)
+                print(f"[decomp] Full recovery: tau={agg['rec_full_trend']:.3f} "
+                      f"sigma={agg['rec_full_rhythm']:.3f}  (DIS={agg['DIS']:.3f}) -> {variant_dir}")
+            except Exception as e:
+                import traceback
+                print(f"[decomp] FAILED (non-fatal): {e}")
+                traceback.print_exc()
+                try:                          # surface the reason IN the results folder, not only the SLURM log
+                    (variant_dir / "decomposition_recovery.FAILED.txt").write_text(
+                        f"run_decomposition_recovery failed: {type(e).__name__}: {e}\n\n"
+                        + traceback.format_exc(), encoding="utf-8")
+                except Exception:
+                    pass
+
     print(f"total time = {(time.time() - t_start) / 60:.1f} min")
 
 
