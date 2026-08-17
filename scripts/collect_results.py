@@ -548,9 +548,20 @@ _PROBE_BACC_METRICS = [(c.replace("_AUC", "_BAcc"), _bacc_key(k))
                        for c, k in _PROBE_AUC_METRICS + _PROBE_AUC_PCA_METRICS]
 
 
-def _mean_sd(vals):                                          # NaN-safe (mean, std=ddof0)
+def _mean_sd(vals):
+    """NaN-safe (mean, SAMPLE sd).
+
+    ddof=1, not the numpy default of 0. These are the S seeds of a sweep -- a sample drawn to
+    estimate run-to-run variability, not the whole population -- so the sample sd is the right
+    estimator and the paper reports "mean +/- sd over seeds". At S=6 the population form is
+    sqrt(5/6) = 0.91 of it, i.e. every interval in the summary table read ~9% tighter than it
+    should. One value returns nan rather than 0: an sd of 0 from a single seed would claim
+    perfect reproducibility.
+    """
     a = np.array([v for v in vals if v == v], dtype=float)
-    return (float(a.mean()), float(a.std())) if a.size else (float("nan"), float("nan"))
+    if a.size == 0:
+        return (float("nan"), float("nan"))
+    return (float(a.mean()), float(a.std(ddof=1)) if a.size > 1 else float("nan"))
 
 
 def aggregate_all_models(rows, base_samples):
@@ -716,9 +727,147 @@ def write_rhythmicity_table(agg, csv_path):
         print(f"Wrote {csv_path}")
 
 
+def _holm(pvals):
+    """Holm-Bonferroni adjusted p-values, input order preserved. Hand-rolled because
+    statsmodels is not in requirements.txt and would import fine here but fail on the cluster."""
+    p = np.asarray(pvals, dtype=float)
+    n, o = len(p), np.argsort(pvals)
+    adj = np.empty(n)
+    adj[o] = np.minimum(1.0, np.maximum.accumulate(p[o] * (n - np.arange(n))))
+    return adj
+
+
+def pe_contrast(results_dir, ref=("tcn", "none"), metric="sigma", n_boot=2000, seed=0):
+    """E1.4 -- Delta_pi = R2_pi - R2_F0 on the RQ1 headline, with a real interval.
+
+    Replaces the design's "paired Wilcoxon over the S seeds", which was never implemented and
+    could not have worked: at S=6 the two-sided signed-rank test bottoms out at p=0.031, so
+    after Holm over ~5 families nothing reaches 0.05 however large the effect.
+
+    Two bootstrap stages instead, on PAIRED draws. Participants, because the claim is about a
+    new person; and seeds with replacement, which carries run-to-run variance as a random
+    effect rather than averaging it away (numpy, not a mixed model -- see _holm). Every variant
+    is scored on the SAME drawn seeds and people, so Delta is paired and its interval can
+    exclude zero even when the marginal ones overlap.
+
+    Exact and cheap because experiment_q1.py stores per-participant sufficient statistics
+    (tasks/decomposition.py::_probe_r2): a resample is a reweighting, not a refit. Variants of
+    one seed share a test split, so a pid missing from a variant raises rather than quietly
+    producing an unpaired contrast.
+    """
+    by = {}                                     # (backbone, pe) -> {seed: sufficient stats}
+    for fp, d in iter_metrics(results_dir):
+        side = fp.parent / "rq1" / "rq1.json"
+        j = read_json(side) if side.exists() else None
+        if j and j.get("bootstrap"):
+            k = variant_key(d, fp)
+            by.setdefault((k.backbone, k.pe), {})[str(k.seed)] = j["bootstrap"]
+    others = sorted(k for k in by if k != ref)
+    if ref not in by or not others:
+        print("\n[pe contrast] needs rq1/rq1.json with a 'bootstrap' block for "
+              f"{'/'.join(ref)} and at least one other variant -- re-run experiment_q1.py")
+        return None
+
+    def r2(blk, pids):
+        """Variance-weighted R2 over a participant list, from sufficient statistics:
+        SStot = sum(syy) - sum(sy)^2/sum(n), identical to recomputing it from the rows."""
+        ss = blk["per_participant"][metric]
+        n = sum(ss[p]["n"] for p in pids)
+        sy, syy, res = (sum(np.asarray(ss[p][f]) for p in pids)
+                        for f in ("sy", "syy", "ssres"))
+        tot = syy - sy ** 2 / max(n, 1)
+        ok = tot > 0
+        return float(np.asarray(blk["weights"][metric])
+                     @ np.clip(np.where(ok, 1.0 - res / np.where(ok, tot, 1.0), 0.0), 0.0, 1.0))
+
+    seeds = sorted(set(by[ref]) & {s for k in others for s in by[k]})
+    pool = {s: sorted(by[ref][s]["per_participant"][metric]) for s in seeds}
+    delta = lambda k, s, pids: r2(by[k][s], pids) - r2(by[ref][s], pids)
+
+    rng = np.random.default_rng(seed)
+    boot = {k: [] for k in others}
+    for _ in range(n_boot):
+        drawn = [(s, [pool[s][i] for i in rng.integers(0, len(pool[s]), len(pool[s]))])
+                 for s in (seeds[i] for i in rng.integers(0, len(seeds), len(seeds)))]
+        for k in others:                        # same seeds, same people, every variant
+            v = [delta(k, s, pids) for s, pids in drawn if s in by[k]]
+            if v:
+                boot[k].append(float(np.mean(v)))
+
+    rows = []
+    for k in others:
+        b = np.asarray(boot[k])
+        rows.append({"variant": "/".join(k),
+                     "delta": float(np.mean([delta(k, s, pool[s]) for s in seeds if s in by[k]])),
+                     "ci_lo": float(np.percentile(b, 2.5)), "ci_hi": float(np.percentile(b, 97.5)),
+                     # two-sided bootstrap p, floored at 1/B so it is never reported as 0
+                     "p": float(max(2 * min((b <= 0).mean(), (b >= 0).mean()), 1.0 / len(b)))})
+    for r, q in zip(rows, _holm([r["p"] for r in rows])):
+        r["p_holm"] = float(q)
+    rows.sort(key=lambda r: -r["delta"])
+
+    print(f"\n=== Delta_pi on Full->{metric} vs {'/'.join(ref)} "
+          f"({len(seeds)} seeds, {n_boot} paired seed x participant draws) ===")
+    print(f"{'variant':<26}{'delta':>9}{'95% CI':>21}{'p':>9}{'p_holm':>9}")
+    for r in rows:
+        print(f"{r['variant']:<26}{r['delta']:>+9.4f}   [{r['ci_lo']:+.4f},{r['ci_hi']:+.4f}]"
+              f"{r['p']:>9.4f}{r['p_holm']:>9.4f}")
+    print(f"survives Holm at 0.05: "
+          f"{[r['variant'] for r in rows if r['p_holm'] < 0.05] or 'none'}")
+    return rows
+
+
+def utility_across_tasks(results_dir, energy_dir):
+    """RQ3 Part A as the design asks for it: one table, ladder x tasks.
+
+    Depression comes from each variant's rq3/rq3_utility.csv; the two emotional-energy tasks
+    come from the matching results_hrd_energy/<run>/<variant>_energy/metrics.json. Merging
+    them is legitimate because train_hrd builds the energy test set as
+    `set(test_pids) & set(pids_with_ee)` -- the SAME held-out participants -- so the columns
+    are the same people scored on different targets.
+
+    Rungs differ per task (the energy ladder has no cosinor or supervised rung), so a missing
+    cell is printed as "-" rather than silently dropped: which comparisons exist is itself
+    part of the reading.
+    """
+    from collections import defaultdict
+    out = defaultdict(dict)                       # (variant, rung) -> {task: auc}
+    for fp in sorted(Path(results_dir).glob("*/*/rq3/rq3_utility.csv")):
+        variant = fp.parent.parent.name
+        with open(fp, encoding="utf-8") as f:
+            for r in csv.DictReader(f):
+                try:
+                    out[(variant, r["representation"])]["depression"] = float(r["auc"])
+                except (ValueError, KeyError):
+                    pass
+    for fp in sorted(Path(energy_dir).glob("*/*_energy/metrics.json")):
+        variant = fp.parent.name[:-len("_energy")]
+        m = read_json(fp) or {}
+        for task, key in (("EE >= 4 (day)", "task1_high_energy"),
+                          ("EE vs own median", "task3_within_person")):
+            for rung, v in (m.get(key) or {}).items():
+                if isinstance(v, dict) and v.get("auc_roc") is not None:
+                    out[(variant, rung)][task] = float(v["auc_roc"])
+    if not out:
+        return []
+    tasks = ["depression", "EE >= 4 (day)", "EE vs own median"]
+    rows = [{"variant": v, "representation": r,
+             **{t: o.get(t) for t in tasks}} for (v, r), o in sorted(out.items())]
+    print("")
+    print("=== RQ3 Part A: utility ladder x tasks "
+          "(AUROC; '-' = rung absent for that task) ===")
+    print(f"{'variant':<26}{'representation':<30}" + "".join(f"{t:>18}" for t in tasks))
+    for r in rows:
+        cells = "".join(f"{r[t]:>18.3f}" if r[t] is not None else f"{'-':>18}" for t in tasks)
+        print(f"{r['variant']:<26}{r['representation']:<30}{cells}")
+    return rows
+
+
 def main():
     p = argparse.ArgumentParser(description="Summarise CoST PE-variant results")
     p.add_argument("--results-dir", default="results_hrd")
+    p.add_argument("--energy-dir", default="results_hrd_energy",
+                   help="Where --energy-output-dir wrote the EE probes; merged into Part A.")
     p.add_argument("--csv", default=None, help="Optional path to write the table as CSV")
     args = p.parse_args()
 
@@ -840,6 +989,24 @@ def main():
         print(f"\nPearson r vs participant AUC  ->  rhythm capture: {fmt(rr.get('rhythm'))}   "
               f"trend capture: {fmt(rr.get('trend'))}")
         print(f"Wrote {out_png}")
+
+    # RQ3 Part A: the ladder against all three downstream tasks
+    ut = utility_across_tasks(args.results_dir, args.energy_dir)
+    if ut and args.csv:
+        fp = Path(args.csv).with_name("summary_utility_tasks.csv")
+        with open(fp, "w", newline="", encoding="utf-8") as f:
+            w = csv.DictWriter(f, fieldnames=list(ut[0]))
+            w.writeheader(); w.writerows(ut)
+        print(f"Wrote {fp}")
+
+    # E1.4: effect of the temporal reference frame, the second half of RQ1
+    pe = pe_contrast(args.results_dir)
+    if pe and args.csv:
+        fp = Path(args.csv).with_name("summary_pe_contrast.csv")
+        with open(fp, "w", newline="", encoding="utf-8") as f:
+            w = csv.DictWriter(f, fieldnames=list(pe[0]))
+            w.writeheader(); w.writerows(pe)
+        print(f"Wrote {fp}")
 
     if args.csv:
         with open(args.csv, "w", newline="", encoding="utf-8") as f:

@@ -1,147 +1,246 @@
 """HRD wearable-data preprocessing for the CoST project.
 
-The raw file ``HRD_RAW_MinuteLevel.csv`` stores BOTH the minute-level sensor
-signals AND the depression labels in one table (labels repeated on every row of
-a participant). This module turns it into a windowed dataset that the CoST model
-(``cost.py``) can train on for depression-endpoint classification.
-
-The dataset was re-exported with snake_case column names (``timestamp``,
-``heart_rate``, ``steps_minutes``, ``fairly_active_minutes``,
-``lightly_active_minutes``, ``very_active_minutes``, ``sleep_status``, ``screen``,
-plus new ``floors``, ``sedentary_minutes``, ``call``, ``depression_trajectory``
-and ``ces_d_*_score`` columns). ``CSV_RENAME`` maps the raw columns we consume
-back to the canonical internal names used everywhere else, so the rename is
-confined to the CSV read and nothing downstream changes.
+The raw file ``HRD_RAW_MinuteLevel.csv`` stores BOTH the minute-level sensor signals AND the
+depression labels in one table (labels repeated on every row of a participant). This module
+turns it into a windowed dataset that the CoST model (``cost.py``) can train on.
 
 Two public entry points:
 
-  * ``load_hrd(csv)``          -> (sensor_df, label_df, ee_by_pid_date), the cleaned
-                                  tables plus the daily emotional_energy lookup.
-  * ``prepare_hrd_dataset(csv)`` -> dict with the windowed tensor ``X`` (N, T, C),
-                                  labels ``y``, participant ids ``pids`` and the
-                                  set of consistent (baseline==endpoint) pids.
+  * ``load_hrd(csv)``               -> (sensor_df, label_df, energy_by_pid_date): the cleaned
+                                       tables plus the daily emotional-energy lookup.
+  * ``prepare_hrd_dataset(csv)``    -> dict with the windowed tensor ``X`` (N, T, C), labels
+                                       ``y``, participant ids ``pids``, and label metadata.
+  * ``prepare_hrd_energy_sliding()`` -> the "mode B" sliding-window variant for the
+                                       emotional-energy probe.
 
-The model uses 4 sensor channels: HR + Steps + is_asleep (binary sleep, derived from
-sleep_status) + screen. Floors, calls, the Sedentary intensity level and the Fitbit
-active-minute intensity levels (Fairly/Lightly/Very_Active) are excluded. Each channel is
-cleaned by its nature:
-  * HR / Steps  - physiological / count; NaN = non-wear -> short gaps interpolated,
-                  long gaps stay NaN (sparse windows dropped); counts clipped >= 0.
-  * is_asleep   - sleep stages -> 1, awake/restless -> 0; NaN split by HR wear
-                  (worn+unscored -> 0, non-wear -> NaN); short gaps interpolated.
-  * screen      - event stream; NaN = no event -> 0.
+Pipeline, in order:
 
-Per-window missing values follow **Algorithm 1 of Yan et al. 2022 (ACM TIST 13(3),
-Article 47), Case 1 (Sec. 3.4.1 / 4.1.1)**: within each participant-window, a sensor
-feature with > ``max_window_missing`` (30%) missing time-bins, or with an edge gap longer
-than ``EDGE_GAP_MINUTES`` (see :func:`_edge_gap_ok`), is unusable; remaining gaps
-are filled by nearest-neighbour LINEAR interpolation. Because the fixed-C tensor needs
-the full channel set, an unusable feature disqualifies the whole window (the tensor
-analogue of the paper's per-feature drop). Per-participant z-scoring is applied at the
-windowing step, so no statistics are shared across participants or with the labels
-(leakage-free).
+    CSV -> load_hrd()                 clean columns, drop bad participants, fill short gaps
+        -> _window_participant()      cut into fixed windows, apply the quality gate, bin
+        -> prepare_hrd_dataset()      stack into (N, T, C) and attach labels
+
+Read the CONFIGURATION section below first: every threshold, column name and magic number
+this module uses lives there, together with the reason it has the value it has.
 """
 
+from __future__ import annotations
+
 import time
-from typing import Dict, List, Tuple
+from dataclasses import dataclass, field
+from datetime import date
+from pathlib import Path
+from typing import Any, Dict, List, Optional, Sequence, Set, Tuple, Union
 
 import numpy as np
 import pandas as pd
 
+PathLike = Union[str, Path]
+
+# A (pid, calendar date) -> emotional energy (1-5) lookup.
+DailyEnergyLookup = Dict[Tuple[str, date], float]
+
+# One produced window: the (T, C) array and the wall-clock time its first bin starts at.
+Window = Tuple[np.ndarray, pd.Timestamp]
+
+
+# =============================================================================
+# CONFIGURATION
 # -----------------------------------------------------------------------------
-# Channel groups by physical nature.
-HR_COLS = ["HR"]
-ACTIVITY_COLS = ["Steps"]                 # step count only; the Fitbit active-minute intensity
-                                          # levels (Fairly/Lightly/Very_Active) and Sedentary are dropped
-SLEEP_COLS = ["is_asleep"]                # binary, DERIVED from sleep_level (_derive_is_asleep)
-EVENT_COLS = ["screen"]                   # event stream; NaN = no event -> 0 (absence is a real 0)
+# Everything tunable or hardcoded is declared here, grouped by concern:
+#
+#   CHANNELS  which CSV columns become which model channels
+#   CLEANING  the quality thresholds that decide what data is usable
+#   WINDOWING the shape of a window and how time is encoded into it
+#
+# The dataclasses are frozen so a stray assignment elsewhere cannot silently change the
+# preprocessing of a run that has already been logged.
+# =============================================================================
 
-WEAR_COLS = HR_COLS + ACTIVITY_COLS + SLEEP_COLS  # wear-dependent -> gap-interp + missingness
-SENSOR_COLS = HR_COLS + ACTIVITY_COLS + SLEEP_COLS + EVENT_COLS  # 4 model channels (Floors, calls,
-                                          # Sedentary + *_Active intensity dropped; sleep -> is_asleep)
-RAW_NUMERIC_COLS = HR_COLS + ACTIVITY_COLS + EVENT_COLS   # numeric columns (canonical names, post-rename)
 
-# Raw (snake_case) CSV column -> canonical internal name. The raw ``timestamp`` is renamed to
-# ``dateTime`` so the load body can parse it into the datetime ``timestamp`` exactly as before;
-# ``screen`` and the label columns already carry their expected names. The excluded columns
-# (``floors``, ``sedentary_minutes``, ``call`` and the *_active_minutes intensity levels
-# are simply never read.)
-CSV_RENAME = {
-    "timestamp": "dateTime",                  # raw timestamp string -> parsed into `timestamp`
-    "heart_rate": "HR",
-    "steps_minutes": "Steps",
-    "sleep_status": "sleep_level",            # categorical sleep stage (values unchanged)
-}
+@dataclass(frozen=True)
+class ChannelConfig:
+    """Which raw CSV columns become which model channels, and how sleep is binarised.
 
-# sleep_status -> binary is_asleep. restless = movement -> NOT asleep (0), per the experiment.
-SLEEP_ASLEEP = {"asleep", "light", "deep", "rem"}     # sleep stages -> 1
-SLEEP_AWAKE = {"awake", "wake", "restless"}           # awake / not-asleep -> 0
-                                                      # (unknown / NaN -> resolved by HR wear)
-LABEL_COLS = ["depression_status_baseline", "depression_status_endpoint"]
-# Richer per-participant labels the re-export added. depression_trajectory holds the paper's
-# Case-1 groups (Pre1_Post1 / Pre1_Post2 / Pre2_Post1 / Pre2_Post2) for group-stratified rhythm
-# analysis; the CES-D scores are the raw depression severities behind the binary status. Carried
-# through to label_df / the output dict but not required by the classification model.
-EXTRA_LABEL_COLS = ["depression_trajectory", "ces_d_baseline_score", "ces_d_endpoint_score"]
+    Channels are grouped by physical nature because each group needs different cleaning:
+    wear-dependent signals get gap interpolation, event streams do not.
+    """
 
-HR_VALID_RANGE = (20.0, 250.0)            # bpm outside this is a sensor error -> NaN
-NUM_TIME_FEATURES = 7                     # CoST calendar covariates appended to every window
+    # --- the 4 model channels, by nature -------------------------------------------------
+    heart_rate: List[str] = field(default_factory=lambda: ["HR"])
+    # Step count only. The Fitbit active-minute intensity levels (fairly/lightly/very) and
+    # sedentary_minutes are deliberately excluded.
+    activity: List[str] = field(default_factory=lambda: ["Steps"])
+    # Binary, DERIVED from the raw sleep_status column -- see derive_is_asleep().
+    sleep: List[str] = field(default_factory=lambda: ["is_asleep"])
+    # Event stream: a missing value means "no event happened", which is a real 0.
+    event: List[str] = field(default_factory=lambda: ["screen"])
 
-# Fixed, DATA-INDEPENDENT standardisation for the calendar covariates produced by
-# _cost_time_features -> [minute, hour, dayofweek, day, dayofyear, month, weekofyear].
-# Every one of these fields has a known a-priori range, so an empirical mean/std estimated
-# from the windows buys nothing -- and estimating it caused two real problems:
-#   1. it was fitted on the POOLED windows, i.e. including held-out test participants
-#      (a transductive scaler; measured effect was small, <= 0.03 sigma, but it is still
-#      test data influencing a transform applied to training data);
+    # --- raw (snake_case) CSV column -> canonical internal name ---------------------------
+    # Confining the rename to the CSV read means nothing downstream has to know the export
+    # schema. Columns we exclude (floors, sedentary_minutes, call, *_active_minutes) are
+    # simply never read.
+    csv_rename: Dict[str, str] = field(default_factory=lambda: {
+        "timestamp": "dateTime",        # raw string; parsed into a real `timestamp` on load
+        "heart_rate": "HR",
+        "steps_minutes": "Steps",
+        "sleep_status": "sleep_level",  # categorical sleep stage, values unchanged
+    })
+
+    # --- sleep_status vocabulary ----------------------------------------------------------
+    # "restless" means movement, so it counts as NOT asleep. Anything outside both sets is
+    # unknown and gets resolved by whether the watch was worn (see derive_is_asleep).
+    sleep_stage_values: Set[str] = field(default_factory=lambda: {"asleep", "light", "deep", "rem"})
+    awake_values: Set[str] = field(default_factory=lambda: {"awake", "wake", "restless"})
+
+    # --- participant-level label columns ---------------------------------------------------
+    label: List[str] = field(default_factory=lambda: [
+        "depression_status_baseline",
+        "depression_status_endpoint",
+    ])
+    # Richer labels the re-export added. `depression_trajectory` holds the paper's Case-1
+    # groups (Pre1_Post1 / Pre1_Post2 / Pre2_Post1 / Pre2_Post2) used for group-stratified
+    # rhythm analysis; the CES-D scores are the raw severities behind the binary status.
+    # Carried through to label_df but not required by the classification model.
+    extra_label: List[str] = field(default_factory=lambda: [
+        "depression_trajectory",
+        "ces_d_baseline_score",
+        "ces_d_endpoint_score",
+    ])
+    # Daily self-report. Kept OUT of the sensor channels: it is a downstream target, never
+    # a model input.
+    energy: str = "emotional_energy"
+
+    @property
+    def wear_dependent(self) -> List[str]:
+        """Channels that go missing when the watch is off -> gap-interpolated, and the ones
+        the participant-level missingness filter is computed over."""
+        return self.heart_rate + self.activity + self.sleep
+
+    @property
+    def sensors(self) -> List[str]:
+        """The full ordered set of model input channels (the C axis of every window)."""
+        return self.heart_rate + self.activity + self.sleep + self.event
+
+    @property
+    def raw_numeric(self) -> List[str]:
+        """Columns read as numbers straight from the CSV (post-rename). `is_asleep` is absent
+        because it is derived, not read."""
+        return self.heart_rate + self.activity + self.event
+
+
+@dataclass(frozen=True)
+class CleaningConfig:
+    """Thresholds that decide which samples, participants and windows are usable."""
+
+    # Heart rate outside this range is a sensor error, not physiology -> set to NaN.
+    hr_valid_bpm: Tuple[float, float] = (20.0, 250.0)
+
+    # Drop a participant whose wear-dependent channels are missing more than this fraction
+    # of the time, averaged over channels.
+    max_participant_missing: float = 0.30
+
+    # Longest non-wear gap that gets linearly interpolated at load time. Data is sampled once
+    # per minute, so this is both a minute count and a sample count. Longer gaps stay NaN and
+    # are dealt with by the per-window gate below.
+    max_gap_minutes: int = 30
+
+    # Per-window, per-channel: a channel missing more than this fraction of its time bins
+    # makes the whole window unusable. This is Algorithm 1, Case 1 of Yan et al. 2022
+    # (ACM TIST 13(3), Article 47, Sec. 3.4.1 / 4.1.1).
+    max_window_missing: float = 0.30
+
+    # Longest run of missing bins tolerated at a window's START or END. Linear interpolation
+    # cannot extrapolate, so edge gaps are nearest-filled; this caps how much may be
+    # fabricated there. Set to the same 30 min the interior already allows, so the edge rule
+    # and the interior rule agree.
+    #
+    # This replaced an earlier rule requiring the first AND last bin to be fully observed.
+    # That rule discarded 14.0% of all candidate windows -- more than the 30% missing-bin
+    # gate itself (10.1%) -- because one unlucky 15-min bin at either boundary killed an
+    # entire 7-day window, and it fell harder on the depressed group (15.0% vs 13.0%).
+    # Measured on HRD_RAW_MinuteLevel.csv, 166 participants.
+    max_edge_gap_minutes: int = 30
+
+    # A window with this many raw samples or fewer is too sparse to bin at all. Checked
+    # before the missingness gate purely to skip obviously empty windows cheaply.
+    min_raw_samples_per_window: int = 10
+
+
+@dataclass(frozen=True)
+class WindowingConfig:
+    """Window geometry and the optional calendar channels appended to each window."""
+
+    window_hours: int = 168                  # 7 days
+    bin_minutes: int = 15
+    label_col: str = "depression_status_endpoint"
+    z_score: bool = True                     # per-participant; see zscore_within_participant
+
+    # CoST calendar covariates, in the order salesforce/CoST's datautils.py builds them:
+    # [minute, hour, dayofweek, day, dayofyear, month, weekofyear].
+    clock_field_ranges: Tuple[Tuple[int, int], ...] = (
+        (0, 59), (0, 23), (0, 6), (1, 31), (1, 366), (1, 12), (1, 53),
+    )
+
+    @property
+    def n_time_features(self) -> int:
+        return len(self.clock_field_ranges)
+
+    @property
+    def bins_per_window(self) -> int:
+        return self.window_hours * 60 // self.bin_minutes
+
+
+CHANNELS = ChannelConfig()
+CLEANING = CleaningConfig()
+WINDOWING = WindowingConfig()
+
+
+# Fixed, DATA-INDEPENDENT standardisation for the calendar covariates. Every clock field has
+# a known a-priori range, so an empirical mean/std estimated from the windows buys nothing --
+# and estimating it caused two real problems:
+#   1. it was fitted on the POOLED windows, i.e. including held-out test participants (a
+#      transductive scaler; measured effect small, <= 0.03 sigma, but it is still test data
+#      influencing a transform applied to training data);
 #   2. worse, the two entry points fitted it on DIFFERENT window sets -- prepare_hrd_dataset
 #      over non-overlapping 168h windows, prepare_hrd_energy_sliding over trailing daily
 #      windows -- so a frozen encoder pretrained through the first path was fed clock
 #      channels on a different scale by the second (measured up to 0.16 sigma).
-# A fixed transform removes both by construction: it cannot see test data, and it is
-# identical everywhere. Values are those of a discrete uniform on the field's range:
-# mean = (lo+hi)/2, std = sqrt(((hi-lo+1)^2 - 1)/12).
-CLOCK_RANGES = ((0, 59), (0, 23), (0, 6), (1, 31), (1, 366), (1, 12), (1, 53))
-CLOCK_MU = np.array([(lo + hi) / 2.0 for lo, hi in CLOCK_RANGES], dtype=np.float32)
-CLOCK_SD = np.array([np.sqrt(((hi - lo + 1) ** 2 - 1) / 12.0) for lo, hi in CLOCK_RANGES],
-                    dtype=np.float32)
+# A fixed transform removes both by construction. The values are those of a discrete uniform
+# on each field's range: mean = (lo + hi) / 2, std = sqrt(((hi - lo + 1)^2 - 1) / 12).
+CLOCK_MU = np.array(
+    [(lo + hi) / 2.0 for lo, hi in WINDOWING.clock_field_ranges], dtype=np.float32)
+CLOCK_SD = np.array(
+    [np.sqrt(((hi - lo + 1) ** 2 - 1) / 12.0) for lo, hi in WINDOWING.clock_field_ranges],
+    dtype=np.float32)
 
 
-def standardise_clock_channels(X: np.ndarray, n_sensors: int) -> np.ndarray:
-    """Scale the trailing NUM_TIME_FEATURES calendar channels of ``X`` (N, T, C) in place.
+# --- Backwards-compatible module-level aliases ---------------------------------------------
+# Other modules and the project docs refer to these names. They are views onto the config
+# above, so there is still exactly one place to change a value.
+HR_COLS = CHANNELS.heart_rate
+ACTIVITY_COLS = CHANNELS.activity
+SLEEP_COLS = CHANNELS.sleep
+EVENT_COLS = CHANNELS.event
+WEAR_COLS = CHANNELS.wear_dependent
+SENSOR_COLS = CHANNELS.sensors
+RAW_NUMERIC_COLS = CHANNELS.raw_numeric
+CSV_RENAME = CHANNELS.csv_rename
+SLEEP_ASLEEP = CHANNELS.sleep_stage_values
+SLEEP_AWAKE = CHANNELS.awake_values
+LABEL_COLS = CHANNELS.label
+EXTRA_LABEL_COLS = CHANNELS.extra_label
+HR_VALID_RANGE = CLEANING.hr_valid_bpm
+EDGE_GAP_MINUTES = CLEANING.max_edge_gap_minutes
+NUM_TIME_FEATURES = WINDOWING.n_time_features
+CLOCK_RANGES = WINDOWING.clock_field_ranges
 
-    Uses the fixed CLOCK_MU/CLOCK_SD above rather than statistics of ``X``, so every caller
-    produces the SAME scaling -- which is what lets an encoder pretrained on one windowing
-    be probed with another. Sensor channels (the leading ``n_sensors``) are untouched; they
-    are already per-participant z-scored at the windowing step."""
-    if X is None or X.shape[-1] <= n_sensors:
-        return X
-    X[:, :, n_sensors:] = ((X[:, :, n_sensors:] - CLOCK_MU) / CLOCK_SD).astype(np.float32)
-    return X
-
-
-def _first_valid(s: pd.Series):
-    """First non-null value of a column (labels repeat, but some rows are blank)."""
-    v = s.dropna()
-    return v.iloc[0] if len(v) else np.nan
-
-
-def _derive_is_asleep(df: pd.DataFrame) -> np.ndarray:
-    """Map sleep_level -> binary is_asleep, disambiguating missingness by wear (needs a
-    cleaned HR column). Sleep stages -> 1; awake/wake/restless -> 0. For unknown/NaN sleep:
-    if HR is present the watch was worn but nothing was scored -> awake (0); if HR is also
-    missing we genuinely don't know -> stays NaN (real non-wear, left for the windowing to
-    drop -- never forced to 0, which would confound non-wear with wakefulness)."""
-    s = df["sleep_level"].astype(str).str.lower().str.strip()
-    a = np.where(s.isin(SLEEP_ASLEEP), 1.0,
-                 np.where(s.isin(SLEEP_AWAKE), 0.0, np.nan)).astype(np.float32)
-    unknown = np.isnan(a)                                   # unknown / NaN sleep_level
-    a[unknown & df["HR"].notna().to_numpy()] = 0.0          # worn but unscored -> awake
-    return a                                                # unknown & HR missing -> NaN
+# Temporary grouping columns added to a working frame during binning.
+_WINDOW_COL = "_w"
+_BIN_COL = "_b"
 
 
 # =============================================================================
-# 1. CSV -> cleaned tables
+# 1. CSV -> CLEANED TABLES
 # =============================================================================
 
 _HRD_CACHE: Dict[tuple, tuple] = {}          # at most one entry; see load_hrd(cache=True)
@@ -152,119 +251,245 @@ def clear_hrd_cache() -> None:
     _HRD_CACHE.clear()
 
 
-def load_hrd(csv_path: str, max_missing: float = 0.30, max_gap_minutes: int = 30,
-             cache: bool = False) -> Tuple[pd.DataFrame, pd.DataFrame]:
-    """Read HRD_RAW_MinuteLevel.csv and return (sensor_df, label_df, ee_by_pid_date).
+def _read_raw_csv(csv_path: PathLike) -> pd.DataFrame:
+    """Read only the columns we consume, rename them to canonical names, and parse types.
 
-    Parsing the 3.4 GB / 53.6 M-row CSV dominates start-up, and both windowing paths
-    (prepare_hrd_dataset and prepare_hrd_energy_sliding) need the SAME cleaned tables.
-    ``cache=True`` keeps the result so a second caller reuses it instead of re-parsing.
-    Sharing is safe: no consumer mutates these tables (both windowers copy their group
-    first). Costs ~1 GiB resident until clear_hrd_cache(), so only pass True when a
-    second consumer actually follows.
+    Rows without a parseable timestamp are dropped -- they cannot be placed on a time grid.
     """
-    key = (str(csv_path), float(max_missing), int(max_gap_minutes))
-    if key in _HRD_CACHE:
-        return _HRD_CACHE[key]
-    t0 = time.time()
-    # Read the raw (snake_case) columns we consume, then rename to canonical internal names.
-    raw_cols = (["pid"] + list(CSV_RENAME) + ["screen"] + LABEL_COLS + EXTRA_LABEL_COLS
-                + ["emotional_energy"])
-    df = pd.read_csv(csv_path, usecols=raw_cols, low_memory=False).rename(columns=CSV_RENAME)
+    raw_columns = (["pid"]
+                   + list(CHANNELS.csv_rename)
+                   + CHANNELS.event
+                   + CHANNELS.label
+                   + CHANNELS.extra_label
+                   + [CHANNELS.energy])
+    df = pd.read_csv(csv_path, usecols=raw_columns, low_memory=False)
+    df = df.rename(columns=CHANNELS.csv_rename)
 
-    # Identifier + timestamp, then drop rows with no parseable time.
     df["pid"] = df["pid"].astype(str).str.lower().str.strip()
     df["timestamp"] = pd.to_datetime(df["dateTime"], errors="coerce")
     df = df.dropna(subset=["timestamp"]).sort_values(["pid", "timestamp"])
-    for c in RAW_NUMERIC_COLS:
-        df[c] = pd.to_numeric(df[c], errors="coerce").astype(np.float32)
-    df["emotional_energy"] = pd.to_numeric(df["emotional_energy"], errors="coerce")
 
-    # Per-sensor range cleaning.
-    lo, hi = HR_VALID_RANGE
-    df["HR"] = df["HR"].where((df["HR"] >= lo) & (df["HR"] <= hi))      # bad HR -> NaN
-    df[ACTIVITY_COLS] = df[ACTIVITY_COLS].clip(lower=0)                 # counts are >= 0
+    for column in CHANNELS.raw_numeric:
+        df[column] = pd.to_numeric(df[column], errors="coerce").astype(np.float32)
+    df[CHANNELS.energy] = pd.to_numeric(df[CHANNELS.energy], errors="coerce")
+    return df
 
-    # Sleep: binary is_asleep, derived AFTER HR cleaning so NaN can be split into
-    # "worn but unscored -> awake" vs "non-wear -> stays NaN" (see _derive_is_asleep).
-    df["is_asleep"] = _derive_is_asleep(df)
 
-    # Structural absence (no event) is a real 0, not a missing value.
-    if EVENT_COLS:
-        df[EVENT_COLS] = df[EVENT_COLS].fillna(0.0)
+def derive_is_asleep(df: pd.DataFrame) -> np.ndarray:
+    """Map the categorical sleep_level to a binary is_asleep channel.
 
-    # One label row per participant (labels are constant within a pid).
-    label_df = df.groupby("pid")[LABEL_COLS + EXTRA_LABEL_COLS].agg(_first_valid).reset_index()
+    Must run AFTER heart rate has been range-cleaned, because HR is what disambiguates a
+    missing sleep score: if HR is present the watch was worn but nothing was scored, which
+    means awake (0); if HR is missing too we genuinely do not know, so the value stays NaN
+    and the windowing gate decides. Forcing it to 0 would confound non-wear with wakefulness.
+    """
+    stage = df["sleep_level"].astype(str).str.lower().str.strip()
+    is_asleep = np.where(
+        stage.isin(CHANNELS.sleep_stage_values), 1.0,
+        np.where(stage.isin(CHANNELS.awake_values), 0.0, np.nan),
+    ).astype(np.float32)
 
-    # Quality filter: drop participants with > max_missing wear-channel missingness.
-    wear_missing = df[WEAR_COLS].isna().groupby(df["pid"]).mean().mean(axis=1)
-    keep_pids = wear_missing.index[wear_missing <= max_missing]
-    n_total = df["pid"].nunique()
+    unknown = np.isnan(is_asleep)
+    watch_was_worn = df["HR"].notna().to_numpy()
+    is_asleep[unknown & watch_was_worn] = 0.0
+    return is_asleep
+
+
+def _clean_sensor_values(df: pd.DataFrame) -> pd.DataFrame:
+    """Apply the per-channel cleaning each channel's nature calls for.
+
+    HR is range-checked, counts are clipped non-negative, sleep is binarised, and event
+    channels get their structural absence turned into a real 0.
+    """
+    lo, hi = CLEANING.hr_valid_bpm
+    for column in CHANNELS.heart_rate:
+        df[column] = df[column].where((df[column] >= lo) & (df[column] <= hi))
+    df[CHANNELS.activity] = df[CHANNELS.activity].clip(lower=0)
+
+    df["is_asleep"] = derive_is_asleep(df)
+
+    if CHANNELS.event:
+        df[CHANNELS.event] = df[CHANNELS.event].fillna(0.0)
+    return df
+
+
+def _build_label_table(df: pd.DataFrame) -> pd.DataFrame:
+    """Collapse the repeated per-row labels into one row per participant."""
+    def first_valid(series: pd.Series) -> Any:
+        """First non-null value; labels repeat, but some rows are blank."""
+        present = series.dropna()
+        return present.iloc[0] if len(present) else np.nan
+
+    label_columns = CHANNELS.label + CHANNELS.extra_label
+    return df.groupby("pid")[label_columns].agg(first_valid).reset_index()
+
+
+def _participants_within_missing_budget(df: pd.DataFrame, max_missing: float) -> pd.Index:
+    """Participant ids whose wear-dependent channels are complete enough to keep."""
+    missing_per_participant = (df[CHANNELS.wear_dependent]
+                               .isna()
+                               .groupby(df["pid"])
+                               .mean()
+                               .mean(axis=1))
+    return missing_per_participant.index[missing_per_participant <= max_missing]
+
+
+def _interpolate_short_gaps(df: pd.DataFrame, max_gap_minutes: int) -> pd.DataFrame:
+    """Linearly fill non-wear gaps up to `max_gap_minutes`, within each participant.
+
+    Longer gaps stay NaN on purpose: they are real non-wear and the per-window gate should
+    see them rather than have them fabricated away. `limit_area="inside"` keeps the fill
+    strictly between observed samples, so nothing is extrapolated past a record's edges.
+    """
+    df[CHANNELS.wear_dependent] = df.groupby("pid")[CHANNELS.wear_dependent].transform(
+        lambda s: s.interpolate(method="linear", limit=max_gap_minutes, limit_area="inside")
+    )
+    df[CHANNELS.activity] = df[CHANNELS.activity].clip(lower=0)
+    return df
+
+
+def _build_daily_energy_lookup(df: pd.DataFrame) -> DailyEnergyLookup:
+    """Build the (pid, calendar date) -> emotional energy map used to label windows."""
+    answered = df.dropna(subset=[CHANNELS.energy]).copy()
+    answered["_date"] = answered["timestamp"].dt.normalize()
+    daily = answered.groupby(["pid", "_date"])[CHANNELS.energy].first()
+    return {(pid, day.date()): float(value) for (pid, day), value in daily.items()}
+
+
+def load_hrd(
+    csv_path: PathLike,
+    max_missing: float = CLEANING.max_participant_missing,
+    max_gap_minutes: int = CLEANING.max_gap_minutes,
+    cache: bool = False,
+) -> Tuple[pd.DataFrame, pd.DataFrame, DailyEnergyLookup]:
+    """Read the raw CSV and return the cleaned (sensor_df, label_df, energy_by_pid_date).
+
+    Parsing the 3.4 GB / 53.6 M-row CSV dominates start-up and both windowing paths need the
+    same cleaned tables, so `cache=True` keeps the result for a second caller. Sharing is
+    safe because no consumer mutates these tables (both windowers copy their group first).
+    Costs ~1 GiB resident until clear_hrd_cache(), so only pass True when a second consumer
+    actually follows.
+    """
+    cache_key = (str(csv_path), float(max_missing), int(max_gap_minutes))
+    if cache_key in _HRD_CACHE:
+        return _HRD_CACHE[cache_key]
+
+    started_at = time.time()
+    df = _read_raw_csv(csv_path)
+    df = _clean_sensor_values(df)
+
+    label_df = _build_label_table(df)
+
+    # Quality filter, computed BEFORE interpolation so it sees genuinely missing data.
+    n_participants_before = df["pid"].nunique()
+    keep_pids = _participants_within_missing_budget(df, max_missing)
     df = df[df["pid"].isin(keep_pids)]
     label_df = label_df[label_df["pid"].isin(keep_pids)].reset_index(drop=True)
 
-    # Gap-limited interpolation of the continuous wear channels: fill only short
-    # non-wear gaps (<= max_gap_minutes; data is 1 sample/minute) and leave long
-    # gaps as NaN for the windowing step to discard.
-    df[WEAR_COLS] = df.groupby("pid")[WEAR_COLS].transform(
-        lambda s: s.interpolate(method="linear", limit=max_gap_minutes, limit_area="inside")
-    )
-    df[ACTIVITY_COLS] = df[ACTIVITY_COLS].clip(lower=0)
+    df = _interpolate_short_gaps(df, max_gap_minutes)
 
-    sensor_df = df[["pid", "timestamp"] + SENSOR_COLS].reset_index(drop=True)
-    # pid -> category AFTER the keep_pids filter, so there are no unused categories.
-    # 53.6 M rows of Python strings cost 3.6 GiB as object dtype vs 1.0 GiB categorical,
-    # which is what makes caching this frame affordable at --mem=32G.
+    sensor_df = df[["pid", "timestamp"] + CHANNELS.sensors].reset_index(drop=True)
+    # pid -> category AFTER the keep_pids filter, so there are no unused categories. 53.6 M
+    # rows of Python strings cost 3.6 GiB as object dtype vs 1.0 GiB categorical, which is
+    # what makes caching this frame affordable at --mem=32G.
     sensor_df["pid"] = sensor_df["pid"].astype("category")
 
-    # Daily self-reported emotional_energy (1-5), constant within a pid-day; keyed by
-    # (pid, calendar date) for the per-window last-day lookup in prepare_hrd_dataset. Kept
-    # OUT of SENSOR_COLS so it never enters the model as an input -- it is a downstream label.
-    df_ee = df.dropna(subset=["emotional_energy"]).copy()
-    df_ee["_date"] = df_ee["timestamp"].dt.normalize()
-    ee_daily = df_ee.groupby(["pid", "_date"])["emotional_energy"].first()
-    ee_by_pid_date = {(p, d.date()): float(v) for (p, d), v in ee_daily.items()}
+    energy_by_pid_date = _build_daily_energy_lookup(df)
 
-    n_consistent = int(
-        (label_df["depression_status_baseline"]
-         == label_df["depression_status_endpoint"]).sum()
-    )
+    n_consistent = int((label_df["depression_status_baseline"]
+                        == label_df["depression_status_endpoint"]).sum())
+    n_dropped = n_participants_before - len(keep_pids)
     print(
-        f"[data_preprocessing] {len(sensor_df):,} rows | kept {len(keep_pids)}/{n_total} "
-        f"participants (dropped {n_total - len(keep_pids)} with >{max_missing:.0%} wear-missing) | "
-        f"{n_consistent} with baseline==endpoint | {time.time() - t0:.1f}s"
+        f"[data_preprocessing] {len(sensor_df):,} rows | kept {len(keep_pids)}/"
+        f"{n_participants_before} participants (dropped {n_dropped} with "
+        f">{max_missing:.0%} wear-missing) | {n_consistent} with baseline==endpoint | "
+        f"{time.time() - started_at:.1f}s"
     )
-    out = (sensor_df, label_df, ee_by_pid_date)
+
+    tables = (sensor_df, label_df, energy_by_pid_date)
     if cache:
         _HRD_CACHE.clear()                   # keep at most one (~1 GiB) entry
-        _HRD_CACHE[key] = out
-    return out
+        _HRD_CACHE[cache_key] = tables
+    return tables
 
 
-def _label_maps(label_df: pd.DataFrame, label_col: str) -> Tuple[Dict[str, int], set]:
-    """Return (label_by_pid, consistent_pids) from the participant label table."""
+def _endpoint_labels_and_consistent_pids(
+    label_df: pd.DataFrame, label_col: str
+) -> Tuple[Dict[str, int], Set[str]]:
+    """Return (label per participant, participants whose baseline == endpoint status).
+
+    "Consistent" participants have a stable label, so they are the clean-label cohort;
+    status-changers add label noise but more samples.
+    """
     label_by_pid: Dict[str, int] = {}
     for _, row in label_df.iterrows():
-        v = row.get(label_col)
-        if pd.notna(v):
-            label_by_pid[row["pid"]] = int(v)
-    base, end = "depression_status_baseline", "depression_status_endpoint"
-    consistent = set(label_df.loc[label_df[base] == label_df[end], "pid"])  # NaN==NaN is False
-    return label_by_pid, consistent
+        value = row.get(label_col)
+        if pd.notna(value):
+            label_by_pid[row["pid"]] = int(value)
+
+    baseline, endpoint = "depression_status_baseline", "depression_status_endpoint"
+    is_consistent = label_df[baseline] == label_df[endpoint]      # NaN == NaN is False
+    consistent_pids = set(label_df.loc[is_consistent, "pid"])
+    return label_by_pid, consistent_pids
+
+
+def _trajectory_by_pid(label_df: pd.DataFrame) -> Dict[str, str]:
+    """Participant -> Case-1 group (Pre1_Post1 ... Pre2_Post2), skipping those without one."""
+    trajectories: Dict[str, str] = {}
+    for pid, group in zip(label_df["pid"], label_df["depression_trajectory"]):
+        if isinstance(group, str):
+            trajectories[pid] = group
+    return trajectories
+
+
+def _baseline_status_by_pid(label_df: pd.DataFrame) -> Dict[str, int]:
+    """Participant -> baseline depression status.
+
+    Read straight from the status column rather than parsed out of `depression_trajectory`'s
+    Pre1/Pre2 strings, so downstream code that selects on the (baseline, endpoint) pair does
+    not depend on that naming convention.
+    """
+    baseline: Dict[str, int] = {}
+    for _, row in label_df.iterrows():
+        status = row["depression_status_baseline"]
+        if pd.notna(status):
+            baseline[row["pid"]] = int(status)
+    return baseline
 
 
 # =============================================================================
-# 2. cleaned tables -> windowed tensor
+# 2. TIME CHANNELS
 # =============================================================================
 
-def _cost_time_features(win_start, target_bins: int, bin_minutes: int) -> np.ndarray:
-    """CoST calendar covariates, EXACTLY as datautils._get_time_features in salesforce/CoST:
-    the RAW [minute, hour, dayofweek, day, dayofyear, month, weekofyear] of each bin's timestamp
-    -> (target_bins, NUM_TIME_FEATURES). CoST standardises them with a StandardScaler fitted on
-    the data and concatenates them to the feature axis; we concatenate them the same way but
-    scale them with the FIXED CLOCK_MU/CLOCK_SD instead (see standardise_clock_channels for
-    why a fitted scaler was wrong here), appended as extra input channels."""
-    ts = pd.date_range(win_start, periods=target_bins, freq=f"{bin_minutes}min")
+def standardise_clock_channels(X: Optional[np.ndarray], n_sensors: int) -> Optional[np.ndarray]:
+    """Scale the trailing calendar channels of `X` (N, T, C) in place, using the fixed scale.
+
+    Uses CLOCK_MU / CLOCK_SD rather than statistics of `X`, so every caller produces the SAME
+    scaling -- which is what lets an encoder pretrained on one windowing be probed with
+    another. Sensor channels (the leading `n_sensors`) are untouched: they are already
+    per-participant z-scored at the windowing step.
+    """
+    if X is None or X.shape[-1] <= n_sensors:
+        return X
+    X[:, :, n_sensors:] = ((X[:, :, n_sensors:] - CLOCK_MU) / CLOCK_SD).astype(np.float32)
+    return X
+
+
+def _window_timestamps(window_start: pd.Timestamp, target_bins: int,
+                       bin_minutes: int) -> pd.DatetimeIndex:
+    """The wall-clock timestamp of every bin in a window."""
+    return pd.date_range(window_start, periods=target_bins, freq=f"{bin_minutes}min")
+
+
+def _cost_time_features(window_start: pd.Timestamp, target_bins: int,
+                        bin_minutes: int) -> np.ndarray:
+    """CoST calendar covariates per bin -> (target_bins, n_time_features).
+
+    Exactly the fields datautils._get_time_features builds in salesforce/CoST. CoST scales
+    them with a StandardScaler fitted on the data; we concatenate them the same way but use
+    the fixed CLOCK_MU / CLOCK_SD instead (see standardise_clock_channels for why).
+    """
+    ts = _window_timestamps(window_start, target_bins, bin_minutes)
     return np.stack(
         [
             ts.minute.to_numpy(),
@@ -279,226 +504,366 @@ def _cost_time_features(win_start, target_bins: int, bin_minutes: int) -> np.nda
     ).astype(np.float32)
 
 
-def _calendar_index_features(win_start, target_bins: int, bin_minutes: int) -> np.ndarray:
-    """Raw [time-of-day bin, day-of-week] index per bin -> (target_bins, 2), for the
-    factorized calendar PE (``--pe factorized``). Deliberately NOT standardised: these are
-    embedding lookups, not covariates."""
-    ts = pd.date_range(win_start, periods=target_bins, freq=f"{bin_minutes}min")
-    tod = (ts.hour.to_numpy() * 60 + ts.minute.to_numpy()) // bin_minutes
-    return np.stack([tod, ts.dayofweek.to_numpy()], axis=1).astype(np.float32)
+def _calendar_index_features(window_start: pd.Timestamp, target_bins: int,
+                             bin_minutes: int) -> np.ndarray:
+    """Raw [time-of-day bin, day-of-week] index per bin -> (target_bins, 2).
+
+    For the factorized calendar PE (``--pe factorized``). Deliberately NOT standardised:
+    these are embedding lookups, not covariates.
+    """
+    ts = _window_timestamps(window_start, target_bins, bin_minutes)
+    time_of_day_bin = (ts.hour.to_numpy() * 60 + ts.minute.to_numpy()) // bin_minutes
+    return np.stack([time_of_day_bin, ts.dayofweek.to_numpy()], axis=1).astype(np.float32)
 
 
-# Longest run of missing bins tolerated at a window's START or END. Linear interpolation
-# cannot extrapolate, so edge gaps are nearest-filled by ``limit_direction="both"``; this
-# caps how much may be fabricated there. Set to the SAME 30 min the interior already allows
-# (load_hrd's max_gap_minutes), so the edge rule and the interior rule agree.
+def _append_time_channels(sensor_values: np.ndarray, window_start: pd.Timestamp,
+                          bin_minutes: int, clock_features: bool,
+                          calendar_index: bool) -> np.ndarray:
+    """Concatenate the optional time channels onto a window's sensor channels.
+
+    The two encodings are mutually exclusive; with neither requested the window stays
+    sensor-only, i.e. time is excluded from the model entirely.
+    """
+    target_bins = sensor_values.shape[0]
+    if clock_features:
+        extra = _cost_time_features(window_start, target_bins, bin_minutes)
+    elif calendar_index:
+        extra = _calendar_index_features(window_start, target_bins, bin_minutes)
+    else:
+        return sensor_values
+    return np.concatenate([sensor_values, extra], axis=1)
+
+
+# =============================================================================
+# 3. BINNING AND THE PER-WINDOW QUALITY GATE
 #
-# This replaces the original endpoint rule, which required the first AND last bin to be
-# fully observed. That rule discarded 14.0% of all candidate windows -- more than the 30%
-# missing-bin quality gate itself (10.1%) -- because a single unlucky 15-min bin at either
-# boundary killed an entire 7-day window, and it fell harder on the depressed group
-# (15.0% vs 13.0%). Measured on HRD_RAW_MinuteLevel.csv, 166 participants.
-EDGE_GAP_MINUTES = 30
+# Shared by both windowing paths (non-overlapping and sliding) so the two can never drift
+# apart on what counts as a usable window.
+# =============================================================================
+
+def zscore_within_participant(g: pd.DataFrame, sensor_cols: List[str]) -> pd.DataFrame:
+    """Standardise one participant's sensor columns using only that participant's own stats.
+
+    Leakage-free by construction: no statistic is shared across participants or with the
+    labels. Zero-variance channels get sd = 1 so they pass through unchanged instead of
+    producing NaN/inf.
+    """
+    g = g.copy()
+    mean = g[sensor_cols].mean()
+    std = g[sensor_cols].std().replace(0.0, 1.0).fillna(1.0)
+    g[sensor_cols] = (g[sensor_cols] - mean) / std
+    return g
+
+
+def _fill_bin_grid(mean_by_bin: pd.DataFrame, count_by_bin: pd.DataFrame,
+                   target_bins: int, n_sensors: int) -> Tuple[np.ndarray, np.ndarray]:
+    """Lay per-bin means onto a fixed (target_bins, n_sensors) grid.
+
+    Returns (values, observed): bins with no sample for a channel are NaN in `values` and
+    False in `observed`, which is what the quality gate below reads.
+    """
+    values = np.full((target_bins, n_sensors), np.nan, dtype=np.float32)
+    observed = np.zeros((target_bins, n_sensors), dtype=bool)
+    for bin_index in mean_by_bin.index:
+        has_sample = count_by_bin.loc[bin_index].to_numpy() > 0
+        values[bin_index] = np.where(
+            has_sample, mean_by_bin.loc[bin_index].to_numpy(dtype=np.float32), np.nan)
+        observed[bin_index] = has_sample
+    return values, observed
 
 
 def _edge_gap_ok(observed: np.ndarray, bin_minutes: int) -> bool:
-    """True when every channel's leading and trailing run of missing bins is short enough
-    to be nearest-filled. ``observed`` is a ``(n_bins, n_channels)`` boolean array."""
-    max_edge = EDGE_GAP_MINUTES // bin_minutes
+    """True when every channel's leading and trailing run of missing bins is short enough.
+
+    Interpolation cannot extrapolate, so edge gaps are nearest-filled; this bounds how much
+    of a window's start or end may be fabricated. `observed` is (n_bins, n_channels) boolean.
+    """
+    max_edge_bins = CLEANING.max_edge_gap_minutes // bin_minutes
     n_bins = observed.shape[0]
-    for c in range(observed.shape[1]):
-        seen = np.flatnonzero(observed[:, c])
-        if len(seen) == 0 or seen[0] > max_edge or (n_bins - 1 - seen[-1]) > max_edge:
+    for channel in range(observed.shape[1]):
+        seen = np.flatnonzero(observed[:, channel])
+        if len(seen) == 0:
+            return False
+        leading_gap, trailing_gap = seen[0], n_bins - 1 - seen[-1]
+        if leading_gap > max_edge_bins or trailing_gap > max_edge_bins:
             return False
     return True
 
 
-def _window_participant(g: "pd.DataFrame", window_minutes: int, bin_minutes: int,
-                        sensor_cols: List[str], max_window_missing: float,
-                        z_score: bool, clock_features: bool = False,
-                        calendar_index: bool = False,
-                        align_midnight: bool = False
-                        ) -> List[Tuple[np.ndarray, "pd.Timestamp"]]:
-    """Vectorised fixed-size binning of one participant into windows.
+def _window_is_usable(observed: np.ndarray, bin_minutes: int,
+                      max_window_missing: float) -> bool:
+    """Apply Algorithm 1 (Yan et al. 2022, Sec. 3.4.1) to one window.
 
-    Each window is sensor-only by default; ``clock_features`` appends the 7 standardised
-    CoST calendar covariates and ``calendar_index`` (``--pe factorized``) appends the 2 raw
-    [time-of-day, day-of-week] index channels instead. The two are mutually exclusive."""
-    out: List[Tuple[np.ndarray, "pd.Timestamp"]] = []
+    A sensor feature is unusable when (a) more than `max_window_missing` of its time bins are
+    missing, or (b) its leading/trailing gap is too long to nearest-fill. Because the fixed-C
+    tensor needs the full channel set, ANY unusable feature disqualifies the whole window --
+    the tensor analogue of the paper's per-feature drop.
+    """
+    missing_fraction = 1.0 - observed.mean(axis=0)          # per channel
+    if (missing_fraction > max_window_missing).any():
+        return False
+    return _edge_gap_ok(observed, bin_minutes)
+
+
+def _interpolate_interior_gaps(values: np.ndarray) -> np.ndarray:
+    """Fill the remaining gaps of a window that already passed the quality gate.
+
+    Interior gaps are linearly interpolated; edge gaps are nearest-filled and were bounded by
+    the gate, so nothing is extrapolated. The result is a clean continuous signal with no
+    zero-padding, which matters because the FFT-based seasonal layer would read padding as
+    real signal.
+    """
+    filled = (pd.DataFrame(values)
+              .interpolate(method="linear", limit_direction="both")
+              .to_numpy(dtype=np.float32))
+    return np.nan_to_num(filled, nan=0.0)
+
+
+def _build_window_array(mean_by_bin: pd.DataFrame, count_by_bin: pd.DataFrame,
+                        target_bins: int, n_sensors: int, bin_minutes: int,
+                        max_window_missing: float) -> Optional[np.ndarray]:
+    """Bin -> gate -> interpolate for one window. None when the window fails the gate."""
+    values, observed = _fill_bin_grid(mean_by_bin, count_by_bin, target_bins, n_sensors)
+    if not _window_is_usable(observed, bin_minutes, max_window_missing):
+        return None
+    return _interpolate_interior_gaps(values)
+
+
+# =============================================================================
+# 4. CLEANED TABLES -> NON-OVERLAPPING WINDOWS (depression path)
+# =============================================================================
+
+def _tag_samples_with_window_and_bin(
+    g: pd.DataFrame, grid_start: pd.Timestamp, window_minutes: int, bin_minutes: int,
+    sensor_cols: List[str], target_bins: int,
+) -> Tuple[Optional[pd.DataFrame], int]:
+    """Label each raw sample with the window and bin it falls into.
+
+    Returns (tagged_frame, n_complete_windows). Samples in the trailing partial window are
+    dropped, since a fixed-size tensor cannot hold one. (None, 0) when there is not even one
+    complete window.
+    """
+    minutes_since_start = (g["timestamp"] - grid_start).dt.total_seconds().to_numpy() / 60.0
+    n_complete_windows = int(float(minutes_since_start[-1]) // window_minutes)
+    if n_complete_windows < 1:
+        return None, 0
+
+    window_index = (minutes_since_start // window_minutes).astype(np.int64)
+    in_complete_window = window_index < n_complete_windows
+    if not in_complete_window.any():
+        return None, 0
+
+    tagged = g.loc[in_complete_window, sensor_cols].copy()
+    windows = window_index[in_complete_window]
+    minutes_into_window = minutes_since_start[in_complete_window] - windows * window_minutes
+
+    tagged[_WINDOW_COL] = windows
+    tagged[_BIN_COL] = np.clip(
+        (minutes_into_window // bin_minutes).astype(np.int64), 0, target_bins - 1)
+    return tagged, n_complete_windows
+
+
+def _window_participant(
+    g: pd.DataFrame,
+    window_minutes: int,
+    bin_minutes: int,
+    sensor_cols: List[str],
+    max_window_missing: float,
+    z_score: bool,
+    clock_features: bool = False,
+    calendar_index: bool = False,
+    align_midnight: bool = False,
+) -> List[Window]:
+    """Cut one participant's record into consecutive fixed-size windows.
+
+    Windows do not overlap. `align_midnight` anchors the grid to midnight so a given timestep
+    always maps to the same clock time, which the circadian-phase pretext task needs;
+    otherwise the grid starts at the participant's first sample.
+    """
+    windows: List[Window] = []
     target_bins = window_minutes // bin_minutes
     n_sensors = len(sensor_cols)
-    if z_score:                                       # per-participant, leakage-free
-        g = g.copy()
-        mu = g[sensor_cols].mean()
-        sd = g[sensor_cols].std().replace(0.0, 1.0).fillna(1.0)
-        g[sensor_cols] = (g[sensor_cols] - mu) / sd
-    ts = g["timestamp"]
-    if len(ts) < 2:
-        return out
-    # Anchor the grid to midnight so a timestep always maps to the same clock time (needed
-    # by the circadian-phase pretext); otherwise start at the participant's first sample.
-    start = ts.iloc[0].floor("D") if align_midnight else ts.iloc[0]
-    delta_min = (ts - start).dt.total_seconds().to_numpy() / 60.0
-    num_windows = int(float(delta_min[-1]) // window_minutes)
-    if num_windows < 1:
-        return out
-    win_idx = (delta_min // window_minutes).astype(np.int64)
-    keep = win_idx < num_windows
-    if not keep.any():
-        return out
-    sub = g.loc[keep, sensor_cols].copy()
-    w = win_idx[keep]
-    within = delta_min[keep] - w * window_minutes
-    sub["_w"] = w
-    sub["_b"] = np.clip((within // bin_minutes).astype(np.int64), 0, target_bins - 1)
-    win_sizes = sub.groupby("_w").size()
-    grouped = sub.groupby(["_w", "_b"])
-    mean_df = grouped[sensor_cols].mean()
-    count_df = grouped[sensor_cols].count()
-    windows_with_data = set(mean_df.index.get_level_values(0))
-    window_size = pd.Timedelta(minutes=window_minutes)
-    for wi in range(num_windows):
-        if int(win_sizes.get(wi, 0)) <= 10:
+
+    if z_score:
+        g = zscore_within_participant(g, sensor_cols)
+    if len(g["timestamp"]) < 2:
+        return windows
+
+    first_sample = g["timestamp"].iloc[0]
+    grid_start = first_sample.floor("D") if align_midnight else first_sample
+
+    tagged, n_complete_windows = _tag_samples_with_window_and_bin(
+        g, grid_start, window_minutes, bin_minutes, sensor_cols, target_bins)
+    if tagged is None:
+        return windows
+
+    samples_per_window = tagged.groupby(_WINDOW_COL).size()
+    grouped = tagged.groupby([_WINDOW_COL, _BIN_COL])
+    mean_by_window_bin = grouped[sensor_cols].mean()
+    count_by_window_bin = grouped[sensor_cols].count()
+    windows_with_data = set(mean_by_window_bin.index.get_level_values(0))
+    window_span = pd.Timedelta(minutes=window_minutes)
+
+    for window_i in range(n_complete_windows):
+        n_samples = int(samples_per_window.get(window_i, 0))
+        if n_samples <= CLEANING.min_raw_samples_per_window:
             continue
-        sensor_values = np.full((target_bins, n_sensors), np.nan, dtype=np.float32)
-        observed = np.zeros((target_bins, n_sensors), dtype=bool)
-        if wi in windows_with_data:
-            wm = mean_df.loc[wi]
-            wc = count_df.loc[wi]
-            for bi in wm.index:
-                obs = wc.loc[bi].to_numpy() > 0
-                sensor_values[bi] = np.where(obs, wm.loc[bi].to_numpy(dtype=np.float32), np.nan)
-                observed[bi] = obs
-        # -- Algorithm 1 (Yan et al. 2022, Sec. 3.4.1) applied per sensor feature over the
-        #    window's time bins. (a) A feature with more than max_window_missing (30%) missing
-        #    bins is unusable. (b) Edge gaps are nearest-filled rather than interpolated, so a
-        #    feature whose leading/trailing gap exceeds EDGE_GAP_MINUTES is unusable. Because
-        #    the fixed-C tensor needs the full channel set, any unusable feature disqualifies
-        #    the whole window (tensor analogue of the per-feature drop).
-        miss_frac = 1.0 - observed.mean(axis=0)               # per-channel missing fraction
-        if (miss_frac > max_window_missing).any():
-            continue
-        if not _edge_gap_ok(observed, bin_minutes):           # bounded edge gap
-            continue
-        # (c) nearest-neighbour LINEAR interpolation of the interior gaps; edge gaps are
-        # nearest-filled and bounded by the gate above, so nothing is extrapolated. The result
-        # is a clean continuous signal (no zeros, so the FFT-based seasonal layer sees no padding).
-        sensor_values = (
-            pd.DataFrame(sensor_values)
-            .interpolate(method="linear", limit_direction="both")
-            .to_numpy(dtype=np.float32)
-        )
-        sensor_values = np.nan_to_num(sensor_values, nan=0.0)
-        win_start = start + wi * window_size
-        if clock_features:
-            time_feat = _cost_time_features(win_start, target_bins, bin_minutes)
-            arr = np.concatenate([sensor_values, time_feat], axis=1)
-        elif calendar_index:
-            arr = np.concatenate(
-                [sensor_values, _calendar_index_features(win_start, target_bins, bin_minutes)],
-                axis=1)
+
+        if window_i in windows_with_data:
+            mean_by_bin = mean_by_window_bin.loc[window_i]
+            count_by_bin = count_by_window_bin.loc[window_i]
         else:
-            arr = sensor_values
-        out.append((arr.astype(np.float32), win_start))
-    return out
+            # No sample landed in any bin: build an empty grid so the gate rejects it.
+            mean_by_bin = count_by_bin = pd.DataFrame(columns=sensor_cols)
+
+        sensor_values = _build_window_array(
+            mean_by_bin, count_by_bin, target_bins, n_sensors, bin_minutes,
+            max_window_missing)
+        if sensor_values is None:
+            continue
+
+        window_start = grid_start + window_i * window_span
+        window = _append_time_channels(
+            sensor_values, window_start, bin_minutes, clock_features, calendar_index)
+        windows.append((window.astype(np.float32), window_start))
+
+    return windows
+
+
+# =============================================================================
+# 5. PUBLIC ENTRY POINT: DEPRESSION DATASET
+# =============================================================================
+
+def _group_energy_by_participant(
+    energy_by_pid_date: DailyEnergyLookup,
+) -> Dict[str, List[Tuple[pd.Timestamp, float]]]:
+    """Reshape the (pid, date) lookup into pid -> [(day, energy), ...]."""
+    by_participant: Dict[str, List[Tuple[pd.Timestamp, float]]] = {}
+    for (pid, day), value in energy_by_pid_date.items():
+        by_participant.setdefault(pid, []).append((pd.Timestamp(day), value))
+    return by_participant
+
+
+def _mean_energy_in_range(
+    day_energy_pairs: Sequence[Tuple[Any, float]],
+    start: pd.Timestamp,
+    end: pd.Timestamp,
+    include_end: bool,
+) -> float:
+    """Mean emotional energy over the answered days a window spans; NaN when there are none.
+
+    Emotional energy is a per-DAY survey while these windows are 7 days long, so scoring a
+    single day's value against a week of input would leave six sevenths of the input saying
+    nothing about the target. The mean is the only target on the window's own timescale.
+    """
+    values: List[float] = []
+    for day, energy in day_energy_pairs:
+        day = pd.Timestamp(day)
+        in_range = (start <= day <= end) if include_end else (start <= day < end)
+        if in_range and np.isfinite(energy):
+            values.append(energy)
+    return float(np.mean(values)) if values else np.nan
+
+
+def _resolve_sensor_cols(sensor_df: pd.DataFrame) -> List[str]:
+    """The configured sensor channels that are actually present in the loaded table."""
+    sensor_cols = [c for c in CHANNELS.sensors if c in sensor_df.columns]
+    if not sensor_cols:
+        raise ValueError("None of the expected sensor columns are present in the CSV.")
+    return sensor_cols
 
 
 def prepare_hrd_dataset(
-    csv_path: str,
-    window_hours: int = 168,
-    bin_minutes: int = 15,
-    label_col: str = "depression_status_endpoint",
-    max_missing: float = 0.30,
-    max_gap_minutes: int = 30,
-    max_window_missing: float = 0.30,
-    z_score: bool = True,
+    csv_path: PathLike,
+    window_hours: int = WINDOWING.window_hours,
+    bin_minutes: int = WINDOWING.bin_minutes,
+    label_col: str = WINDOWING.label_col,
+    max_missing: float = CLEANING.max_participant_missing,
+    max_gap_minutes: int = CLEANING.max_gap_minutes,
+    max_window_missing: float = CLEANING.max_window_missing,
+    z_score: bool = WINDOWING.z_score,
     clock_features: bool = False,
     calendar_index: bool = False,
     align_midnight: bool = False,
     cache_raw: bool = False,
 ) -> Dict[str, object]:
-    """Full HRD preprocessing -> windowed classification dataset for CoST.
+    """Full HRD preprocessing -> non-overlapping windowed classification dataset for CoST.
 
-    ``clock_features`` (default False) keeps sensor channels only -- time is excluded
-    from the model entirely. Set it True to append NUM_TIME_FEATURES CoST-style calendar
-    covariates (raw minute/hour/dayofweek/day/dayofyear/month/weekofyear) to every window --
-    the same channels salesforce/CoST's datautils.py builds, but scaled by the fixed
-    CLOCK_MU/CLOCK_SD rather than a StandardScaler fitted on the windows, so the transform
-    is identical here and in prepare_hrd_energy_sliding and never sees held-out data.
+    `clock_features` (default False) keeps sensor channels only, i.e. time is excluded from
+    the model entirely. Set it True to append the CoST calendar covariates, scaled by the
+    fixed CLOCK_MU / CLOCK_SD so the transform is identical here and in the sliding path.
 
     Returns a dict with:
-      X               (N, T, C) float32 windows, C = n_sensors (+ NUM_TIME_FEATURES
-                      when clock_features is True)
-      y               (N,)      int endpoint labels (0=control, 1=depressed)
-      pids            (N,)      participant id per window
-      window_ids      (N,)      unique id "pid_<isotime>" per window
-      consistent_pids set       pids with baseline == endpoint
-      labeled_pids    set       pids that carry an endpoint label
-      trajectory_by_pid dict    pid -> Case-1 group (Pre1_Post1 ... Pre2_Post2)
+      X                 (N, T, C) float32 windows
+      y                 (N,)  int endpoint labels (0 = control, 1 = depressed)
+      pids              (N,)  participant id per window
+      window_ids        (N,)  unique "pid_<isotime>" per window
+      ee_win            (N,)  mean emotional energy over the days the window spans (NaN if none)
+      consistent_pids   set   pids with baseline == endpoint
+      labeled_pids      set   pids that carry an endpoint label
+      trajectory_by_pid dict  pid -> Case-1 group (Pre1_Post1 ... Pre2_Post2)
+      baseline_by_pid   dict  pid -> baseline depression status
       sensor_cols, n_sensors, n_features
     """
-    # ee_by_pid_date (the daily emotional_energy lookup) is only used by the sliding
-    # energy path (prepare_hrd_energy_sliding); the depression windowing ignores it.
-    sensor_df, label_df, _ = load_hrd(csv_path, max_missing=max_missing,
-                                      max_gap_minutes=max_gap_minutes, cache=cache_raw)
-    label_by_pid, consistent_pids = _label_maps(label_df, label_col)
-    sensor_cols = [c for c in SENSOR_COLS if c in sensor_df.columns]
-    if not sensor_cols:
-        raise ValueError("None of the expected sensor columns are present in the CSV.")
+    sensor_df, label_df, energy_by_pid_date = load_hrd(
+        csv_path, max_missing=max_missing, max_gap_minutes=max_gap_minutes, cache=cache_raw)
+
+    label_by_pid, consistent_pids = _endpoint_labels_and_consistent_pids(label_df, label_col)
+    sensor_cols = _resolve_sensor_cols(sensor_df)
     window_minutes = window_hours * 60
+    window_span = pd.Timedelta(minutes=window_minutes)
+    energy_by_pid = _group_energy_by_participant(energy_by_pid_date)
 
-    t0 = time.time()
-    X_list, y_list, pid_list, wid_list = [], [], [], []
-    for pid, g in sensor_df.groupby("pid", sort=True, observed=True):
+    started_at = time.time()
+    all_windows: List[np.ndarray] = []
+    all_labels: List[int] = []
+    all_pids: List[str] = []
+    all_window_ids: List[str] = []
+    all_window_energy: List[float] = []
+
+    for pid, participant_rows in sensor_df.groupby("pid", sort=True, observed=True):
         label = label_by_pid.get(pid, 0)
-        for arr, win_start in _window_participant(g, window_minutes, bin_minutes,
-                                                  sensor_cols, max_window_missing, z_score,
-                                                  clock_features=clock_features,
-                                                  calendar_index=calendar_index,
-                                                  align_midnight=align_midnight):
-            X_list.append(arr)
-            y_list.append(label)
-            pid_list.append(pid)
-            wid_list.append(f"{pid}_{win_start.isoformat()}")
+        for window, window_start in _window_participant(
+            participant_rows, window_minutes, bin_minutes, sensor_cols, max_window_missing,
+            z_score, clock_features=clock_features, calendar_index=calendar_index,
+            align_midnight=align_midnight,
+        ):
+            all_windows.append(window)
+            all_labels.append(label)
+            all_pids.append(pid)
+            all_window_ids.append(f"{pid}_{window_start.isoformat()}")
+            all_window_energy.append(_mean_energy_in_range(
+                energy_by_pid.get(pid, []),
+                start=pd.Timestamp(window_start),
+                end=pd.Timestamp(window_start) + window_span,
+                include_end=False,
+            ))
 
-    if not X_list:
+    if not all_windows:
         raise RuntimeError("No windows produced; check window/bin/missing settings.")
-    X = np.stack(X_list, axis=0).astype(np.float32)
+
+    X = np.stack(all_windows, axis=0).astype(np.float32)
     if clock_features:
-        # Standardise the appended CoST calendar covariates with the FIXED scale (see
-        # standardise_clock_channels): data-independent, so it neither sees the held-out
-        # participants nor drifts between this path and prepare_hrd_energy_sliding.
         standardise_clock_channels(X, len(sensor_cols))
     n_features = X.shape[-1]
+
+    n_depressed = int(np.sum(np.asarray(all_labels) == 1))
     print(
-        f"[data_preprocessing] built {len(X_list):,} windows of shape "
-        f"(T={X.shape[1]}, C={n_features}) from {len(set(pid_list))} participants | "
-        f"{int(np.sum(np.asarray(y_list) == 1))} depressed-endpoint windows | "
-        f"{time.time() - t0:.1f}s"
+        f"[data_preprocessing] built {len(all_windows):,} windows of shape "
+        f"(T={X.shape[1]}, C={n_features}) from {len(set(all_pids))} participants | "
+        f"{n_depressed} depressed-endpoint windows | {time.time() - started_at:.1f}s"
     )
-    # Case-1 group label per participant (Pre1_Post1 ... Pre2_Post2), for group-stratified
-    # rhythm analysis; NaN for participants without an endpoint survey.
-    trajectory_by_pid = {
-        p: t for p, t in zip(label_df["pid"], label_df["depression_trajectory"])
-        if isinstance(t, str)
-    }
-    # baseline status per pid (endpoint status is already `label_by_pid` == y). Built directly
-    # from depression_status_baseline rather than parsing `depression_trajectory`'s Pre1/Pre2
-    # strings, so the (baseline, endpoint) pair used to pick trajectory-group participants
-    # (e.g. dep->dep, non->non, dep->non, non->dep) doesn't depend on that naming convention.
-    baseline_by_pid = {
-        row["pid"]: int(row["depression_status_baseline"])
-        for _, row in label_df.iterrows() if pd.notna(row["depression_status_baseline"])
-    }
+
     return {
         "X": X,
-        "y": np.asarray(y_list, dtype=int),
-        "pids": np.asarray(pid_list),
-        "window_ids": np.asarray(wid_list),
+        "y": np.asarray(all_labels, dtype=int),
+        "pids": np.asarray(all_pids),
+        "window_ids": np.asarray(all_window_ids),
+        "ee_win": np.asarray(all_window_energy, dtype=float),
         "consistent_pids": consistent_pids,
         "labeled_pids": set(label_by_pid),
-        "trajectory_by_pid": trajectory_by_pid,
-        "baseline_by_pid": baseline_by_pid,
+        "trajectory_by_pid": _trajectory_by_pid(label_df),
+        "baseline_by_pid": _baseline_status_by_pid(label_df),
         "sensor_cols": sensor_cols,
         "n_sensors": len(sensor_cols),
         "n_features": n_features,
@@ -506,161 +871,213 @@ def prepare_hrd_dataset(
 
 
 # =============================================================================
-# 3. cleaned tables -> SLIDING windows (emotional-energy probe, "mode B")
+# 6. CLEANED TABLES -> SLIDING WINDOWS (emotional-energy probe, "mode B")
 # =============================================================================
 
-def _bin_window(g_win, win_start, target_bins, sensor_cols, bin_minutes, max_window_missing):
-    """Bin the already-z-scored rows of ONE window ([win_start, win_start +
-    target_bins*bin_minutes)) into a (target_bins, n_sensors) array, applying the SAME
-    Algorithm-1 gate as _window_participant: a channel with more than max_window_missing
-    missing bins, or an edge gap longer than EDGE_GAP_MINUTES, makes the window unusable
-    -> return None. Interior gaps are linearly interpolated. Kept separate from
-    _window_participant so the non-overlapping (depression) path is untouched."""
-    n_sensors = len(sensor_cols)
-    within = (g_win["timestamp"].to_numpy() - np.datetime64(win_start)) / np.timedelta64(1, "m")
-    b = np.clip((within // bin_minutes).astype(np.int64), 0, target_bins - 1)
-    sub = g_win[sensor_cols].copy()
-    sub["_b"] = b
-    grouped = sub.groupby("_b")
-    mean_df = grouped[sensor_cols].mean()
-    count_df = grouped[sensor_cols].count()
-    sensor_values = np.full((target_bins, n_sensors), np.nan, dtype=np.float32)
-    observed = np.zeros((target_bins, n_sensors), dtype=bool)
-    for bi in mean_df.index:
-        obs = count_df.loc[bi].to_numpy() > 0
-        sensor_values[bi] = np.where(obs, mean_df.loc[bi].to_numpy(dtype=np.float32), np.nan)
-        observed[bi] = obs
-    if (1.0 - observed.mean(axis=0) > max_window_missing).any():   # per-channel missing-bin gate
-        return None
-    if not _edge_gap_ok(observed, bin_minutes):                    # bounded edge gap
-        return None
-    sensor_values = (pd.DataFrame(sensor_values)
-                     .interpolate(method="linear", limit_direction="both")
-                     .to_numpy(dtype=np.float32))
-    return np.nan_to_num(sensor_values, nan=0.0)
+def _bin_window(
+    window_rows: pd.DataFrame,
+    window_start: pd.Timestamp,
+    target_bins: int,
+    sensor_cols: List[str],
+    bin_minutes: int,
+    max_window_missing: float,
+) -> Optional[np.ndarray]:
+    """Bin the already-z-scored rows of ONE explicit window into (target_bins, n_sensors).
+
+    Applies the same Algorithm-1 gate as the non-overlapping path and returns None when the
+    window fails it. Kept separate from `_window_participant` so the depression path is
+    untouched by changes here, but the gate and interpolation are shared.
+    """
+    minutes_into_window = (
+        (window_rows["timestamp"].to_numpy() - np.datetime64(window_start))
+        / np.timedelta64(1, "m")
+    )
+    tagged = window_rows[sensor_cols].copy()
+    tagged[_BIN_COL] = np.clip(
+        (minutes_into_window // bin_minutes).astype(np.int64), 0, target_bins - 1)
+
+    grouped = tagged.groupby(_BIN_COL)
+    return _build_window_array(
+        grouped[sensor_cols].mean(), grouped[sensor_cols].count(),
+        target_bins, len(sensor_cols), bin_minutes, max_window_missing)
 
 
-def _sliding_windows_participant(g, day_ee_pairs, window_minutes, bin_minutes,
-                                 sensor_cols, max_window_missing, z_score,
-                                 clock_features=False, calendar_index=False):
-    """One TRAILING window per labelled day (mode B): for day D the window covers the 7
-    calendar days [D-6, D] (nowcast) and is labelled EE(D). Windows overlap by 6 days --
-    fine because the train/val/test split is participant-level, so overlapping windows of
-    one person never straddle the split boundary. When ``clock_features`` is True the CoST
-    calendar covariates are appended as [sensor | clock], EXACTLY as _window_participant does,
-    so the tensor matches an encoder pretrained with --with-clock-features. Returns
-    [(arr, day, ee), ...]."""
-    out = []
+def _sliding_windows_participant(
+    g: pd.DataFrame,
+    day_energy_pairs: Sequence[Tuple[Any, float]],
+    window_minutes: int,
+    bin_minutes: int,
+    sensor_cols: List[str],
+    max_window_missing: float,
+    z_score: bool,
+    clock_features: bool = False,
+    calendar_index: bool = False,
+) -> List[Tuple[np.ndarray, Any, float]]:
+    """One TRAILING window per labelled day: day D gets the 7 days [D-6, D], labelled EE(D).
+
+    Consecutive windows overlap by six days. That is fine because the train/val/test split is
+    participant-level, so overlapping windows of one person never straddle the boundary --
+    it is a statistical-independence caveat, not leakage.
+
+    Returns [(window, day, energy), ...].
+    """
+    results: List[Tuple[np.ndarray, Any, float]] = []
     target_bins = window_minutes // bin_minutes
-    if z_score:                                       # per-participant, leakage-free (as elsewhere)
-        g = g.copy()
-        mu = g[sensor_cols].mean()
-        sd = g[sensor_cols].std().replace(0.0, 1.0).fillna(1.0)
-        g[sensor_cols] = (g[sensor_cols] - mu) / sd
+
+    if z_score:
+        g = zscore_within_participant(g, sensor_cols)
     if len(g) < 2:
-        return out
-    tvals = g["timestamp"].to_numpy()                 # sensor_df is sorted by (pid, timestamp)
-    span = pd.Timedelta(minutes=window_minutes)
+        return results
+
+    timestamps = g["timestamp"].to_numpy()          # sensor_df is sorted by (pid, timestamp)
+    window_span = pd.Timedelta(minutes=window_minutes)
     one_day = pd.Timedelta(days=1)
-    for day, ee_val in day_ee_pairs:
-        win_start = pd.Timestamp(day) - (span - one_day)   # (D-6) 00:00 for a 7-day window
-        win_end = pd.Timestamp(day) + one_day              # (D+1) 00:00
-        lo = int(np.searchsorted(tvals, np.datetime64(win_start)))
-        hi = int(np.searchsorted(tvals, np.datetime64(win_end)))
-        if hi - lo <= 10:                                  # too few raw samples (matches the >10 gate)
+
+    for day, energy in day_energy_pairs:
+        window_start = pd.Timestamp(day) - (window_span - one_day)   # (D-6) 00:00
+        window_end = pd.Timestamp(day) + one_day                     # (D+1) 00:00
+        lo = int(np.searchsorted(timestamps, np.datetime64(window_start)))
+        hi = int(np.searchsorted(timestamps, np.datetime64(window_end)))
+        if hi - lo <= CLEANING.min_raw_samples_per_window:
             continue
-        arr = _bin_window(g.iloc[lo:hi], win_start, target_bins, sensor_cols,
-                          bin_minutes, max_window_missing)
-        if arr is not None:
-            if clock_features:                             # append [sensor | clock] like _window_participant
-                time_feat = _cost_time_features(win_start, target_bins, bin_minutes)
-                arr = np.concatenate([arr, time_feat], axis=1)
-            elif calendar_index:
-                arr = np.concatenate(
-                    [arr, _calendar_index_features(win_start, target_bins, bin_minutes)], axis=1)
-            out.append((arr.astype(np.float32), day, float(ee_val)))
-    return out
+
+        sensor_values = _bin_window(g.iloc[lo:hi], window_start, target_bins, sensor_cols,
+                                    bin_minutes, max_window_missing)
+        if sensor_values is None:
+            continue
+
+        window = _append_time_channels(
+            sensor_values, window_start, bin_minutes, clock_features, calendar_index)
+        results.append((window.astype(np.float32), day, float(energy)))
+
+    return results
+
+
+def _sorted_energy_days_by_pid(
+    energy_by_pid_date: DailyEnergyLookup,
+) -> Dict[str, List[Tuple[date, float]]]:
+    """pid -> [(date, energy), ...] sorted by date, for the trailing-window loop."""
+    days_by_pid: Dict[str, List[Tuple[date, float]]] = {}
+    for (pid, day), value in energy_by_pid_date.items():
+        days_by_pid.setdefault(pid, []).append((day, value))
+    for pid in days_by_pid:
+        days_by_pid[pid].sort()
+    return days_by_pid
 
 
 def prepare_hrd_energy_sliding(
-    csv_path, window_hours=168, bin_minutes=15, max_missing=0.30,
-    max_gap_minutes=30, max_window_missing=0.30, z_score=True, build_pretrain=True,
-    clock_features=False, calendar_index=False, energy_stride=1,
-):
+    csv_path: PathLike,
+    window_hours: int = WINDOWING.window_hours,
+    bin_minutes: int = WINDOWING.bin_minutes,
+    max_missing: float = CLEANING.max_participant_missing,
+    max_gap_minutes: int = CLEANING.max_gap_minutes,
+    max_window_missing: float = CLEANING.max_window_missing,
+    z_score: bool = WINDOWING.z_score,
+    build_pretrain: bool = True,
+    clock_features: bool = False,
+    calendar_index: bool = False,
+    energy_stride: int = 1,
+) -> Dict[str, object]:
     """Mode-B dataset for the emotional-energy probe, from a SINGLE CSV read.
 
     Returns two windowings of the same cleaned data:
-      * PROBE  (sliding): one trailing 7-day window per labelled participant-day, labelled
-                with that day's emotional_energy. Keys ``X`` / ``ee`` / ``pids`` / ``days``.
+      * PROBE (sliding): one trailing 7-day window per labelled participant-day, labelled
+        with that day's emotional energy. Keys `X` / `ee` / `pids` / `days`.
       * PRETRAIN (non-overlapping): the standard midnight-aligned windows over ALL
-                participants (label-free SSL). Keys ``X_pretrain`` / ``pids_pretrain``.
-                Skipped (both keys ``None``) when ``build_pretrain=False`` -- used when the
-                caller REUSES an already-pretrained encoder (train_hrd.py --energy-probe)
-                and only needs the probe windows.
+        participants, label-free. Keys `X_pretrain` / `pids_pretrain`, both None when
+        `build_pretrain=False` -- which is the case when the caller reuses an already
+        pretrained encoder (train_hrd.py --energy-probe) and only needs probe windows.
 
-    The caller pretrains on ``X_pretrain`` minus the test participants, then encodes ``X``
-    and probes it -- so test participants stay out of pretraining exactly as in the
-    non-sliding path. The only new property is that probe windows overlap WITHIN a
-    participant (a statistical-independence caveat, not leakage).
+    The caller pretrains on `X_pretrain` minus the test participants, then encodes and probes
+    `X`, so test participants stay out of pretraining exactly as in the non-sliding path.
 
-    ``energy_stride`` keeps every k-th labelled day per participant. Consecutive windows
-    share six of their seven days, so the INPUTS are highly redundant; the LABELS are not
-    (each day's EE is a distinct target), which is why the useful range is small strides.
-    Applied here rather than after the fact so the discarded windows are never built at
-    all -- both the ~0.5 GiB array and the windowing time scale with 1/k."""
-    sensor_df, label_df, ee_by_pid_date = load_hrd(csv_path, max_missing=max_missing,
-                                                   max_gap_minutes=max_gap_minutes)
-    sensor_cols = [c for c in SENSOR_COLS if c in sensor_df.columns]
-    if not sensor_cols:
-        raise ValueError("None of the expected sensor columns are present in the CSV.")
+    `energy_stride` keeps every k-th labelled day per participant. Consecutive windows share
+    six of their seven days so the INPUTS are highly redundant, but the LABELS are not (each
+    day's energy is a distinct target), which is why only small strides are useful. Applied
+    here rather than after the fact, so discarded windows are never built at all -- both the
+    ~0.5 GiB array and the windowing time scale with 1/k.
+    """
+    sensor_df, label_df, energy_by_pid_date = load_hrd(
+        csv_path, max_missing=max_missing, max_gap_minutes=max_gap_minutes)
+
+    sensor_cols = _resolve_sensor_cols(sensor_df)
     window_minutes = window_hours * 60
+    days_by_pid = _sorted_energy_days_by_pid(energy_by_pid_date)
 
-    # per-participant (date, emotional_energy) pairs, sorted by date
-    days_by_pid: Dict[str, List] = {}
-    for (p, d), v in ee_by_pid_date.items():
-        days_by_pid.setdefault(p, []).append((d, v))
-    for p in days_by_pid:
-        days_by_pid[p].sort()
+    started_at = time.time()
+    probe_windows: List[np.ndarray] = []
+    probe_pids: List[str] = []
+    probe_days: List[Any] = []
+    probe_energy: List[float] = []
+    pretrain_windows: List[np.ndarray] = []
+    pretrain_pids: List[str] = []
 
-    t0 = time.time()
-    Xs, ps, ds, es = [], [], [], []                   # probe (sliding, one per labelled day)
-    Xp, pp = [], []                                   # pretrain (non-overlapping, all pids)
-    for pid, g in sensor_df.groupby("pid", sort=True, observed=True):
+    for pid, participant_rows in sensor_df.groupby("pid", sort=True, observed=True):
         if build_pretrain:
-            for arr, win_start in _window_participant(g, window_minutes, bin_minutes,
-                                                      sensor_cols, max_window_missing, z_score,
-                                                      clock_features=clock_features,
-                                                      calendar_index=calendar_index,
-                                                      align_midnight=True):
-                Xp.append(arr); pp.append(pid)
-        for arr, day, ee_val in _sliding_windows_participant(
-                g, days_by_pid.get(pid, [])[::energy_stride], window_minutes, bin_minutes,
-                sensor_cols, max_window_missing, z_score, clock_features=clock_features,
-                calendar_index=calendar_index):
-            Xs.append(arr); ps.append(pid); ds.append(day); es.append(ee_val)
+            for window, _window_start in _window_participant(
+                participant_rows, window_minutes, bin_minutes, sensor_cols,
+                max_window_missing, z_score, clock_features=clock_features,
+                calendar_index=calendar_index, align_midnight=True,
+            ):
+                pretrain_windows.append(window)
+                pretrain_pids.append(pid)
 
-    if not Xs:
+        for window, day, energy in _sliding_windows_participant(
+            participant_rows, days_by_pid.get(pid, [])[::energy_stride], window_minutes,
+            bin_minutes, sensor_cols, max_window_missing, z_score,
+            clock_features=clock_features, calendar_index=calendar_index,
+        ):
+            probe_windows.append(window)
+            probe_pids.append(pid)
+            probe_days.append(day)
+            probe_energy.append(energy)
+
+    if not probe_windows:
         raise RuntimeError("No sliding windows produced; check window/bin/missing settings.")
-    X = np.stack(Xs).astype(np.float32)
-    X_pre = np.stack(Xp).astype(np.float32) if build_pretrain else None
+
+    X = np.stack(probe_windows).astype(np.float32)
+    X_pretrain = np.stack(pretrain_windows).astype(np.float32) if build_pretrain else None
     if clock_features:
-        # Same FIXED scale as prepare_hrd_dataset -- now genuinely identical, not merely the
-        # same formula over a different reference set. That is what makes these probe windows
-        # safe to feed to an encoder pretrained through the other path.
-        ns = len(sensor_cols)
-        standardise_clock_channels(X, ns)
-        standardise_clock_channels(X_pre, ns)
+        # Same FIXED scale as prepare_hrd_dataset -- genuinely identical, not merely the same
+        # formula over a different reference set. That is what makes these probe windows safe
+        # to feed to an encoder pretrained through the other path.
+        standardise_clock_channels(X, len(sensor_cols))
+        standardise_clock_channels(X_pretrain, len(sensor_cols))
+
     print(
-        f"[data_preprocessing] mode-B sliding: {len(Xs):,} trailing probe windows "
-        f"(1 per labelled day) from {len(set(ps))} participants | "
-        f"{len(Xp):,} non-overlapping pretrain windows | shape (T={X.shape[1]}, "
-        f"C={X.shape[-1]}) | {time.time() - t0:.1f}s"
+        f"[data_preprocessing] mode-B sliding: {len(probe_windows):,} trailing probe windows "
+        f"(1 per labelled day) from {len(set(probe_pids))} participants | "
+        f"{len(pretrain_windows):,} non-overlapping pretrain windows | "
+        f"shape (T={X.shape[1]}, C={X.shape[-1]}) | {time.time() - started_at:.1f}s"
     )
+
+    # Window-matched label: the mean energy over the labelled days the window actually spans.
+    # `ee` above is EE(D) alone, so a 7-day input would be scored against a 1-day target.
+    # Measured on HRD, that mismatch costs the task most of its signal: same-day daily
+    # aggregates predict EE(D) at AUROC 0.56, the 7-day trailing mean of the SAME features at
+    # 0.51, and the 7-day mean against a 7-day label back at 0.54. Computed from the FULL day
+    # list, before `energy_stride` thins it, so the mean covers every labelled day in the
+    # window regardless of stride.
+    span_days = window_minutes // (60 * 24)
+    window_energy: List[float] = []
+    for pid, day in zip(probe_pids, probe_days):
+        window_end = pd.Timestamp(day)
+        window_energy.append(_mean_energy_in_range(
+            days_by_pid.get(pid, []),
+            start=window_end - pd.Timedelta(days=span_days - 1),
+            end=window_end,
+            include_end=True,
+        ))
+
     return {
-        "X": X, "ee": np.asarray(es, dtype=float), "pids": np.asarray(ps),
-        "days": np.asarray(ds, dtype=object),
-        "X_pretrain": X_pre,
-        "pids_pretrain": np.asarray(pp) if build_pretrain else None,
-        "sensor_cols": sensor_cols, "n_sensors": len(sensor_cols),
+        "X": X,
+        "ee": np.asarray(probe_energy, dtype=float),
+        "pids": np.asarray(probe_pids),
+        "ee_win": np.asarray(window_energy, dtype=float),
+        "days": np.asarray(probe_days, dtype=object),
+        "X_pretrain": X_pretrain,
+        "pids_pretrain": np.asarray(pretrain_pids) if build_pretrain else None,
+        "sensor_cols": sensor_cols,
+        "n_sensors": len(sensor_cols),
         "n_features": X.shape[-1],
     }

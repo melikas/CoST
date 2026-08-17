@@ -55,11 +55,13 @@ class FactorizedCalendarPE(nn.Module):
         self.p_dow = nn.Embedding(7, dim)
 
     def forward(self, idx):                    # idx: B x T x 2 = [tod, dow] -> B x T x dim
-        # round-then-clamp, not a bare .long(): an out-of-range index is a CUDA device-side
-        # assert that kills the job with no usable traceback, so never let one reach the table.
+        # Modulo, per the paper ("we map w_t to factorized indices via modulo functions").
+        # Both fields are CYCLIC, so wrapping is the correct operation -- clamping would map
+        # one past the last bin onto 23:45 instead of midnight. It is also total, so no
+        # out-of-range index can reach the table (the same argument CircularCalendarPE makes).
         i = idx.round().long()
-        return (self.p_tod(i[..., 0].clamp(0, self.p_tod.num_embeddings - 1))
-                + self.p_dow(i[..., 1].clamp(0, self.p_dow.num_embeddings - 1)))
+        return (self.p_tod(i[..., 0] % self.p_tod.num_embeddings)
+                + self.p_dow(i[..., 1] % self.p_dow.num_embeddings))
 
     def tables(self):
         """``(P_tod, P_dow)`` -- the two additive calendar codes (WavesFM Fig. 13 geometry)."""
@@ -156,6 +158,20 @@ class Time2VecPE(nn.Module):
     concatenates the ``T x d_model`` output to the channels before ``input_fc``
     (``x'_j = [x_j ; t2v(tau)]``); it is NOT added as a positional encoding.
 
+    ON k. ``d_model = k + 1``; the default is 65, i.e. k=64, the paper's best (App. B: 64
+    beats 32 and 16 in most cases). It was 16 (k=15), BELOW the smallest configuration the
+    paper ever tested, and tcn:time2vec then failed to converge in run 19649817 -- pretrain
+    loss fell only 48%, to 3.50, where every other variant reached ~0.10. Sec. 6 of the paper
+    reports optimisation trouble only "when using only a few sine functions" and credits
+    "using many sine functions which reduces the distance to the goal". The mechanism is
+    visible in the initialisation below: over a 672-bin window the k=15 grid puts its nearest
+    frequency 10.9% away from the circadian 2*pi/bins_per_day, so NO sine starts near 24 h and
+    one has to be dragged there by gradient descent; at k=64 the nearest is 0.6% away. Cost is
+    1,666 parameters (+0.2%). The old worry that a wide t2v block swamps four sensor channels
+    is handled by the initialisation, not by k: sines are bounded in [-1, 1] and the linear
+    term is scaled to span [-0.5, 0.5], so every t2v feature already matches the z-scored
+    sensor channels in magnitude at any k.
+
     Also per the paper, Time2Vec REPLACES the notion of time -- it is the sole time
     representation and is never combined with another time encoding. So a pe=time2vec run
     is kept sensor-only (no --with-clock-features); mixing the two would confound the
@@ -215,6 +231,56 @@ class Time2VecPE(nn.Module):
 # ---------------------------------------------------------------------------
 # Self-attention with swappable positional encoding
 # ---------------------------------------------------------------------------
+class TUPEPosition(nn.Module):
+    """TUPE-A positional correlation (Ke et al. 2021, Eq. 10).
+
+    ``(1/sqrt(2d)) (p_i U^Q)(p_j U^K)^T`` with a LEARNABLE ``p`` that is LayerNorm'd
+    before use. The paper shares this term across all layers, so it is computed once
+    and passed to every attention block.
+    """
+
+    def __init__(self, d_model, n_heads, max_len):
+        super().__init__()
+        self.h = n_heads
+        self.dh = d_model // n_heads
+        self.pos = nn.Embedding(max_len, d_model)
+        self.norm = nn.LayerNorm(d_model)
+        self.pq = nn.Linear(d_model, d_model, bias=False)
+        self.pk = nn.Linear(d_model, d_model, bias=False)
+
+    def forward(self, T, device):
+        p = self.norm(self.pos(torch.arange(T, device=device)))
+        pq = self.pq(p).view(T, self.h, self.dh).transpose(0, 1)
+        pk = self.pk(p).view(T, self.h, self.dh).transpose(0, 1)
+        return torch.matmul(pq, pk.transpose(-2, -1)) / math.sqrt(2 * self.dh)
+
+
+class ConvSPE(nn.Module):
+    """convSPE (Liutkus et al. 2021, Sec. 3.2 and Eq. 10-11).
+
+    ``Qbar_d = Z_d * Phi_d^Q``, ``Kbar_d = Z_d * Phi_d^K`` from shared Gaussian noise
+    ``Z``, then gated per dimension by ``delta_d``. The codes MULTIPLY the content
+    queries/keys; they are never added to the attention scores.
+    """
+
+    def __init__(self, n_heads, dh, kernel=15, realizations=16):
+        super().__init__()
+        self.h, self.dh, self.R = n_heads, dh, realizations
+        c = n_heads * dh
+        self.conv_q = nn.Conv1d(c, c, kernel, padding=kernel // 2, groups=c, bias=False)
+        self.conv_k = nn.Conv1d(c, c, kernel, padding=kernel // 2, groups=c, bias=False)
+        self.gate = nn.Parameter(torch.zeros(n_heads, dh))
+
+    def forward(self, T, device, dtype):
+        z = torch.randn(self.R, self.h * self.dh, T, device=device, dtype=dtype)
+        qbar = self.conv_q(z).view(self.R, self.h, self.dh, T)
+        kbar = self.conv_k(z).view(self.R, self.h, self.dh, T)
+        delta = torch.sigmoid(self.gate)[None, :, :, None]
+        eps = torch.randn(self.R, self.h, 1, T, device=device, dtype=dtype)
+        a, b = (1 - delta).sqrt(), delta.sqrt()
+        return a * qbar + b * eps, a * kbar + b * eps
+
+
 class PESelfAttention(nn.Module):
     """Multi-head self-attention with a swappable positional-encoding mechanism.
 
@@ -224,7 +290,7 @@ class PESelfAttention(nn.Module):
     """
 
     def __init__(self, method, d_model, n_heads, max_len,
-                 dropout=0.1, conv_kernel=15, spe_realizations=16):
+                 dropout=0.1, conv_kernel=15, spe_realizations=16, rpe_clip_k=16):
         super().__init__()
         assert d_model % n_heads == 0, "d_model must be divisible by n_heads"
         self.method = method
@@ -239,23 +305,17 @@ class PESelfAttention(nn.Module):
         self.proj = nn.Linear(d_model, d_model)
         self.drop = nn.Dropout(dropout)
         if method == "rpe":
-            self.rel_k = nn.Parameter(torch.empty(2 * max_len - 1, self.dh))
+            # Shaw et al. 2018 Sec. 3.2: clip(x, k) = max(-k, min(k, x)), k = 16.
+            # Both a^K (Eq. 4) and a^V (Eq. 3), shared across heads, unique per layer.
+            self.clip_k = rpe_clip_k
+            self.rel_k = nn.Parameter(torch.empty(2 * rpe_clip_k + 1, self.dh))
+            self.rel_v = nn.Parameter(torch.empty(2 * rpe_clip_k + 1, self.dh))
             nn.init.normal_(self.rel_k, std=0.02)
+            nn.init.normal_(self.rel_v, std=0.02)
         elif method == "erpe":
             self.rel_bias = nn.Parameter(torch.zeros(self.h, 2 * max_len - 1))
-        elif method == "tupe":
-            self.register_buffer(
-                "tupe_pos",
-                sinusoidal_pe(max_len, d_model, torch.device("cpu"), torch.float32),
-                persistent=False,
-            )
-            self.pq = nn.Linear(d_model, d_model, bias=False)
-            self.pk = nn.Linear(d_model, d_model, bias=False)
         elif method == "convspe":
-            self.R = spe_realizations
-            pad = conv_kernel // 2
-            self.spe_q = nn.Conv1d(self.h, self.h, conv_kernel, padding=pad, groups=self.h, bias=False)
-            self.spe_k = nn.Conv1d(self.h, self.h, conv_kernel, padding=pad, groups=self.h, bias=False)
+            self.spe = ConvSPE(n_heads, self.dh, conv_kernel, spe_realizations)
         elif method == "tpe":
             # T-PE semantic component, S(i,j) = exp(-||x_i - x_j||^2 / 2 sigma^2)
             # (Zhang et al. 2024; Irani & Metsis 2025, Sec. 3.9). sigma_0 = sqrt(d_model),
@@ -265,78 +325,30 @@ class PESelfAttention(nn.Module):
             # dS/dsigma = S*dist^2/sigma^3, so the semantic term could never train its way
             # out. sigma_0 = sqrt(d_model) puts 2 sigma^2 = 2 d_model, i.e. S ~ exp(-1).
             self.log_sigma = nn.Parameter(torch.full((1,), 0.5 * math.log(d_model)))
-        # Cache for the deterministic eval-time ConvSPE position term (see _convspe_pos).
-        # Deliberately a plain attribute, not a buffer: it is DERIVED from spe_q/spe_k, so it
-        # must never enter a state_dict nor outlive a weight change. Invalidated on train()
-        # and after load_state_dict.
-        self._spe_eval_pos = None
-        if hasattr(self, "register_load_state_dict_post_hook"):
-            self.register_load_state_dict_post_hook(
-                lambda module, incompatible_keys: setattr(module, "_spe_eval_pos", None))
-
-    def train(self, mode=True):
-        # Entering train mode means the weights are about to move, so the cached eval kernel
-        # goes stale. Only cleared for mode=True: eval() -> eval() must reuse the cache, and
-        # every train->eval transition is preceded by a train(True) that already cleared it.
-        if mode:
-            self._spe_eval_pos = None
-        return super().train(mode)
-
-    def _convspe_pos(self, T, device, dtype):
-        """ConvSPE position term (Liutkus et al. 2021, "Relative Positional Encoding for
-        Transformers with Linear Complexity").
-
-        TRAINING keeps the paper's Monte-Carlo estimator: R fresh noise realizations filtered
-        by the two depthwise convs and cross-correlated. Resampling every step IS the method
-        (SPE is a stochastic PE) and is left untouched.
-
-        EVAL uses the EXACT expectation of that same estimator, so evaluation is deterministic
-        -- repeated encode() calls agree bit for bit. Writing the convs as linear maps
-        ``qpe_r = Cq z_r``, ``kpe_r = Ck z_r`` with ``z ~ N(0, I)``:
-
-            E[ (1/R) sum_r qpe_r(t) kpe_r(s) ] = (Cq Ck^T)[t, s]
-
-        i.e. the ``R -> inf`` limit of the training estimator. That makes eval both
-        deterministic AND unbiased, unlike freezing one sampled realization, which would bake
-        that draw's Monte-Carlo error in permanently -- at the default R=16 that error is
-        ~0.35x the size of the position term itself. Feeding the identity through the same
-        convs recovers Cq/Ck exactly, including at the zero-padded edges where the kernel is
-        NOT Toeplitz (in the interior it reduces to the filters' cross-correlation, which is
-        what position_matrix() reports).
-
-        Depends only on the conv weights and T -- never on the input -- so it is cached.
-        """
-        if self.training:
-            z = torch.randn(self.R, self.h, T, device=device, dtype=dtype)
-            return torch.einsum("rht,rhs->hts", self.spe_q(z), self.spe_k(z)) / self.R
-
-        cached = self._spe_eval_pos
-        if (cached is not None and cached.shape[-1] == T
-                and cached.device == device and cached.dtype == dtype):
-            return cached
-        # realization n is the unit impulse at position n, so the conv output IS column n of
-        # the linear map -- (T realizations, h, T) in, Cq/Ck out.
-        eye = torch.eye(T, device=device, dtype=dtype)[:, None, :].expand(T, self.h, T).contiguous()
-        pos = torch.einsum("nht,nhs->hts", self.spe_q(eye), self.spe_k(eye))
-        if not torch.is_grad_enabled():   # never cache a tensor that carries an autograd graph
-            self._spe_eval_pos = pos
-        return pos
 
     def _rel_index(self, T, device):
+        """eRPE index into the 2L-1 table (Foumani et al. 2024: no clipping)."""
         idx = torch.arange(T, device=device)
         rel = idx[:, None] - idx[None, :] + (self.max_len - 1)
         return rel.clamp_(0, 2 * self.max_len - 2)
 
-    def forward(self, x):
+    def _clip_index(self, T, device):
+        """Shaw et al. 2018: clip(j - i, k) + k."""
+        idx = torch.arange(T, device=device)
+        return (idx[None, :] - idx[:, None]).clamp(-self.clip_k, self.clip_k) + self.clip_k
+
+    def forward(self, x, pos_bias=None):
         B, T, _ = x.shape
         q = self.q(x).view(B, T, self.h, self.dh).transpose(1, 2)
         k = self.k(x).view(B, T, self.h, self.dh).transpose(1, 2)
         v = self.v(x).view(B, T, self.h, self.dh).transpose(1, 2)
         if self.method == "rpe":
-            rel = self.rel_k[self._rel_index(T, x.device)]
-            rel_scores = torch.einsum("bhid,ijd->bhij", q, rel)
-            scores = (torch.matmul(q, k.transpose(-2, -1)) + rel_scores) * self.scale
-            out = torch.matmul(self.drop(scores.softmax(-1)), v)
+            rel = self._clip_index(T, x.device)
+            scores = (torch.matmul(q, k.transpose(-2, -1))
+                      + torch.einsum("bhid,ijd->bhij", q, self.rel_k[rel])) * self.scale
+            attn = self.drop(scores.softmax(-1))
+            out = (torch.matmul(attn, v)
+                   + torch.einsum("bhij,ijd->bhid", attn, self.rel_v[rel]))
         elif self.method == "erpe":
             # Bias added AFTER the softmax -- intentional, and the defining feature of eRPE
             # (Foumani et al. 2024, eq. 14: alpha_i = sum_j (A_ij + w_{i-j}) x_j). It matches
@@ -362,18 +374,16 @@ class PESelfAttention(nn.Module):
             attn = attn + bias.unsqueeze(0)
             out = torch.matmul(attn, v)
         elif self.method == "tupe":
-            content = torch.matmul(q, k.transpose(-2, -1))
-            pos = self.tupe_pos[:T].to(device=x.device, dtype=x.dtype)
-            pq = self.pq(pos).view(T, self.h, self.dh).permute(1, 0, 2)
-            pk = self.pk(pos).view(T, self.h, self.dh).permute(1, 0, 2)
-            pos_scores = torch.matmul(pq, pk.transpose(-2, -1)).unsqueeze(0)
-            scores = (content + pos_scores) / math.sqrt(2 * self.dh)
+            scores = (torch.matmul(q, k.transpose(-2, -1)) / math.sqrt(2 * self.dh)
+                      + pos_bias.unsqueeze(0))
             out = torch.matmul(self.drop(scores.softmax(-1)), v)
         elif self.method == "convspe":
-            content = torch.matmul(q, k.transpose(-2, -1)) * self.scale
-            # MC estimate while training, its exact expectation at eval -- see _convspe_pos.
-            pos = self._convspe_pos(T, x.device, x.dtype)
-            out = torch.matmul(self.drop((content + pos.unsqueeze(0)).softmax(-1)), v)
+            qbar, kbar = self.spe(T, x.device, x.dtype)
+            s = (self.dh * self.spe.R) ** 0.25
+            qh = torch.einsum("bhtd,rhdt->bhtr", q, qbar) / s
+            kh = torch.einsum("bhtd,rhdt->bhtr", k, kbar) / s
+            scores = torch.matmul(qh, kh.transpose(-2, -1)) / math.sqrt(self.spe.R)
+            out = torch.matmul(self.drop(scores.softmax(-1)), v)
         elif self.method == "tpe":
             scores = torch.matmul(q, k.transpose(-2, -1)) * self.scale
             sigma = self.log_sigma.exp().clamp_min(1e-4)
@@ -404,7 +414,7 @@ class PETransformerEncoderLayer(nn.Module):
             nn.Dropout(dropout),
         )
 
-    def forward(self, x):
+    def forward(self, x, pos_bias=None):
         if self.method == "tpe":
             # T-PE geometric component. The sinusoidal code is re-injected at EVERY block --
             # "applies enhanced sinusoidal positional encoding across multiple layers of the
@@ -415,7 +425,7 @@ class PETransformerEncoderLayer(nn.Module):
             # distinguish the two. Injected here rather than upstream so it is added exactly
             # once per block, including the first.
             x = x + sinusoidal_pe(x.size(1), x.size(-1), x.device, x.dtype).unsqueeze(0)
-        x = x + self.attn(self.norm1(x))
+        x = x + self.attn(self.norm1(x), pos_bias)
         x = x + self.ff(self.norm2(x))
         return x
 
@@ -442,10 +452,9 @@ def position_matrix(net, T):
 
     Returns None when the variant carries no position code (e.g. the TCN with pe='none').
 
-    NOTE the attention tables are allocated at ``max_len`` (2048) while a window is 672
-    bins, so only the rows actually reached during training are read; ConvSPE is exactly
-    zero beyond its kernel half-width, which is a real property of that encoding and not
-    a truncation artefact.
+    NOTE ``rpe`` is clipped at ``clip_k`` (Shaw et al. 2018), so its profile is flat
+    beyond that offset by construction; ConvSPE is exactly zero beyond its kernel
+    half-width. Both are real properties of those encodings, not truncation artefacts.
     """
     pe = getattr(net, "pe", "none")
     cpu, f32 = torch.device("cpu"), torch.float32
@@ -470,19 +479,18 @@ def position_matrix(net, T):
     delta = np.arange(T)[:, None] - np.arange(T)[None, :]
 
     if pe == "tupe":
-        p = attn.tupe_pos[:T].to(attn.pq.weight.device, attn.pq.weight.dtype)
-        q = attn.pq(p).view(T, attn.h, attn.dh)
-        k = attn.pk(p).view(T, attn.h, attn.dh)
-        return (torch.einsum("ihd,jhd->ij", q, k).float().cpu().numpy()
-                / (attn.h * math.sqrt(attn.dh)))
+        tp = getattr(fe, "tupe", None)
+        if tp is None:
+            return None
+        return tp(T, tp.pos.weight.device).mean(0).float().cpu().numpy()
     if pe == "rpe":                       # how the offset-delta code compares to offset 0
         r = F.normalize(attn.rel_k.detach().cpu().float(), dim=-1)
-        g, centre = (r @ r[attn.max_len - 1]).numpy(), attn.max_len - 1
+        g, centre = (r @ r[attn.clip_k]).numpy(), attn.clip_k
     elif pe == "erpe":                    # the learned post-softmax bias itself
         g, centre = attn.rel_bias.detach().cpu().float().mean(0).numpy(), attn.max_len - 1
     elif pe == "convspe":                 # induced kernel = cross-correlation of the filters
-        wq = attn.spe_q.weight.detach().cpu().float().squeeze(1).numpy()
-        wk = attn.spe_k.weight.detach().cpu().float().squeeze(1).numpy()
+        wq = attn.spe.conv_q.weight.detach().cpu().float().squeeze(1).numpy()
+        wk = attn.spe.conv_k.weight.detach().cpu().float().squeeze(1).numpy()
         g = np.mean([np.correlate(b, a, "full") for a, b in zip(wq, wk)], axis=0)
         centre = wq.shape[1] - 1
     else:

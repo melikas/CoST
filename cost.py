@@ -349,7 +349,7 @@ class CoST:
                  depth: int = 10,
                  backbone: str = 'tcn',
                  pe: str = 'sinusoidal',
-                 time2vec_dim: int = 16,
+                 time2vec_dim: int = 65,
                  loss_balance: str = "fixed",
                  bins_per_day: int = 96,
                  disentangle: bool = True,
@@ -407,13 +407,23 @@ class CoST:
         # plain single representation (--no-disentangle) -> the full output_dims.
         moco_dim = self.net.component_dims if disentangle else self.net.output_dims
 
+        # Queue length. Upstream CoST uses K=4096, sized for its forecasting corpora (single
+        # long series cropped into tens of thousands of overlapping subsequences). This cohort
+        # pretrains on ~3,000 NON-overlapping 7-day windows, so K=4096 > N: the queue then holds
+        # several stale copies of nearly every window, including the query's own, and those
+        # enter the denominator as negatives. MoCo assumes K << N precisely to avoid that
+        # false-negative rate. K=1024 stays well under N and divides the batch size (16 x 64;
+        # both loaders use drop_last=True, so every batch is exactly batch_size and the
+        # `K % batch_size == 0` assert in _dequeue_and_enqueue holds).
+        # Revisit if the pretraining set grows: with a denser pretrain stride, N rises ~7x and
+        # 4096 becomes the better setting again.
         self.cost = CoSTModel(
             self.net,
             copy.deepcopy(self.net),
             kernels=kernels,
             dim=moco_dim,
             alpha=alpha,
-            K=4096,
+            K=1024,
             disentangle=disentangle,
             phase_mode=phase_mode,
             device=self.device,
@@ -497,7 +507,7 @@ class CoST:
         # val-loss oscillation, so the final checkpoint is a lottery). AdamW with a
         # linear-warmup + cosine schedule tames it. The TCN is well-behaved under SGD,
         # so it keeps the original optimizer (and the original results stay comparable).
-        is_transformer = getattr(self.net, "backbone", None) in ("transformer", "vit")
+        is_transformer = getattr(self.net, "backbone", None) == "transformer"
         gradnorm = self.loss_balance == "gradnorm"
         # GradNorm's task weights (cost.loss_w) are trained by a SEPARATE optimizer, never by
         # the main one -- exclude them here.

@@ -141,7 +141,7 @@ def _ridge_fit(Ftr, Ytr):
     return predict
 
 
-def _probe_r2(feat, target, fit_mask, sel_mask, test_mask, alphas):
+def _probe_r2(feat, target, fit_mask, sel_mask, test_mask, alphas, groups=None):
     """Per-channel held-out R2 of a ridge probe feat -> target, with the penalty chosen on a
     held-out selection (validation) set -- never on train and never on test.
 
@@ -169,8 +169,35 @@ def _probe_r2(feat, target, fit_mask, sel_mask, test_mask, alphas):
     pred = predict(alphas[k], Fte)
     ss_res = ((Yte - pred) ** 2).sum(axis=0)
     ss_tot = ((Yte - Yte.mean(axis=0)) ** 2).sum(axis=0)
+    # NOT clipped to [0, 1]. A held-out R2 below 0 means the probe is worse than predicting the
+    # target mean, which is a real and reportable outcome, and clipping it away is not neutral
+    # here: DIS is a DIFFERENCE of these numbers,
+    #     DIS = 0.5 * ((rec_T - leak_T) + (rec_S - leak_S)),
+    # so flooring a genuinely negative leak at 0 inflates DIS by half that leak, always in the
+    # same direction. DIS is reported as evidence that the trend/seasonal split holds, so it
+    # must not rest on a floor that can only help it. rhythm.py's E1.3 probe already reports
+    # negative R2 unclipped for the same reason; this makes the two conventions agree.
     r2 = np.where(ss_tot > 0, 1.0 - ss_res / np.where(ss_tot > 0, ss_tot, 1.0), 0.0)
-    return np.clip(r2, 0.0, 1.0), float(alphas[k])           # (C,), lambda*
+    if groups is None:
+        return r2, float(alphas[k])                          # (C,), lambda*
+
+    # Per-participant sufficient statistics, so a PARTICIPANT bootstrap of this R2 is an exact
+    # reweighting instead of a refit. For any resampled set D of participants,
+    #   SSres(D) = sum_p ssres[p]
+    #   SStot(D) = sum_p syy[p] - (sum_p sy[p])^2 / sum_p n[p]
+    # which reproduces 1 - SSres/SStot exactly, including the recomputed target mean. Without
+    # these the headline R2 is a single number over all test rows and cannot be resampled at
+    # all -- which is why RQ1's PE contrast had no participant-level interval to report.
+    # Rows are window-major (see `flat`), so each window's T' timesteps carry its pid.
+    g = np.repeat(np.asarray(groups)[test_mask], feat.shape[1])
+    stats = {}
+    for q in np.unique(g):
+        mq = g == q
+        Y, P = Yte[mq], pred[mq]
+        stats[str(q)] = {"n": int(mq.sum()), "sy": Y.sum(0).tolist(),
+                         "syy": (Y ** 2).sum(0).tolist(),
+                         "ssres": ((Y - P) ** 2).sum(0).tolist()}
+    return r2, float(alphas[k]), stats
 
 
 def _selection_split(train_mask, val_mask, pids, seed):
@@ -253,7 +280,13 @@ def _save_figure(names, rFullT, rT, rST, rFullS, rS, rTS, agg, variant_dir, tag)
         ax.bar(x,     branch, w, color=REC_BRANCH_COLOR, label="recovery R2 (own branch)")
         ax.bar(x + w, leak,   w, color=LEAK_COLOR,       label="leak R2 (other branch)")
         ax.set_xticks(x); ax.set_xticklabels(names, rotation=45, ha="right", fontsize=8)
-        ax.set_title(title, fontsize=11); ax.set_ylim(0, 1); ax.grid(axis="y", alpha=0.25)
+        ax.set_title(title, fontsize=11); ax.grid(axis="y", alpha=0.25)
+        # lower bound follows the data: R2 is no longer clipped at 0 (see _probe_r2), so a
+        # negative bar must be visible rather than hidden under the axis.
+        lo = min(0.0, float(np.nanmin(np.concatenate([full, branch, leak]))))
+        ax.set_ylim(min(-0.05, lo * 1.1), 1)
+        if lo < 0:
+            ax.axhline(0.0, color="0.4", lw=0.8)
         ax.legend(fontsize=7.5, framealpha=0.85)
     axes[0].set_ylabel("held-out R2")
     fig.suptitle(f"Decomposition recovery  -  {tag}\n"

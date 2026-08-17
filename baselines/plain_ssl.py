@@ -15,6 +15,7 @@ are cached to `cache_path`, so the first caller pays and later ones reload.
 Deliberately NOT importing train_hrd: train_hrd imports baselines.*, so the reverse edge would
 be a cycle. paper_kernels is therefore inlined below (7 lines, kept identical).
 """
+import json
 import math
 from pathlib import Path
 
@@ -56,8 +57,28 @@ def plain_ssl_encoder(X, pretrain_mask, cfg, n_sensors, device, seed=42, cache_p
         mask_prob=cfg["mask_keep_prob"], phase_mode=cfg["phase_encoding"],
         device=device, lr=cfg["lr"], batch_size=cfg["batch_size"])
 
+    # The cache is keyed by the PRETRAINING CONFIG, not by the file path alone. This control
+    # only means anything if it saw exactly what the disentangled model saw, and a cached file
+    # carries no record of that: a plain_encoder.pt written before --mask-mode changed would be
+    # reloaded silently and the "only the split differs" claim would be false -- the control
+    # would be the one without masking and the model the one with it. A sidecar .json holds the
+    # settings the twin was trained under; any mismatch retrains instead of reloading.
     cache_path = Path(cache_path) if cache_path else None
-    if cache_path is not None and cache_path.exists():
+    key = {k: cfg.get(k) for k in ("backbone", "pe", "repr_dims", "hidden_dims", "depth",
+                                   "alpha", "lr", "batch_size", "iters", "epochs",
+                                   "jitter_sigma", "mask_mode", "mask_keep_prob",
+                                   "phase_encoding", "loss_balance", "time2vec_dim")}
+    key["n_pretrain_windows"] = int(pretrain_mask.sum())
+    key["seed"] = int(seed)
+    key_path = cache_path.with_suffix(".key.json") if cache_path else None
+
+    cached = (cache_path is not None and cache_path.exists()
+              and key_path.exists()
+              and json.loads(key_path.read_text(encoding="utf-8")) == key)
+    if cache_path is not None and cache_path.exists() and not cached and verbose:
+        print(f"[plain-ssl] cache {cache_path.name} was trained under a DIFFERENT config "
+              f"(or has no key file) -- retraining rather than reusing a mismatched control.")
+    if cached:
         model.load(cache_path)
         if verbose:
             print(f"[plain-ssl] reloaded cached plain encoder -> {cache_path.name}")
@@ -70,6 +91,7 @@ def plain_ssl_encoder(X, pretrain_mask, cfg, n_sensors, device, seed=42, cache_p
                   verbose=verbose)
         if cache_path is not None:
             model.save(cache_path)
+            key_path.write_text(json.dumps(key, indent=2, sort_keys=True), encoding="utf-8")
     model.net.eval()
     return model
 

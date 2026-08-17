@@ -3,7 +3,6 @@ from typing import List
 
 import torch
 from torch import nn
-import torch.nn.functional as F
 import torch.fft as fft
 from einops import reduce, rearrange
 
@@ -17,6 +16,7 @@ from .positional_encoding import (
     FactorizedCalendarPE,
     Time2VecPE,
     PETransformerEncoderLayer,
+    TUPEPosition,
     add_absolute_pe,
 )
 
@@ -121,6 +121,8 @@ class TransformerFeatureExtractor(nn.Module):
         self.in_drop = nn.Dropout(dropout)
         # parameters used only by specific absolute PEs
         self.lpe = nn.Embedding(max_len, output_dims) if pe == 'learnable' else None
+        # TUPE shares one positional-correlation term across ALL layers (Ke et al. 2021).
+        self.tupe = TUPEPosition(output_dims, n_heads, max_len) if pe == 'tupe' else None
         self.layers = nn.ModuleList([
             PETransformerEncoderLayer(pe, output_dims, n_heads, max_len, dropout)
             for _ in range(depth)
@@ -134,191 +136,11 @@ class TransformerFeatureExtractor(nn.Module):
         if cal_pe is not None:               # calendar PE: same site/width as the absolute PEs
             x = x + cal_pe
         x = self.in_drop(x)
+        pos_bias = self.tupe(x.size(1), x.device) if self.tupe is not None else None
         for layer in self.layers:
-            x = layer(x)
+            x = layer(x, pos_bias)
         x = self.norm(x)
         return x.transpose(1, 2)             # B x output_dims x T
-
-
-class LearnableFourierMultiDim(nn.Module):
-    """Multi-dimensional Learnable Fourier positional encoding
-    (Li et al., "Learnable Fourier Features for Multi-Dimensional Spatial Positional
-    Encoding", NeurIPS 2021 -- Algorithm 1) for a metric M-dimensional position.
-
-    Given positions ``X`` of shape ``(T, M)``, a SINGLE shared learnable projection
-    ``Wr in R^{F x M}`` (initialised ``N(0, gamma^-2)``, Eq. 4) produces the Fourier
-    features ``r = (1/sqrt(F)) [cos(X Wr^T) || sin(X Wr^T)]`` of shape ``(T, 2F)`` (Eq. 2),
-    which a small MLP maps to ``d_model`` (Eq. 6). Because all M dimensions share ONE Wr
-    and are encoded JOINTLY (a single positional group, G=1), the dot product of two
-    encodings depends on ``X_i - X_j`` across every dimension together -- the paper's
-    L2-distance / shift-invariant inductive bias -- rather than encoding each dimension
-    separately and adding, which the paper shows is weaker (Sec. 5).
-
-    For the ViT-2D backbone this encodes each timestep's metric TIME position as
-    ``[within-day phase, day-of-week]`` (M=2), a shift-invariant multi-scale (daily +
-    weekly) circadian code. ``M=1`` recovers the plain 1-D learnable-Fourier time encoding.
-    The non-metric CHANNEL axis is left to a discrete embedding (the L2 prior only holds
-    on a metric axis).
-    """
-
-    def __init__(self, d_model, n_dims=2, n_freqs=None, gamma=1.0, mlp_hidden=None):
-        super().__init__()
-        n_freqs = n_freqs if n_freqs is not None else max(d_model // 2, 1)
-        mlp_hidden = mlp_hidden if mlp_hidden is not None else d_model
-        # W_r in R^{F x M}: N(0, gamma^-2), i.e. std = 1/gamma (Li et al. 2021, Eq. 4)
-        self.Wr = nn.Parameter(torch.randn(n_freqs, n_dims) / max(gamma, 1e-6))
-        self.mlp = nn.Sequential(
-            nn.Linear(2 * n_freqs, mlp_hidden), nn.GELU(), nn.Linear(mlp_hidden, d_model)
-        )
-        self.scale = 1.0 / math.sqrt(n_freqs)
-
-    def forward(self, pos):                              # pos: (T, M) float positions
-        proj = pos @ self.Wr.t()                         # (T, F) = X Wr^T
-        r = torch.cat([proj.cos(), proj.sin()], dim=-1) * self.scale   # (T, 2F), Eq. 2
-        return self.mlp(r)                               # (T, d_model), Eq. 6
-
-
-class _AxialBlock(nn.Module):
-    """One factorized 2-D attention block: channel-axis attention (mixing the few
-    sensors) followed by time-axis attention. Both are the project's vanilla
-    pre-norm Transformer blocks (``method='none'`` -> no in-attention PE); the
-    channel/time positions are injected once into the tokens upstream."""
-
-    def __init__(self, d_model, n_heads, n_channels, max_len, dropout):
-        super().__init__()
-        self.chan = PETransformerEncoderLayer('none', d_model, n_heads, max(n_channels, 2), dropout)
-        self.time = PETransformerEncoderLayer('none', d_model, n_heads, max_len, dropout)
-
-    def forward(self, x):                                   # x: (B, C, T, d)
-        B, C, T, d = x.shape
-        xc = x.permute(0, 2, 1, 3).reshape(B * T, C, d)     # channel-axis attention
-        xc = self.chan(xc).reshape(B, T, C, d).permute(0, 2, 1, 3)
-        xt = xc.reshape(B * C, T, d)                        # time-axis attention
-        xt = self.time(xt).reshape(B, C, T, d)
-        return xt
-
-
-class ViT2DFeatureExtractor(nn.Module):
-    """SensorLM-style 2-D encoder over the raw ``[sensor-channel x time]`` grid,
-    kept interface-compatible with the TCN / Transformer backbones:
-    ``(B, C_in, T) -> (B, output_dims, T)``.
-
-    Each ``(channel, time)`` cell is embedded to a token. Positions follow the
-    metric/non-metric split: the CHANNEL axis (HR, steps, ... have no meaningful
-    ordering or distance) gets a DISCRETE learnable embedding, while the metric TIME
-    position of each timestep -- taken as the MULTI-DIMENSIONAL point
-    ``[within-day phase, day-of-week]`` -- gets the multi-dimensional Learnable Fourier
-    encoding (Li et al. 2021, Algorithm 1), which encodes both time dimensions JOINTLY
-    (one shared Wr) so its shift-invariant / L2-kernel prior spans the daily + weekly
-    circadian scales. The L2 prior is only valid on such metric axes, hence the channel
-    axis stays discrete. Attention is factorized (channel-axis then time-axis) -- cheap because
-    there are only a handful of sensor channels -- and the time resolution T is
-    preserved (temporal patch = 1), so the CoST TFD/SFD heads and the plain-SSL
-    read-out downstream are unchanged.
-    """
-
-    def __init__(self, n_channels, output_dims, depth=4, n_heads=8, dropout=0.1,
-                 max_len=2048, lf_freqs=None, lf_gamma=1.0, bins_per_day=96):
-        super().__init__()
-        d = output_dims
-        n_heads = n_heads if d % n_heads == 0 else 1
-        self.n_channels = n_channels
-        self.d_model = d
-        self.bins_per_day = int(bins_per_day)
-        self.value_embed = nn.Linear(1, d)                      # scalar cell -> token
-        self.chan_embed = nn.Embedding(n_channels, d)           # discrete (non-metric) channel position
-        # multi-dimensional Learnable Fourier PE on the metric TIME position
-        # [within-day phase, day-of-week] (Li et al. 2021, Algorithm 1, M=2)
-        self.time_pe = LearnableFourierMultiDim(d, n_dims=2, n_freqs=lf_freqs, gamma=lf_gamma)
-        self.in_drop = nn.Dropout(dropout)
-        self.blocks = nn.ModuleList([
-            _AxialBlock(d, n_heads, n_channels, max_len, dropout) for _ in range(depth)
-        ])
-        self.norm = nn.LayerNorm(d)
-
-    def _time_positions(self, T, device):
-        """Metric 2-D time position per timestep: [within-day phase, day-of-week index],
-        each normalised to [0,1) so the learnable Fourier frequencies see comparable scales."""
-        t = torch.arange(T, device=device, dtype=torch.float32)
-        bpd = float(self.bins_per_day)
-        within_day = torch.remainder(t, bpd) / bpd                       # clock phase, [0,1)
-        n_days = max(1.0, T / bpd)
-        day = torch.div(t, bpd, rounding_mode="floor") / n_days          # day index, [0,1)
-        return torch.stack([within_day, day], dim=-1)                    # (T, 2)
-
-    def forward(self, x):                                       # x: (B, C_in, T) raw sensor grid
-        B, C, T = x.shape
-        tok = self.value_embed(x.unsqueeze(-1))                 # (B, C, T, d)
-        chan = self.chan_embed(torch.arange(C, device=x.device))    # (C, d)  discrete channel PE
-        time = self.time_pe(self._time_positions(T, x.device)).to(tok.dtype)   # (T, d) multi-dim LFF
-        tok = tok + chan[None, :, None, :] + time[None, None, :, :]
-        tok = self.in_drop(tok)
-        for blk in self.blocks:
-            tok = blk(tok)
-        tok = self.norm(tok)
-        tok = tok.mean(dim=1)                                   # aggregate channels -> (B, T, d)
-        return tok.transpose(1, 2)                              # (B, output_dims, T)
-
-
-class PlainViTFeatureExtractor(nn.Module):
-    """Vanilla ViT (Dosovitskiy et al. 2021) over the raw ``[sensor-channel x time]``
-    grid, kept interface-compatible with the other backbones: ``(B, C_in, T) ->
-    (B, output_dims, T)``. Sits ALONGSIDE the SensorLM-style axial ``ViT2DFeatureExtractor``
-    (``backbone='vit'``) as a literal reading of the original paper's design, rather than
-    that backbone's intrinsic multi-dim Learnable-Fourier + axial-attention scheme:
-
-      * Patch embedding: each ``(channel, timestep)`` scalar cell is linearly projected to
-        ``d_model`` -- this project's temporal resolution T must be preserved for the
-        downstream TFD (Conv1d) / SFD (FFT) heads, so there is no time-axis patching
-        (patch size 1), same tokenisation as ``backbone='vit'``.
-      * Positional encoding: ONE shared 1-D learnable absolute embedding over the
-        FLATTENED ``(channel, time)`` sequence of length ``C*T`` -- reuses the exact
-        ``add_absolute_pe(..., 'learnable', ...)`` mechanism the plain Transformer
-        backbone uses -- exactly the original ViT's single learned position-embedding
-        table, added once before the encoder stack. No metric/non-metric axis split,
-        no Learnable-Fourier.
-      * Attention: standard JOINT multi-head self-attention over all ``C*T`` tokens
-        (``PETransformerEncoderLayer`` with ``method='none'``), NOT the axial
-        (channel-then-time) factorisation ``backbone='vit'`` uses -- faithful to the
-        original paper's full self-attention, at the cost of ``O((C*T)^2)`` instead of
-        the axial backbone's much cheaper ``O(T*(C^2+T))``.
-      * No CLS token: the paper's classification token has no role here since the
-        encoder must emit a PER-TIMESTEP sequence for the trend/seasonal decomposition
-        heads downstream, not a single global vector, so it is intentionally omitted.
-
-    WARNING: full O((C*T)^2) attention over C=n_channels x T=length tokens is far more
-    memory-hungry than the axial 'vit' backbone at the same T -- use a much smaller
-    batch size (see VIT_PLAIN_BATCH_SIZE in scripts/run.sh).
-    """
-
-    def __init__(self, n_channels, output_dims, depth=4, n_heads=8, dropout=0.1, max_len=2048):
-        super().__init__()
-        d = output_dims
-        n_heads = n_heads if d % n_heads == 0 else 1
-        self.n_channels = n_channels
-        self.d_model = d
-        self.value_embed = nn.Linear(1, d)                       # "patch" (1x1 cell) embedding
-        # single flat learnable position-embedding table over the whole (channel, time)
-        # sequence -- the original ViT's one learned positional embedding, not split by axis
-        self.pos_embed = nn.Embedding(n_channels * max_len, d)
-        self.in_drop = nn.Dropout(dropout)
-        seq_len = n_channels * max_len
-        self.blocks = nn.ModuleList([
-            PETransformerEncoderLayer('none', d, n_heads, seq_len, dropout) for _ in range(depth)
-        ])
-        self.norm = nn.LayerNorm(d)
-
-    def forward(self, x):                                       # x: (B, C_in, T) raw sensor grid
-        B, C, T = x.shape
-        tok = self.value_embed(x.unsqueeze(-1))                 # (B, C, T, d)
-        tok = tok.reshape(B, C * T, self.d_model)               # ONE flat sequence, ViT-style
-        tok = add_absolute_pe(tok, "learnable", self.d_model, learnable_pe=self.pos_embed)
-        tok = self.in_drop(tok)
-        for blk in self.blocks:
-            tok = blk(tok)                                      # full joint self-attention
-        tok = self.norm(tok)
-        tok = tok.reshape(B, C, T, self.d_model).mean(dim=1)    # aggregate channels -> (B, T, d)
-        return tok.transpose(1, 2)                              # (B, output_dims, T)
 
 
 class CoSTEncoder(nn.Module):
@@ -327,7 +149,7 @@ class CoSTEncoder(nn.Module):
                  length: int,
                  hidden_dims=64, depth=10,
                  mask_mode='none', backbone='tcn', pe='sinusoidal',
-                 n_time_features=0, time2vec_dim=16, disentangle=True,
+                 n_time_features=0, time2vec_dim=65, disentangle=True,
                  bins_per_day=96, mask_prob=0.5):
         super().__init__()
 
@@ -390,44 +212,6 @@ class CoSTEncoder(nn.Module):
             self.feature_extractor = TransformerFeatureExtractor(
                 hidden_dims, output_dims, depth=depth, pe=self.pe
             )
-        elif backbone == 'vit':
-            # ViT-2D over the raw [sensor-channel x time] grid. It builds its own
-            # token/positional embedding (discrete channel + MULTI-DIMENSIONAL Learnable
-            # Fourier on the [within-day, day-of-week] time position), so it bypasses
-            # input_fc / Time2Vec and takes no swappable PE.
-            if self.pe != 'none':
-                raise ValueError(
-                    "vit backbone uses an intrinsic multi-dimensional Learnable-Fourier "
-                    "(time) + discrete(channel) encoding; use pe='none'."
-                )
-            if n_time_features > 0:
-                raise ValueError(
-                    "vit backbone does not support appended clock/time features "
-                    "(run without --with-clock-features)."
-                )
-            self.feature_extractor = ViT2DFeatureExtractor(
-                self.n_sensor_dims, output_dims, depth=depth, max_len=length,
-                bins_per_day=bins_per_day
-            )
-        elif backbone == 'vit_plain':
-            # Vanilla ViT (Dosovitskiy et al. 2021): one flat learnable positional
-            # embedding + full joint self-attention over the raw [sensor-channel x time]
-            # grid -- see PlainViTFeatureExtractor's docstring for how this differs from
-            # backbone='vit'. It also bypasses input_fc / Time2Vec and takes only the
-            # single 'learnable' PE (the original paper's standard configuration).
-            if self.pe != 'learnable':
-                raise ValueError(
-                    "vit_plain backbone uses the original ViT's single learnable "
-                    "absolute positional embedding; use pe='learnable'."
-                )
-            if n_time_features > 0:
-                raise ValueError(
-                    "vit_plain backbone does not support appended clock/time features "
-                    "(run without --with-clock-features)."
-                )
-            self.feature_extractor = PlainViTFeatureExtractor(
-                self.n_sensor_dims, output_dims, depth=depth, max_len=length
-            )
         elif backbone == 'tcn':
             # The calendar PEs are allowed: convolutions carry RELATIVE position but no
             # absolute calendar phase, which is what they supply (added at input_fc). Both are
@@ -445,7 +229,7 @@ class CoSTEncoder(nn.Module):
             )
         else:
             raise ValueError(
-                f"backbone must be one of 'tcn', 'transformer', 'vit', 'vit_plain', got: {backbone}"
+                f"backbone must be one of 'tcn', 'transformer', got: {backbone}"
             )
 
         self.repr_dropout = nn.Dropout(p=0.1)
@@ -475,21 +259,16 @@ class CoSTEncoder(nn.Module):
         x = x.clone()                                  # don't mutate the caller's tensor / a view
         x[~nan_mask] = 0
 
-        # The ViT-2D / vit_plain backbones consume the RAW [sensor-channel x time] grid
-        # and build their own token/positional embedding, so they bypass input_fc /
-        # Time2Vec entirely. Masking of non-wear timesteps below still applies (it zeros
-        # whole timesteps).
-        if self.backbone not in ('vit', 'vit_plain'):
-            # Time2Vec fed as input (Kazemi et al. 2019, x'_j = [x_j ; t2v(tau)]):
-            # concat t2v(tau) to the sensor channels before input_fc.
-            if self.t2v is not None:
-                t2v = self.t2v(x.size(1), x.device, x.dtype)        # T x time2vec_dim
-                x = torch.cat([x, t2v.unsqueeze(0).expand(x.size(0), -1, -1)], dim=-1)
-            x = self.input_fc(x)  # B x T x Ch  (sensors [+ Time2Vec])
-            # clock covariates (time-of-day / day-of-week) as an additive temporal
-            # encoding -- kept out of input_fc and the seasonal decomposition
-            if self.time_fc is not None:
-                x = x + self.time_fc(x_time)
+        # Time2Vec fed as input (Kazemi et al. 2019, x'_j = [x_j ; t2v(tau)]):
+        # concat t2v(tau) to the sensor channels before input_fc.
+        if self.t2v is not None:
+            t2v = self.t2v(x.size(1), x.device, x.dtype)        # T x time2vec_dim
+            x = torch.cat([x, t2v.unsqueeze(0).expand(x.size(0), -1, -1)], dim=-1)
+        x = self.input_fc(x)  # B x T x Ch  (sensors [+ Time2Vec])
+        # clock covariates (time-of-day / day-of-week) as an additive temporal
+        # encoding -- kept out of input_fc and the seasonal decomposition
+        if self.time_fc is not None:
+            x = x + self.time_fc(x_time)
 
         # generate & apply mask. mask=None (the default) resolves to the CONFIGURED
         # augmentation while training and to no masking at eval, so masking is opt-in

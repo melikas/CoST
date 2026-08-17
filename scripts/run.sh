@@ -14,11 +14,12 @@
 # task 0 notices and submits the missing tail into the same results folder. `bash` computes
 # the range up front and needs no healing.
 #
-# TCN variants are ~1.5x the rest; --time cannot vary within one array, so submit
-# them separately to keep the rest inside the 3 h partition bucket:
-#   bash scripts/run.sh --dry-run           # shows the task ids
-#   sbatch --time=8:00:00 --array=<tcn ids> scripts/run.sh
-# TCN entries are variants 0,1 -> task ids {0,1} + N_VARIANTS*seed_index.
+# This sweep is the TCN pair only: 6 seeds x 2 variants = 12 tasks, all of them heavy
+# (both variants pretrain the plain-SSL twin AND run q1/q2/q3). Stage 0 first -- one seed of
+# each -- so the real wall time is measured before 12 tasks are committed to a 3 h limit:
+#   sbatch --time=3:00:00 --array=0,1%2 scripts/run.sh     # Stage 0 (seed 42, both variants)
+#   sacct -j <jobid> --format=JobID%20,State,Elapsed        # then size Stage 1 from this
+# task id -> (seed, variant): seed = SEEDS[id / 2], variant = VARIANTS[id % 2].
 #
 # Results: results_hrd/<arrayjobid>/{backbone}_{pe}_seed{SEED}/
 # Monitor: squeue -u $USER ; tail -f logs/cost_hrd-<arrayjobid>_<taskid>.out
@@ -28,8 +29,8 @@
 #SBATCH --gres=gpu:nvidia_h100_80gb_hbm3_3g.40gb:1   # MIG slice: H100 speed, 40GB, many slices -> short queue (full h100:1 waits days)
 #SBATCH --cpus-per-task=4
 #SBATCH --mem=32G                    # 32G OOM-killed 17/28 tasks in 18535364 before the energy rhythm analysis was subsampled; 64G will not schedule on this node type.
-#SBATCH --time=8:00:00               # Was 3h (a <=3h job is eligible for BOTH the 3h and 12h buckets, ~20x less queued work ahead of it). One array cannot vary --time per task, so it must cover the WORST task: tcn:none and transformer:sinusoidal also pretrain the plain-SSL twin, i.e. two full pretrainings plus q1/q2/q3. That no longer fits 3h, so the whole sweep moves to the 12h bucket and queues longer. This is the price of one-command submission; splitting the array by task id (see header) buys the 3h bucket back for the other 60.
-#SBATCH --array=0-71%12              # 6 seeds x 12 variants. Goes stale when the sweep grows,
+#SBATCH --time=3:00:00               # A <=3h job is eligible for BOTH the 3h and 12h buckets (~20x less queued work ahead of it); at 8h it is locked into the 12h bucket. Run 19649817 was measured: the WORST task -- tcn:none, which pretrains the plain-SSL twin AND runs q1/q2/q3 -- finished in 2:23:41, and every transformer task in ~1:10. 8h was a guess that cost that array two days in ReqNodeNotAvail. Margin here is ~35 min; a rare TIMEOUT costs one rerun, which is far cheaper than the queue.
+#SBATCH --array=0-11%12              # 6 seeds x 2 variants. Goes stale when the sweep grows,
 #                                    # so task 0 self-heals: it detects a short array and
 #                                    # submits the remainder (see SELF-HEALING ARRAY below).
 #SBATCH --output=logs/%x-%A_%a.out
@@ -56,27 +57,39 @@ OUTPUT_DIR="results_hrd"
 # bit, so new seeds are the only way to add information.
 SEEDS=(42 82 22 91 53 45)         # 6 seeds
 
-# "backbone:pe". TCN accepts {none, time2vec, factorized}; Transformer accepts all 8 PE
-# methods + time2vec + factorized.
+# "backbone:pe". The sweep is deliberately the TCN PAIR only.
 #
-# factorized = the calendar-anchored PE of WavesFM Eq. 2 (two learnable tables indexed by
-# the bin's real time-of-day / day-of-week). Its controls are already in this sweep:
-#   transformer:learnable  -> same learnable-table form, INDEX-anchored  (isolates the anchor)
-#   tcn:none               -> relative position only, no absolute calendar
-# circular = the hand-designed twin of factorized: same wall-clock anchor and the same
-# additive site, but a FIXED sin/cos basis instead of learnable per-bin tables. Both are
-# input-side encodings, so both run on either backbone -- which is what makes the wall-clock
-# family readable free of the backbone (factorized alone was Transformer-only).
+#   tcn:none      relative position from the convolutions alone, no time encoding at all.
+#                 This is the F0 REFERENCE: pe_contrast(ref=("tcn","none")) measures every
+#                 other variant's Delta_pi against it, so it can never be dropped.
+#   tcn:time2vec  Kazemi et al. 2019 fed as an INPUT feature (1 linear + 64 learnable-
+#                 frequency sines). Elapsed-time structure, not calendar phase -- windows
+#                 start at an arbitrary hour (align_midnight=False), so tau maps to a
+#                 different wall-clock time in every window.
+#
+# Both are in PLAIN_REF, so both carry the plain-SSL control, and both are in Q23_VARIANTS,
+# so both run RQ1, RQ2 and RQ3 in full. That makes every task in this array a "worst case" --
+# see the Stage 0 note in the header before trusting the 3 h limit.
+#
+# CONSEQUENCE for E1.4: with two variants, Delta_pi has exactly ONE contrast arm
+# (time2vec vs none). That is a valid comparison but not a family, so the Holm correction in
+# pe_contrast is a no-op and the "does the temporal reference frame matter?" half of RQ1
+# rests on a single pair. Add the wall-clock arms back (tcn:circular, transformer:circular,
+# transformer:factorized) when that half is the claim being made.
+#
+# tcn:time2vec never converged in 19649817 (pretrain loss fell only 48%, to 3.50, vs ~0.10
+# everywhere else) because --time2vec-dim was 16, i.e. k=15 sines -- below the smallest
+# configuration the paper ever tested, and its frequency grid started 10.9% away from the
+# circadian 2*pi/96 so no sine began near 24 h. The default is now 65 (k=64, the paper's
+# best; nearest frequency 0.6% away). CHECK IT IN STAGE 0: if the loss still plateaus above
+# ~3 this variant is not reportable and should come out before Stage 1 spends six tasks.
 VARIANTS=(
-  tcn:none tcn:time2vec tcn:circular
-  transformer:sinusoidal transformer:learnable transformer:tpe
-  transformer:rpe transformer:erpe transformer:tupe
-  transformer:convspe
-  transformer:factorized transformer:circular
+  tcn:none tcn:time2vec
 )
-#transformer:time2vec
-#transformer:tpe
-#tcn:factorized
+# Dropped from this sweep, not from the codebase -- add back for the full PE study:
+#   tcn:circular transformer:sinusoidal transformer:learnable transformer:tpe
+#   transformer:rpe transformer:erpe transformer:tupe transformer:convspe
+#   transformer:factorized transformer:circular
 
 N_SEEDS=${#SEEDS[@]}
 N_VARIANTS=${#VARIANTS[@]}
@@ -96,7 +109,7 @@ if [ -z "${SLURM_JOB_ID:-}" ]; then
       *)            _pass+=("$1");    shift ;;
     esac
   done
-  _time="8:00:00"                         # must match the #SBATCH default above
+  _time="3:00:00"                         # must match the #SBATCH default above
 
   _cmd=(sbatch "--array=0-$(( N_JOBS - 1 ))%${_concurrent}" "--time=$_time"
         "--job-name=cost_hrd" "--export=ALL")
@@ -165,7 +178,14 @@ JITTER_SIGMA="0.1"
 # one -- its encoder's mask argument hard-defaulted to 'all_true', so mask_mode was
 # unreachable and MASK_KEEP_PROB had NO effect. Set MASK_MODE=binomial to actually enable it;
 # MASK_KEEP_PROB is read only in that case.
-MASK_MODE="none"; MASK_KEEP_PROB="0.5"
+MASK_MODE="binomial"; MASK_KEEP_PROB="0.5"
+# Was "none". With scale deliberately dropped (amplitude IS the biomarker) and no random
+# crop (max_train_length == seq_len, so the crop branch in cost.py never fires), the two
+# contrastive views differed only by jitter sigma=0.1 and a per-channel DC offset. Run
+# 19649817 solved that pretext task outright -- InfoNCE fell to 0.05-0.10 (98%+ drop) on
+# every variant -- and the resulting encoder lost to a RANDOM-INIT encoder on Full->sigma
+# in 72/72 runs. Timestep masking restores a non-trivial task without touching amplitude,
+# and is training-only (encode() always runs mask='none'), so nothing downstream changes.
 # Seasonal-loss phase comparison:
 #   circular      -- [sin, cos]; correct across the +/-pi branch cut
 #   circular_amp  -- circular, additionally weighted by each channel's amplitude, so
@@ -289,7 +309,29 @@ python train_hrd.py \
 VARIANT_DIR="$OUTPUT_DIR/$RUN_ID/${BACKBONE}_${PE}${SEED_TAG}"
 CACHE_DIR="${SLURM_TMPDIR:-/tmp}/hrd_cache"; mkdir -p "$CACHE_DIR"
 
+# RQ1 runs on every variant -- it IS the PE sweep. RQ2/RQ3 run on a PRE-DECLARED pair only
+# (docs/RQ_Minimal_Experiment_Design.md:304), for two distinct reasons:
+#   multiplicity -- 12 variants x 3 perturbations x 7 levels is a large family, and every
+#                   extra variant widens it without answering a new question;
+#   selection    -- choosing the pair AFTER seeing RQ1 would make every RQ2/RQ3 number
+#                   conditional on that choice. Fixing the list in advance, here, is what
+#                   keeps them unconditional.
+# One no-calendar reference and one wall-clock variant: the contrast RQ1 is actually about.
+# Every variant in this sweep, so the gate below never fires. The design restricts RQ2/RQ3 to
+# a pre-declared subset to keep the multiple-comparison surface small; with a two-variant
+# sweep the subset IS the sweep, so the restriction costs nothing and both arms get the full
+# RQ1/RQ2/RQ3 treatment. Declared here, before the run -- not chosen after seeing results.
+#
+# The previous sweep pre-declared transformer:circular and it came back useless: AUC 0.548,
+# below the breakdown_valid floor of 0.60 (experiment_q3.py:245), so its c* was undefined by
+# construction and half of RQ3 was empty. Both arms here clear that floor on past runs.
+Q23_VARIANTS="tcn:none tcn:time2vec"
+
 for Q in 1 2 3; do
+  if [ "$Q" != "1" ] && ! printf '%s\n' $Q23_VARIANTS | grep -qx "$BACKBONE:$PE"; then
+    echo "--- experiment_q$Q | $BACKBONE/$PE not in Q23_VARIANTS -> skipped ---"
+    continue
+  fi
   echo "--- experiment_q$Q | seed $SEED | $BACKBONE / $PE | $(date +%H:%M:%S) ---"
   python "experiment_q$Q.py" --variant-dir "$VARIANT_DIR" \
       --cache-dir "$CACHE_DIR" --gpu "$GPU_INDEX" \
@@ -298,6 +340,6 @@ done
 
 # plain_encoder.pt is the non-disentangled SSL control, pretrained once by q1 and reloaded
 # by q3. Same size and same reasoning as encoder.pt, so it is kept/dropped together.
-if [ "$KEEP_ENC" -eq 0 ]; then rm -f "$VARIANT_DIR/encoder.pt" "$VARIANT_DIR/plain_encoder.pt"; fi
+if [ "$KEEP_ENC" -eq 0 ]; then rm -f "$VARIANT_DIR/encoder.pt" "$VARIANT_DIR/plain_encoder.pt" \n                                    "$VARIANT_DIR/plain_encoder.key.json"; fi
 
 echo "=== done $(date) | $VARIANT_DIR ==="

@@ -63,7 +63,8 @@ class _SupervisedNet(nn.Module):
 
 def supervised_baseline_row(X, y, pids, train_mask, val_mask, test_mask, backbone, pe, name,
                             n_time_features, hidden_dims, depth, output_dims, device="cuda",
-                            max_epochs=60, patience=12, lr=1e-3, batch_size=64, seed=42):
+                            max_epochs=60, patience=12, lr=1e-3, batch_size=64, seed=42,
+                            return_scores=False):
     """Train the supervised backbone end-to-end and return a separability-table row dict
     (same keys as `separability_table`). Best epoch chosen by participant-level validation
     AUC (early stopping); F1/Acc use a val-tuned threshold; AUC is threshold-free."""
@@ -116,7 +117,7 @@ def supervised_baseline_row(X, y, pids, train_mask, val_mask, test_mask, backbon
     pp, pl = participant_aggregate(pids[test_mask], tprob, yte)
     p_auc = roc_auc_score(pl, pp) if len(np.unique(pl)) > 1 else float("nan")
     p_pred = (pp >= thr).astype(int)
-    return {
+    row = {
         "Representation": name, "Dim": "e2e", "Thr": float(thr),
         "Win AUC": float(w_auc), "Win F1": float(f1_score(yte, w_pred, zero_division=0)),
         "Win Acc": float(accuracy_score(yte, w_pred)),
@@ -127,3 +128,11 @@ def supervised_baseline_row(X, y, pids, train_mask, val_mask, test_mask, backbon
         "Subj BAcc": float(balanced_accuracy_score(pl, p_pred)),
         "Subj MCC": float(matthews_corrcoef(pl, p_pred)),
     }
+    # `return_scores` hands back the participant-level probabilities and labels as well.
+    # RQ3's Delta AUC is bootstrapped on SHARED participant draws, so it needs this rung's
+    # per-participant scores, not just its summary AUC -- and `participant_aggregate` orders
+    # by np.unique(pids[test_mask]), the same order experiment_q3.per_subject uses, so the
+    # two vectors are row-aligned and the contrast is genuinely paired.
+    if return_scores:
+        return row, pp, pl
+    return row

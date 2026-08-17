@@ -377,6 +377,21 @@ def save_loss_curves(iters, train_loss, val_loss, variant_dir, tag):
         plt.close(fig)
 
 
+def _build_energy_control(args, data, Xe, device, seed):
+    """Random-init encoder (never trained) encoding the ENERGY windows -- the same negative
+    control the depression ladder uses, so the two ladders share a floor."""
+    torch.manual_seed(seed)
+    m = CoST(input_dims=Xe.shape[-1],
+             n_time_features=int(Xe.shape[-1]) - int(data["n_sensors"]),
+             kernels=paper_kernels(Xe.shape[1]), alpha=args.alpha,
+             max_train_length=Xe.shape[1], output_dims=args.repr_dims,
+             hidden_dims=args.hidden_dims, depth=args.depth, backbone=args.backbone,
+             pe=args.pe, time2vec_dim=args.time2vec_dim,
+             bins_per_day=24 * 60 // args.bin_minutes, device=device)
+    m.net.eval()
+    return m.encode(Xe, mode="forecasting", pool=args.energy_pool).squeeze(1)
+
+
 def paper_kernels(seq_len):
     """CoST mixture-of-AR-experts kernels: powers of 2 up to floor(log2(T/2))."""
     L = max(0, int(math.floor(math.log2(max(seq_len // 2, 1)))))
@@ -510,7 +525,7 @@ def parse_args():
                    help="Fraction of pretrain windows held out to monitor the SSL validation loss")
     # CoST encoder / pretraining
     p.add_argument("--backbone", default="tcn",
-                    choices=["tcn", "transformer", "vit", "vit_plain"])
+                    choices=["tcn", "transformer"])
     p.add_argument(
         "--pe", default=None,
         choices=["sinusoidal", "learnable", "tape", "rpe", "erpe", "tupe",
@@ -521,13 +536,18 @@ def parse_args():
              "input-side encodings, which is what lets a reference-frame contrast be read "
              "on both backbones.",
     )
-    p.add_argument("--time2vec-dim", type=int, default=16,
+    p.add_argument("--time2vec-dim", type=int, default=65,
                    help="Time2Vec vector size k+1 (1 linear + k learnable-frequency "
                         "sines), concatenated to the input when --pe time2vec "
-                        "(Kazemi et al. 2019, fed as input). Default 16: with only 4 "
-                        "sensor channels a larger block (e.g. 64) swamps the input and "
-                        "collapses SSL; the t2v features are also standardised in "
-                        "Time2VecPE.forward. Paper tries k in {16,32,64}.")
+                        "(Kazemi et al. 2019, fed as input). Default 65 = k=64 sines, the "
+                        "paper's best (App. B: 64 outperforms 32 and 16 in most cases). Was "
+                        "16, i.e. k=15 -- BELOW the smallest configuration the paper ever "
+                        "tested -- and tcn:time2vec then failed to converge in run 19649817 "
+                        "(pretrain loss fell only 48%%, to 3.50, where every other variant "
+                        "reached ~0.10). That is the exact failure the paper attributes to "
+                        "too few sines: Sec. 6 reports optimisation trouble only 'when using "
+                        "only a few sine functions' and credits 'using many sine functions "
+                        "which reduces the distance to the goal'.")
     p.add_argument("--repr-dims", type=int, default=320)
     p.add_argument("--hidden-dims", type=int, default=64)
     p.add_argument("--depth", type=int, default=10)
@@ -647,12 +667,7 @@ def main():
     # Resolve the per-backbone default PE: sinusoidal for the Transformer, none
     # (the position-aware convolutions need no PE) for the TCN.
     if args.pe is None:
-        if args.backbone == "transformer":
-            args.pe = "sinusoidal"
-        elif args.backbone == "vit_plain":
-            args.pe = "learnable"
-        else:
-            args.pe = "none"
+        args.pe = "sinusoidal" if args.backbone == "transformer" else "none"
     # The calendar PEs are allowed on the TCN too: convolutions carry RELATIVE position but
     # have no access to absolute calendar phase, which is exactly what they add.
     if args.backbone == "tcn" and args.pe not in ("none", "time2vec") + CALENDAR_PES:
@@ -667,17 +682,6 @@ def main():
         )
     if args.backbone == "transformer" and args.pe == "none":
         raise SystemExit("--pe none is not valid for the Transformer backbone.")
-    if args.backbone == "vit" and args.pe != "none":
-        raise SystemExit(
-            "--pe must be 'none' for the vit backbone: it uses an intrinsic "
-            "Learnable-Fourier(time) + discrete(channel) encoding, not a swappable PE."
-        )
-    if args.backbone == "vit_plain" and args.pe != "learnable":
-        raise SystemExit(
-            "--pe must be 'learnable' for the vit_plain backbone: it is the original "
-            "ViT (Dosovitskiy et al. 2021) with a single learnable absolute positional "
-            "embedding, not a swappable PE."
-        )
     # Deprecated alias: it means exactly --probe-unit last, which is already the default, so it
     # only ever matters when the two disagree. Say so at startup rather than silently picking
     # one, because the choice changes what a probe sample is and is not visible in the metrics.
@@ -1121,12 +1125,31 @@ def main():
             mode_desc = ("**Mode B (sliding), encoder REUSED from the depression run**: one "
                          "trailing 7-day window per labelled day ([D-6, D] -> EE(D)); test = the "
                          "participants already held out of pretraining, so leakage-free.")
+            # Same encoder-based controls the depression ladder carries, so the two
+            # downstreams are compared against the same set. The plain twin is pretrained here
+            # with the SAME cache path experiment_q1/q3 use, so it is trained once per variant
+            # and reloaded there -- moving the cost earlier, not adding one.
+            extra = {}
+            try:
+                # imported here, not at module scope: tasks._experiment_common imports this
+                # module, so a top-level edge back would be a cycle.
+                from tasks._experiment_common import PLAIN_REF
+                extra["Random-init"] = _build_energy_control(args, data, Xe, device, model_seed)
+                if (args.backbone, args.pe) in PLAIN_REF and args.disentangle:
+                    from baselines.plain_ssl import encode_plain, plain_ssl_encoder
+                    _plain = plain_ssl_encoder(X, pretrain_mask, vars(args), data["n_sensors"],
+                                               device, seed=model_seed,
+                                               cache_path=variant_dir / "plain_encoder.pt")
+                    extra["CoST plain (no disentangle)"] = encode_plain(_plain, Xe, vars(args))
+            except Exception as e:
+                print(f"[energy] extra ladder rungs SKIPPED (non-fatal): {type(e).__name__}: {e}")
             _t = time.time()
             run_energy_tasks(model, Xe, eee, pe, data["n_sensors"], tr_e, va_e, te_e,
                              args.energy_pool, args.energy_threshold, model_seed,
                              e_out, mode_desc,
                              {**vars(args), "split_seed": split_seed, "model_seed": model_seed},
-                             season_pool=season_pool)
+                             season_pool=season_pool, ee_win=edata.get("ee_win"),
+                             extra_reprs=extra)
             print(f"[energy] probe tasks done in {time.time() - _t:.0f}s")
             # Same rhythm figures as depression, but split by energy PER DAY (high- vs
             # low-energy days). subject_aggregate=False: each window is its own unit (a person

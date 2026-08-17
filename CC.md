@@ -32,46 +32,11 @@ ssh melikas@narval.alliancecan.ca
 ```
 scp -r ./cost.py ./train_hrd.py ./data_preprocessing.py ./hrd_rhythm.py ./decomposition_recovery.py ./utils.py ./models ./scripts ./requirements.txt melikas@narval.alliancecan.ca:~/projects/def-plago/melikas/projects/rhythmssl_project/
 
-Multifactor authentication (MFA) is mandatory. If you have not set it up:
-https://ccdb.alliancecan.ca/multi_factor_authentications
 
-Type `exit` any time to close the Narval session and return to your PC.
-
----
-
-## Step 1 — Upload your project (LOCAL → Narval)
-
-Do this from your PC. It copies the code **and** the dataset to Narval.
-
-```powershell
-# LOCAL: go to the project folder
-cd c:\Users\umroot\Documents\CoST
-```
-
-# LOCAL
-scp scripts/run_debug.sh melikas@narval.alliancecan.ca:~/projects/def-plago/melikas/projects/rhythmssl_project/scripts/
+scp -r ./cost.py ./utils.py ./train_hrd.py ./train_globem.py ./experiment_q1.py ./experiment_q2.py ./experiment_q3.py ./requirements.txt ./models ./tasks ./tasks_globem ./baselines ./data_processing ./scripts melikas@nibi.alliancecan.ca:~/projects/def-plago/melikas/projects/rhythmssl_project/
 
 
 
-
-```bash
-# LOCAL: create the destination folder on Narval (one time)
-ssh melikas@narval.alliancecan.ca "mkdir -p ~/projects/def-plago/melikas/projects/rhythmssl_project"
-```
-ssh melikas@rorqual.alliancecan.ca "mkdir -p ~/projects/def-plago/melikas/projects/rhythmssl_project"
-
-Now upload. **Prefer `rsync`** — it skips junk (`.git`, caches, old results) and
-can resume if interrupted:
-
-```bash
-# LOCAL: upload everything needed (code + datasets/HRD_RAW_MinuteLevel.csv)
-rsync -avP \
-  --exclude='.git' --exclude='__pycache__' --exclude='*.pyc' --exclude='results_hrd' \
-  ./ melikas@narval.alliancecan.ca:~/projects/def-plago/melikas/projects/rhythmssl_project/
-```
-scp -r ./ melikas@rorqual.alliancecan.ca:~/projects/def-plago/melikas/projects/rhythmssl_project/
-
-scp -r ./cost.py ./cosinor.py ./train_hrd.py ./train_hrd_energy.py ./data_preprocessing.py ./hrd_rhythm.py ./decomposition_recovery.py ./utils.py ./models ./scripts ./requirements.txt melikas@nibi.alliancecan.ca:~/projects/def-plago/melikas/projects/rhythmssl_project/
 
 
 What the flags mean: `-a` keep file structure, `-v` show progress, `-P` resume
@@ -114,18 +79,19 @@ You do **not** wait at the terminal — the job runs in the background.
 # NARVAL: run the BASELINE experiment (TCN + Transformer/sinusoidal)
 cd ~/projects/def-plago/melikas/projects/rhythmssl_project
 sbatch scripts/run.sh
+# 2. smoke test -- the heaviest task, no self-heal
+sbatch --array=12 scripts/run.sh
 ```
 ror: 
 
-nibi: 19024283
+nibi: 19649817
 
+logs/cost_rq1-19421181_0.out       (seed 43)
+logs/cost_rq1-19422314_[1-6].out   (بقیهٔ seedها)
 
 It prints something like `Submitted batch job 62977394`. **Write down that
 number** — it is your `<jobid>`.
 
-**Want all positional-encoding variants instead** (8 PEs + Time2Vec + TCN variants)?
-Open `scripts/run.sh`, find the block marked `OPTION E`, remove the `#` at the
-start of its two lines (and comment out OPTION A above it), then `sbatch scripts/run.sh`.
 
 ---
 
@@ -200,12 +166,16 @@ rsync -avP \
   ./results_hrd/
 ```
 
-scp -r melikas@rorqual.alliancecan.ca:~/projects/def-plago/melikas/projects/rhythmssl_project/results_hrd/16829002 c:\Users\umroot\Documents\CoST - Rorqual\results_hrd\
+
+scp -r melikas@nibi.alliancecan.ca:~/projects/def-plago/melikas/projects/rhythmssl_project/results_hrd/19606825 "c:\Users\umroot\Documents\CoST - Rorqual\results_hrd\"
+
+scp -r melikas@nibi.alliancecan.ca:~/projects/def-plago/melikas/projects/rhythmssl_project/results_hrd_energy/19314126 "c:\Users\umroot\Documents\CoST - Rorqual\results_hrd_energy\"
 
 
-scp -r melikas@nibi.alliancecan.ca:~/projects/def-plago/melikas/projects/rhythmssl_project/results_hrd/18975686 "c:\Users\umroot\Documents\CoST - Rorqual\results_hrd\"
+smoke download 
+# LOCAL
+scp -r "melikas@nibi.alliancecan.ca:~/projects/def-plago/melikas/projects/rhythmssl_project/results_hrd/19422314" "c:\Users\umroot\Documents\CoST - Rorqual\results_hrd\"
 
-scp -r melikas@nibi.alliancecan.ca:~/projects/def-plago/melikas/projects/rhythmssl_project/results_hrd_energy/18975686 "c:\Users\umroot\Documents\CoST - Rorqual\results_hrd_energy\"
 
 
 

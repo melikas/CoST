@@ -15,7 +15,7 @@ import json
 import time
 
 import numpy as np
-from scipy.stats import spearmanr
+from scipy.stats import rankdata, spearmanr
 from sklearn.linear_model import LogisticRegression, Ridge
 from sklearn.pipeline import make_pipeline
 from sklearn.preprocessing import StandardScaler
@@ -131,7 +131,7 @@ def regression_table(title, rows):
 
 def run_energy_tasks(model, X, ee, pids, n_sensors, tr, va, te,
                      pool, energy_threshold, seed, out_dir, mode_desc, config,
-                     season_pool=None):
+                     season_pool=None, ee_win=None, extra_reprs=None):
     """Encode X with the FROZEN `model` and run the 3 emotional-energy tasks on the given
     participant-level masks (tr/va/te), writing report.md + metrics.json to out_dir.
 
@@ -143,32 +143,66 @@ def run_energy_tasks(model, X, ee, pids, n_sensors, tr, va, te,
     reprs = model.encode(X, mode="forecasting", pool=pool,
                          season_pool=season_pool).squeeze(1)                    # (N, repr_dims)
     hc = handcrafted_features(X, n_sensors)                                     # (N, 2*n_sensors)
+    # Ladder rungs, in the design's order. `extra_reprs` carries the encoder-based controls the
+    # depression ladder already has (random-init, plain SSL) so the two downstreams are probed
+    # against the SAME comparison set; the caller builds them because only it has the config.
+    reps = {"Handcrafted (mean/std)": hc}
+    reps.update(extra_reprs or {})
+    reps["CoST (SSL repr)"] = reprs
 
     y_reg = ee
     y_hi = (ee >= energy_threshold).astype(int)                                 # task 1
-    pid_median = {p: np.median(ee[(pids == p) & lab]) for p in pids_with_label}
-    med_arr = np.array([pid_median.get(p, np.nan) for p in pids])
-    y_wp = (ee >= med_arr).astype(int)                                          # task 3
+    # Task 3: "is this a high day FOR THIS PERSON". EE is a 1-5 INTEGER scale, so a median
+    # split by comparison is not a median split at all: on HRD `ee >= median` puts every tie
+    # in the positive class (72% positive) and `ee > median` puts them all in the negative
+    # one (22%). Neither is the 50/50 contrast the task claims, and the imbalance was
+    # visible in the reported majority accuracy (0.68-0.74 where it should be ~0.50).
+    # Rank within the participant instead -- 50/50 by construction whatever the ties.
+    y_wp = np.zeros(len(ee), dtype=int)
+    for p in pids_with_label:
+        m = (pids == p) & lab
+        y_wp[m] = (rankdata(ee[m], method="average") / int(m.sum()) > 0.5).astype(int)
 
     # Participants of the test rows: the unit the bootstrap CI resamples, because a person's
     # ~150 sliding windows overlap by six days and are not independent observations.
     tep = pids[te]
-    t1 = [("Majority (chance)", majority_binary(y_hi, tr, te, tep)),
-          ("Handcrafted (mean/std)", probe_binary(hc, y_hi, tr, va, te, seed, tep)),
-          ("CoST (SSL repr)", probe_binary(reprs, y_hi, tr, va, te, seed, tep))]
-    t2 = [("Mean predictor", mean_regression(y_reg, tr, te)),
-          ("Handcrafted (mean/std)", probe_regression(hc, y_reg, tr, te, tep)),
-          ("CoST (SSL repr)", probe_regression(reprs, y_reg, tr, te, tep))]
-    t3 = [("Majority (chance)", majority_binary(y_wp, tr, te, tep)),
-          ("Handcrafted (mean/std)", probe_binary(hc, y_wp, tr, va, te, seed, tep)),
-          ("CoST (SSL repr)", probe_binary(reprs, y_wp, tr, va, te, seed, tep))]
+    t1 = ([("Majority (chance)", majority_binary(y_hi, tr, te, tep))]
+          + [(n, probe_binary(R, y_hi, tr, va, te, seed, tep)) for n, R in reps.items()])
+    t2 = ([("Mean predictor", mean_regression(y_reg, tr, te))]
+          + [(n, probe_regression(R, y_reg, tr, te, tep)) for n, R in reps.items()])
+    t3 = ([("Majority (chance)", majority_binary(y_wp, tr, te, tep))]
+          + [(n, probe_binary(R, y_wp, tr, va, te, seed, tep)) for n, R in reps.items()])
+
+    # Tasks 4-5: the SAME input scored against a window-matched target (mean EE over the
+    # days the window spans) instead of EE on its last day alone. Tasks 1-3 keep the
+    # day-level target; reporting both is what turns the timescale mismatch from a
+    # confound into a measurement.
+    # Deliberately regression-only. A threshold on a window MEAN is not the same cut as the
+    # same threshold on a single day -- averaging shrinks the variance, so `>= 4` selects a
+    # small extreme tail -- and any other value would be a free parameter. Spearman needs no
+    # cut and discards nothing; the binary EE questions are already covered by Tasks 1 and 3.
+    t4 = None
+    if ee_win is not None:
+        y_win = np.asarray(ee_win, dtype=float)
+        okw = np.isfinite(y_win)
+        trw, tew = tr & okw, te & okw
+        yw0 = np.nan_to_num(y_win, nan=float(np.nanmean(y_win)))
+        tepw = pids[tew]
+        t4 = ([("Mean predictor", mean_regression(yw0, trw, tew))]
+              + [(n, probe_regression(R, yw0, trw, tew, tepw)) for n, R in reps.items()])
 
     n_tr, n_va, n_te = (len(set(pids[tr])), len(set(pids[va])), len(set(pids[te])))
     pos_rate = float(y_hi[te].mean())
     tbl1 = binary_table(f"Task 1 - High-energy day (EE >= {energy_threshold:g})  "
                         f"[test positive rate = {pos_rate:.1%}]", t1)
     tbl2 = regression_table("Task 2 - Ordinal regression (EE 1-5)", t2)
-    tbl3 = binary_table("Task 3 - Within-person high day (EE >= participant's own median)", t3)
+    tbl3 = binary_table("Task 3 - Within-person high day (rank split at participant's median)", t3)
+    tbl45 = ""
+    if t4 is not None:
+        tbl45 = "\n" + regression_table(
+            "Task 4 - Regression on mean EE over the window  [window-matched target; pair "
+            "with Task 2 -- identical features, metric, split and pooling, only the "
+            "target's timescale differs]", t4)
 
     out_dir.mkdir(parents=True, exist_ok=True)
     report = (
@@ -193,6 +227,7 @@ def run_energy_tasks(model, X, ee, pids, n_sensors, tr, va, te,
         "task1_high_energy": {n: m for n, m in t1},
         "task2_regression": {n: m for n, m in t2},
         "task3_within_person": {n: m for n, m in t3},
+        **({"task4_regression_week": {n: m for n, m in t4}} if t4 is not None else {}),
     }
     (out_dir / "metrics.json").write_text(json.dumps(metrics, indent=2), encoding="utf-8")
     print("\n" + report)
@@ -206,7 +241,7 @@ def parse_args():
     p = argparse.ArgumentParser(description="Emotional-energy probe on CoST representations")
     p.add_argument("--sensor-csv", required=True)
     p.add_argument("--backbone", default="transformer",
-                   choices=["tcn", "transformer", "vit", "vit_plain"])
+                   choices=["tcn", "transformer"])
     p.add_argument("--pe", default=None)
     p.add_argument("--pool", choices=["last", "mean", "max", "meanmax"], default="last",
                    help="How the 7-day representation is collapsed before the probe. "
@@ -289,7 +324,8 @@ def main():
     out = Path(args.output_dir) / args.run_id / f"{args.backbone}_{args.pe}_seed{args.seed}"
     run_energy_tasks(model, X, ee, pids, n_sensors, tr, va, te,
                      args.pool, args.energy_threshold, args.seed, out, mode_desc, vars(args),
-                     season_pool=None if args.season_pool == "same" else args.season_pool)
+                     season_pool=None if args.season_pool == "same" else args.season_pool,
+                     ee_win=data.get("ee_win"))
     print(f"total time = {(time.time() - t0) / 60:.1f} min")
 
 

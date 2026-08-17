@@ -28,16 +28,22 @@ from train_hrd import paper_kernels, stratified_pid_holdout
 # against its OWN disentangled twin, which is what leaves `disentangle` as the single
 # difference; it is deliberately NOT a common yardstick under the other variants, where
 # backbone and PE would differ too.
-PLAIN_REF = {("tcn", "none"), ("transformer", "sinusoidal")}
+PLAIN_REF = {("tcn", "none"), ("tcn", "time2vec"), ("transformer", "sinusoidal")}
 
 # Preprocessing-relevant config keys: two runs agreeing on these produce the same windows,
 # so one cached dataset serves every variant of an array task (the CSV is 53.5M rows).
 _DATA_KEYS = ("sensor_csv", "window_hours", "bin_minutes", "label_col", "max_missing",
               "max_window_missing", "no_zscore", "with_clock_features", "pe")
+# Bumped whenever prepare_hrd_dataset gains a KEY, not just when a config value changes.
+# None of _DATA_KEYS moves when a new field is added, so without this a pickle written by
+# the previous schema is a cache HIT and the new field silently arrives as None.
+#   2 -> added "ee_win" (window-matched emotional energy) for RQ2 layer 3.
+_SCHEMA_VERSION = 2
 
 
 def _dataset(cfg, cache_dir):
-    key = hashlib.md5(json.dumps({k: cfg.get(k) for k in _DATA_KEYS},
+    key = hashlib.md5(json.dumps({**{k: cfg.get(k) for k in _DATA_KEYS},
+                                  "_schema": _SCHEMA_VERSION},
                                  sort_keys=True, default=str).encode()).hexdigest()[:12]
     fp = Path(cache_dir) / f"hrd_windows_{key}.pkl" if cache_dir else None
     if fp is not None and fp.exists():
@@ -104,6 +110,7 @@ def load_context(variant_dir, cache_dir=None, gpu=0):
     return SimpleNamespace(
         model=model, cfg=cfg, device=device, variant_dir=variant_dir,
         X=X, y=y, pids=pids, window_ids=data.get("window_ids"),
+        ee_win=data.get("ee_win"),
         sensor_cols=list(data["sensor_cols"]), n_sensors=int(data["n_sensors"]),
         bin_minutes=cfg["bin_minutes"], seq_len=X.shape[1],
         bins_per_day=24 * 60 // cfg["bin_minutes"],

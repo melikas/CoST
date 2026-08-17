@@ -32,14 +32,15 @@ import torch
 from torch.nn.functional import normalize as l2normalize
 from models.positional_encoding import position_matrix
 from baselines.cosinor import N_PARAMS
+from tasks.decomposition import RIDGE_ALPHAS, _ridge_fit
 
 import matplotlib
 matplotlib.use("Agg")
 import matplotlib.pyplot as plt
 from sklearn.manifold import TSNE
-from sklearn.linear_model import LogisticRegression, Ridge
+from sklearn.linear_model import LogisticRegression
 from sklearn.decomposition import PCA
-from sklearn.model_selection import GroupKFold, cross_val_predict
+from sklearn.model_selection import GroupKFold
 from sklearn.pipeline import make_pipeline
 from sklearn.preprocessing import StandardScaler
 from sklearn.metrics import (roc_auc_score, f1_score, accuracy_score, r2_score,
@@ -124,25 +125,47 @@ def representation_views(rep):
     }
 
 
-def cosinor_markers(cf, n_channels, top_k=2):
-    """Per-window (amplitude, acrophase) read from the project's SINGLE cosinor fit.
+def cosinor_markers_per_channel(cf, n_channels, top_k=2):
+    """Per-window (amplitude, acrophase) for EACH channel separately -- each (N, n_channels).
 
     There is deliberately no second cosinor implementation: the markers used to validate the
     latent space are read from the same `paper_cosinor_features` matrix that serves as the
     baseline, so the target and the competitor cannot disagree. Only the DOMINANT period of
-    each channel (k=0) is used; channels are combined by an amplitude-weighted circular mean so
-    one strong rhythm is not cancelled by a weak one. Because the fit is clock-anchored and
-    subject-aggregated, the acrophase returned here is a wall-clock angle (0 = midnight) and is
-    comparable across participants. Returns (amplitude, acrophase-radians), each (N,).
+    each channel (k=0) is used. Because the fit is clock-anchored and subject-aggregated, each
+    acrophase is a wall-clock angle (0 = midnight) and is comparable across participants.
+
+    This is the form every CLAIM should use. Heart rate, ambulatory activity and sleep have
+    different acrophases by definition -- they are different chronobiological constructs, not
+    three noisy measurements of one -- so they are carried separately and reported separately.
     """
-    A, TH = [], []
+    A, TH, M = [], [], []
     for c in range(n_channels):
         b = (c * top_k) * N_PARAMS                      # dominant-period block of this channel
         per = cf[:, b].astype(np.float64)
+        M.append(cf[:, b + 1].astype(np.float64))       # MESOR (COSINOR_PARAM_COLS[1])
         A.append(cf[:, b + 2].astype(np.float64))       # Amplitude
         ph = cf[:, b + 4].astype(np.float64)            # Acrophase, in bins since midnight
         TH.append(np.where(per > 0, 2 * np.pi * ph / np.maximum(per, 1e-9), 0.0))
-    A, TH = np.stack(A, 1), np.stack(TH, 1)
+    return np.stack(A, 1), np.stack(TH, 1), np.stack(M, 1)
+
+
+def cosinor_markers(cf, n_channels, top_k=2):
+    """DISPLAY-ONLY pooled summary: one (amplitude, acrophase) per window. NOT a construct.
+
+    Never use this as a probe target. Sleep runs roughly ANTIPHASE to activity and heart rate
+    -- an `is_asleep` acrophase near 03:00 against a steps/HR acrophase near 15:00 -- so the
+    amplitude-weighted circular mean below points somewhere between two different constructs,
+    and where it lands is governed by the relative z-scored amplitudes of sleep vs activity,
+    which is an artefact of preprocessing rather than physiology. Two antiphase channels cancel
+    in proportion to their amplitudes however they are weighted; weighting only stops a WEAK
+    rhythm from cancelling a STRONG one, which is a different problem. The amplitude half is
+    likewise a mean over constructs that do not share a scale.
+
+    It survives only because `clinical_marker_tsne` needs ONE angle per window to colour one
+    scatter point. Everything that makes a claim -- E1.3's `rhythm_axis_probe` -- uses
+    `cosinor_markers_per_channel` and reports each channel on its own.
+    """
+    A, TH, _ = cosinor_markers_per_channel(cf, n_channels, top_k)
     return A.mean(1), np.angle((A * np.exp(1j * TH)).sum(1))
 
 
@@ -977,21 +1000,26 @@ def label_embedding_figure(views, y, idx, variant_dir, fname, method, embed, hea
     plt.close(fig)
 
 
-def _interdaily_stability(Xs, bpd):
+def _interdaily_stability(Xs, bpd, per_channel=False):
     """Interdaily stability IS per window (Witting et al.): variance of the mean 24-h profile
-    over total variance -> day-to-day regularity in [0, 1] (higher = more stable). Averaged over
-    channels. IS = nd * SS_between_bins / SS_total, with nd = #days, bpd = bins/day."""
+    over total variance -> day-to-day regularity in [0, 1] (higher = more stable).
+    IS = nd * SS_between_bins / SS_total, with nd = #days, bpd = bins/day.
+
+    ``per_channel=True`` returns (N, C) -- the form E1.3 probes, because "the sleep rhythm is
+    regular" and "the heart-rate rhythm is regular" are separate statements and a mean over
+    channels can hide one collapsing while another holds. The default (N,) channel-mean is the
+    display summary kept for the t-SNE colouring and for RQ2's raw markers."""
     N, T, C = Xs.shape
     nd = T // bpd
     if nd < 2:
-        return np.full(N, np.nan)
+        return np.full((N, C), np.nan) if per_channel else np.full(N, np.nan)
     m = Xs[:, :nd * bpd].reshape(N, nd, bpd, C)
     grand = m.mean(axis=(1, 2))                                  # (N, C)
     prof = m.mean(axis=1)                                        # (N, bpd, C) mean 24-h profile
     ss_between = ((prof - grand[:, None]) ** 2).sum(axis=1)      # (N, C)
     ss_total = ((m - grand[:, None, None]) ** 2).sum(axis=(1, 2))
     IS = np.where(ss_total > 0, nd * ss_between / ss_total, np.nan)
-    return np.nanmean(IS, axis=1)                                # (N,)
+    return IS if per_channel else np.nanmean(IS, axis=1)         # (N, C) or (N,)
 
 
 def clinical_marker_tsne(emb_view, Xs, idx, variant_dir, bin_minutes, seed, tag, cf,
@@ -1273,55 +1301,183 @@ def _circ_corr(a, b):
     return float(np.sum(sa * sb) / den) if den > 0 else float("nan")
 
 
+def _oof_ridge_selected(F, Y, groups, cv, alphas, seed):
+    """Out-of-fold ridge predictions with the penalty selected INSIDE each fold.
+
+    E1.3 used to pin ``Ridge(alpha=10.0)`` while E1.2 swept the CoST grid and chose lambda* on
+    held-out participants -- two conventions for the same claim ("this marker is linearly
+    readable from the latent"). A hand-set penalty also confounds a low R2 with a mis-set
+    penalty, which is precisely the confound E1.2's sweep exists to remove
+    (docs/RQ_Minimal_Experiment_Design.md, E1.2). This applies the E1.2 rule here: same grid
+    (``RIDGE_ALPHAS``), same criterion (RMSE + MAE), same principle that the penalty is never
+    chosen on the rows it is scored on.
+
+    Nested, not flat: within each outer fold a participant-disjoint quarter of THAT fold's
+    training participants is held out to pick lambda*, and the outer test fold is touched once,
+    with lambda* already fixed. Choosing lambda* on the outer test fold would leak it.
+
+    lambda* is then REFIT on the full outer-training fold, as GridSearchCV(refit=True) does --
+    the inner split exists to choose the penalty, not to be thrown away. Fitting the returned
+    model on the inner 75% instead would silently cost a quarter of the training data in every
+    fold, which at ~36 participants is not affordable.
+
+    Costs little more than a single fit: ``_ridge_fit`` pays the O(n p^2) Gram and its
+    eigendecomposition once and reads the whole grid off that one decomposition.
+
+    With a one-element ``alphas`` the selection is a no-op and this reduces EXACTLY to
+    ``cross_val_predict(make_pipeline(StandardScaler(), Ridge(alpha)), ...)`` -- the invariant
+    the unit check relies on.
+
+    Returns ``(pred (n, C) aligned with F, [lambda* per outer fold])``.
+    """
+    F = np.asarray(F)
+    Y = np.asarray(Y, dtype=np.float64)
+    if Y.ndim == 1:
+        Y = Y[:, None]
+    pred = np.full((len(F), Y.shape[1]), np.nan)
+    chosen, degenerate = [], False
+    rng = np.random.RandomState(seed)
+    for tr, te in cv.split(F, Y[:, 0], groups):
+        g = np.unique(groups[tr])
+        rng.shuffle(g)
+        sel = np.isin(groups[tr], g[:max(1, int(round(0.25 * len(g))))])
+        fit = ~sel
+        if not fit.any() or not sel.any():       # too few participants to carve a selection
+            fit = sel = np.ones(len(tr), bool)   # degenerate: selected on the fitted rows
+            degenerate = True
+        if len(alphas) > 1:
+            inner = _ridge_fit(F[tr][fit], Y[tr][fit])
+            err = [float(np.sqrt((r ** 2).mean()) + np.abs(r).mean())
+                   for r in (inner(a, F[tr][sel]) - Y[tr][sel] for a in alphas)]
+            a_star = float(alphas[int(np.argmin(err))])
+        else:
+            a_star = float(alphas[0])
+        pred[te] = _ridge_fit(F[tr], Y[tr])(a_star, F[te])       # refit on the FULL train fold
+        chosen.append(a_star)
+    if degenerate:
+        print("[rhythm] WARNING: too few participants to hold a selection set out inside a "
+              "fold; lambda* was chosen on the rows it was fitted on for at least one fold.")
+    return pred, chosen
+
+
 def rhythm_axis_probe(emb, Xs, mask, pids, bin_minutes, variant_dir, seed, cf,
-                      n_sensors, top_k=2, table_tag="", n_splits=5):
+                      n_sensors, top_k=2, table_tag="", n_splits=5, sensor_cols=None):
     """Quantify what hrd_tsne_clinical.png shows by eye: is the latent space organised along
     known chronobiological axes?
 
-    Ridge-regresses three markers computed from the RAW signal (never from the model or the
-    label) out of the embedding, out-of-fold with folds grouped by participant so a person's
+    Ridge-regresses markers computed from the RAW signal (never from the model or the label)
+    out of the embedding, out-of-fold with folds grouped by participant so a person's
     correlated windows never sit on both sides of a split. A mean predictor scores R^2 = 0, so
     R^2 > 0 means the marker is linearly readable from the latent.
 
+    Every marker is PER CHANNEL. Heart rate, ambulatory activity and sleep have different
+    acrophases by construction -- sleep is roughly antiphase to the other two -- so pooling
+    them into one angle produces a quantity with no chronobiological referent whose value is
+    driven by the relative z-scored amplitudes of sleep vs activity (see cosinor_markers).
+    "HR acrophase is recoverable to within 1.4 h" is a claim; "the pooled acrophase is
+    recoverable" is not. The same reasoning applies to amplitude and interdaily stability.
+
+    This multiplies the probe count by n_sensors, so treat the per-channel table as a family
+    and correct for multiplicity before calling any single channel significant.
+
     Acrophase is an angle, so it is fitted as sin/cos, recombined with arctan2, and scored with
     a circular correlation plus the median absolute error in hours (an R^2 on raw radians would
-    be meaningless across the 0/2*pi wrap)."""
+    be meaningless across the 0/2*pi wrap).
+
+    The ridge penalty is NOT hand-set: it is swept over the same CoST grid as E1.2 and chosen
+    inside each fold on held-out participants (see _oof_ridge_selected), so RQ1 states one
+    convention for both probes. The lambda* actually used is reported per marker."""
     emb, pm = np.asarray(emb)[mask], pids[mask]
     Xm = Xs[mask]
-    amp, acro = cosinor_markers(np.asarray(cf)[mask], n_sensors, top_k)
-    IS = _interdaily_stability(Xm, int(round(24 * 60 / bin_minutes)))
+    AMP, ACRO, MESOR = cosinor_markers_per_channel(np.asarray(cf)[mask], n_sensors, top_k)
+    IS = _interdaily_stability(Xm, int(round(24 * 60 / bin_minutes)), per_channel=True)
+    names = ([str(s) for s in sensor_cols][:n_sensors] if sensor_cols is not None
+             else [f"ch{c}" for c in range(n_sensors)])
 
     n_groups = len(np.unique(pm))
     if n_groups < 3 or len(emb) < 20:
         return {}
-    cv = GroupKFold(n_splits=int(min(n_splits, n_groups)))
+    alphas = tuple(RIDGE_ALPHAS)
 
-    def oof(t):
-        pipe = make_pipeline(StandardScaler(), Ridge(alpha=10.0))
-        return cross_val_predict(pipe, emb, t, cv=cv, groups=pm)
+    def at_bound(lam):
+        """True = some fold chose a grid ENDPOINT, i.e. it wanted a penalty the grid does not
+        offer and the R2 beside it is a truncated answer. Same flag decomposition.py reports
+        for E1.2; extend the grid on that side before reading the number."""
+        return bool(len(alphas) > 1 and set(lam) & {float(alphas[0]), float(alphas[-1])})
+
+    def oof(F, target, ok):
+        """Nested-CV prediction over the FINITE rows only.
+
+        Restricting to `ok` is not cosmetic: a marker is NaN for a window whose cosinor fit did
+        not converge, and the previous version masked only when SCORING while still handing
+        those NaNs to the fit. The fold count follows the participants that survive the mask.
+        """
+        g = pm[ok]
+        cv = GroupKFold(n_splits=int(min(n_splits, len(np.unique(g)))))
+        return _oof_ridge_selected(F[ok], target[ok], g, cv, alphas, seed)
+
+    # The reference level. "R2 > 0" on its own says nothing here: these markers are computed
+    # FROM the raw window, so the raw window predicts them trivially. What licenses a claim
+    # about the ENCODER is the gain over the same probe run on a PCA of the raw window at the
+    # latent's own width -- reported as `gain_over_raw` on every latent row.
+    flat = Xm.reshape(len(Xm), -1)
+    spaces = {"": emb, " | raw PCA": PCA(n_components=min(emb.shape[1], *flat.shape),
+                                         random_state=seed).fit_transform(flat)}
 
     out = {}
-    for name, t in (("cosinor amplitude", amp), ("interdaily stability", IS)):
+    targets = [(f"{m} [{nm}]", kind, v[:, c])
+               for c, nm in enumerate(names)
+               for m, kind, v in (("cosinor amplitude", "linear", AMP),
+                                  ("cosinor MESOR", "linear", MESOR),
+                                  ("interdaily stability", "linear", IS),
+                                  ("acrophase", "circular", ACRO))]
+    for name, kind, t in targets:
         ok = np.isfinite(t)
-        if ok.sum() < 20 or np.std(t[ok]) == 0:
+        if ok.sum() < 20 or len(np.unique(pm[ok])) < 3:
             continue
-        pred = oof(t)
-        # R2 is reported alongside Pearson r on purpose. Out-of-fold R2 goes NEGATIVE whenever
-        # the fit is worse than the global mean, which is easy to hit with grouped folds and a
-        # few dozen participants, and a negative number is hard to read. r still says whether
-        # the marker is tracked, separately from whether the scale/offset generalise.
-        r = float(np.corrcoef(t[ok], pred[ok])[0, 1]) if np.std(pred[ok]) > 0 else float("nan")
-        out[name] = {"metric": "R2", "value": float(r2_score(t[ok], pred[ok])),
-                     "pearson_r": r,
-                     "n_windows": int(ok.sum()), "n_participants": n_groups}
-    ok = np.isfinite(acro)
-    if ok.sum() >= 20:
-        pred = np.arctan2(oof(np.sin(acro)), oof(np.cos(acro)))
-        err = np.angle(np.exp(1j * (pred[ok] - acro[ok])))     # wrapped to (-pi, pi]
-        out["acrophase"] = {"metric": "circular r",
-                            "value": _circ_corr(acro[ok], pred[ok]),
+        if kind == "linear" and np.std(t[ok]) == 0:            # dead channel: nothing to track
+            continue
+        if kind == "circular" and np.std(np.sin(t[ok])) == 0 and np.std(np.cos(t[ok])) == 0:
+            continue                                           # constant angle
+        common = {"n_windows": int(ok.sum()), "channel": name[name.index("[") + 1:-1],
+                  "n_participants": int(len(np.unique(pm[ok])))}
+        for tag, F in spaces.items():
+            key = name + tag
+            if kind == "linear":
+                pred, lam = oof(F, t[:, None], ok)
+                pred = pred[:, 0]
+                # R2 is reported alongside Pearson r on purpose. Out-of-fold R2 goes NEGATIVE
+                # whenever the fit is worse than the global mean, which is easy to hit with
+                # grouped folds and a few dozen participants, and a negative number is hard to
+                # read. r still says whether the marker is tracked, separately from whether the
+                # scale/offset generalise.
+                r = float(np.corrcoef(t[ok], pred)[0, 1]) if np.std(pred) > 0 else float("nan")
+                out[key] = {"metric": "R2", "value": float(r2_score(t[ok], pred)),
+                            "pearson_r": r, **common,
+                            "ridge_alpha_per_fold": lam, "ridge_alpha_at_bound": at_bound(lam)}
+            else:
+                # sin and cos are two outputs of ONE circular model, so they share a single
+                # lambda* on the joint criterion instead of drifting to two unrelated penalties.
+                P, lam = oof(F, np.c_[np.sin(t), np.cos(t)], ok)
+                pred = np.arctan2(P[:, 0], P[:, 1])
+                err = np.angle(np.exp(1j * (pred - t[ok])))    # wrapped to (-pi, pi]
+                out[key] = {"metric": "circular r", "value": _circ_corr(t[ok], pred),
                             "median_abs_err_hours": float(np.median(np.abs(err)) * 12 / np.pi),
-                            "n_windows": int(ok.sum()), "n_participants": n_groups}
+                            **common,
+                            "ridge_alpha_per_fold": lam, "ridge_alpha_at_bound": at_bound(lam)}
+        # the number that actually answers RQ1: what the ENCODER adds over the raw window
+        out[name]["gain_over_raw"] = out[name]["value"] - out[name + " | raw PCA"]["value"]
+
+    # The one defensible cross-channel summary: aggregate the ERROR, never the phase. An error
+    # of 1.4 h means the same thing whether the construct is sleep timing or HR timing, so a
+    # median over channels is interpretable -- whereas a median over the phases themselves is
+    # the quantity cosinor_markers exists to warn about.
+    ph = [v["median_abs_err_hours"] for k, v in out.items()
+          if k.startswith("acrophase [") and not k.endswith("raw PCA")]
+    if ph:
+        out["acrophase | median over channels"] = {
+            "metric": "median abs err (h)", "value": float(np.median(ph)),
+            "n_channels": len(ph)}
 
     if out:
         stem = f"rhythm_axis_probe_{table_tag}" if table_tag else "rhythm_axis_probe"
@@ -1332,10 +1488,20 @@ def rhythm_axis_probe(emb, Xs, mask, pids, bin_minutes, variant_dir, seed, cf,
                      if "median_abs_err_hours" in v
                      else (f"Pearson r = {v['pearson_r']:.3f}" if "pearson_r" in v else ""))
             lines.append(f"| {k} | {v['metric']} | {v['value']:.3f} | {extra} | "
-                         f"{v['n_windows']} | {v['n_participants']} |")
+                         f"{v.get('n_windows', '')} | {v.get('n_participants', '')} |")
         lines.append("\n*Out-of-fold Ridge from the latent, folds grouped by participant. "
                      "Markers come from the raw signal, not from the model or the label; "
                      "a mean predictor would score R2 = 0.*")
+        lines.append("\n*One row per (marker, CHANNEL): sleep, activity and heart rate are "
+                     "different chronobiological constructs with different acrophases -- sleep "
+                     "is roughly antiphase to the other two -- so pooling them into one angle "
+                     "would report a quantity with no referent. Treat the rows as a family and "
+                     "correct for multiplicity before calling one channel significant.*")
+        used = sorted({a for v in out.values() for a in v.get("ridge_alpha_per_fold", ())})
+        lines.append(f"\n*Ridge penalty selected INSIDE each fold on held-out participants -- "
+                     f"the same rule as E1.2 (CoST grid {alphas[0]:g} ... {alphas[-1]:g}, "
+                     f"minimising RMSE + MAE), never hand-set. lambda* used across folds and "
+                     f"markers: {', '.join(f'{a:g}' for a in used)}.*")
         (Path(variant_dir) / f"{stem}.md").write_text("\n".join(lines), encoding="utf-8")
     return out
 
@@ -1620,7 +1786,8 @@ def run_hrd_rhythm_analysis(model, X, y, pids, train_mask, test_mask, variant_di
         # the numeric counterpart of that figure: read the same markers back out of the latent
         axis_probe = rhythm_axis_probe(views["Full [V^(T);V^(S)]"], Xs, test_mask, pids,
                                        bin_minutes, variant_dir, seed, views[COSINOR_VIEW],
-                                       Xs.shape[-1], paper_cosinor_topk, table_tag=table_tag)
+                                       Xs.shape[-1], paper_cosinor_topk, table_tag=table_tag,
+                                       sensor_cols=sensor_cols)
         for k, v in axis_probe.items():
             print(f"[rhythm] axis probe  {k:<22} {v['metric']} = {v['value']:.3f}")
     except Exception as e:
