@@ -313,9 +313,7 @@ def main():
     ap.add_argument("--clock-off", help="run id WITHOUT the calendar channels (enables panel D)")
     ap.add_argument("--backbone", default="transformer",
                     help="backbone whose PE variants panel C compares")
-    # vit_plain ran at batch 4 against 64 for tcn/transformer, so at a fixed --iters budget it
-    # saw ~16x less data -- its comparison was never like-for-like.
-    ap.add_argument("--exclude", nargs="*", default=["vit_plain"],
+    ap.add_argument("--exclude", nargs="*", default=[],
                     help="backbones to drop from the study")
     ap.add_argument("--drop-seed", nargs="*", default=[], metavar="RUN:SEED",
                     help="drop one (run, seed) cell, e.g. a seed shared between two pooled runs")

@@ -10,7 +10,7 @@ of the survey):
   * learnable PE               -> diffuse / noisy (memorised per index)
   * RPE / eRPE / ConvSPE       -> banded (Toeplitz), translation-invariant
   * TUPE                       -> untied absolute position-position score
-  * Time2Vec / LFF (M-dim)     -> repeating diagonal bands at the (learned)
+  * Time2Vec                   -> repeating diagonal bands at the (learned)
                                   circadian period -- the visual signature of
                                   rhythmicity
 
@@ -23,10 +23,9 @@ a bias on the ``Q K^T`` score. So for each family we compute the position-
 position matrix in the way that faithfully reflects **how that exact module in
 this repo injects position** -- never a hand-wavy stand-in:
 
-  vector codes (sinusoidal, tape, learnable, time2vec, lff)
+  vector codes (sinusoidal, tape, learnable, time2vec)
       S = P P^T with P the ACTUAL code from the module
-      (``sinusoidal_pe`` / ``tape_pe`` / ``nn.Embedding`` / ``Time2VecPE`` /
-       ``LearnableFourierMultiDim``).
+      (``sinusoidal_pe`` / ``tape_pe`` / ``nn.Embedding`` / ``Time2VecPE``).
   rpe   S_{ij} = a_{i-j} . a_0   (autocorrelation of the learned relative-key
         embeddings ``PESelfAttention.rel_k`` across lags; Toeplitz by
         construction -- the content-free part of the Shaw-style term q.a_{i-j}).
@@ -49,7 +48,7 @@ reproducibility. train_hrd.py does not checkpoint the model, so init is what is
 available by default; pass ``--ckpt path/to/net_state_dict.pt`` (from
 ``cost.CoST.save``) to substitute the *trained* parameters of whichever PE that
 run used, or ``--illustrative`` to set the learnable-frequency encodings
-(Time2Vec / LFF / eRPE) to the circadian spectrum so the "learned" bands are
+(Time2Vec / eRPE) to the circadian spectrum so the "learned" bands are
 visible without training (clearly labelled in the panel titles).
 
 Examples
@@ -93,7 +92,6 @@ from models.positional_encoding import (          # noqa: E402
     Time2VecPE,
     PESelfAttention,
 )
-from models.encoder import LearnableFourierMultiDim  # noqa: E402
 
 
 # One-line "how the matrix is derived" tag per PE, shown under each panel title.
@@ -102,14 +100,13 @@ FAMILY = {
     "tape":       "additive absolute  |  S=P.P^T (length-aware sinusoid)",
     "learnable":  "additive absolute  |  S=P.P^T (nn.Embedding)",
     "time2vec":   "input-concat clock |  S=P.P^T, P=t2v(tau)",
-    "lff":        "additive intrinsic |  S=P.P^T, P=LFF[within-day, day]",
     "rpe":        "attention bias      |  S_ij=a_(i-j).a_0",
     "erpe":       "attention bias      |  S_ij=bias[i-j] (post-softmax)",
     "convspe":    "attention bias      |  S=E[q^pe_i.k^pe_j] (conv kernel)",
     "tupe":       "attention bias      |  S=p^Q_i.p^K_j (untied)",
     "tpe":        "hybrid              |  S=P.P^T (sinusoid anchor; +content Gauss.)",
 }
-DEFAULT_PES = ["sinusoidal", "tape", "learnable", "time2vec", "lff",
+DEFAULT_PES = ["sinusoidal", "tape", "learnable", "time2vec",
                "rpe", "erpe", "convspe", "tupe", "tpe"]
 
 
@@ -119,20 +116,6 @@ DEFAULT_PES = ["sinusoidal", "tape", "learnable", "time2vec", "lff",
 def gram(P: torch.Tensor) -> torch.Tensor:
     """S_ij = P_i . P_j  for a code matrix P of shape (L, d)."""
     return P @ P.t()
-
-
-def time_positions_2d(L: int, bins_per_day: int) -> torch.Tensor:
-    """Metric 2-D time position [within-day phase, day-of-week], each in [0,1).
-
-    Exact copy of ``ViT2DFeatureExtractor._time_positions`` (models/encoder.py)
-    so the LFF panel sees precisely the positions the model feeds it.
-    """
-    t = torch.arange(L, dtype=torch.float32)
-    bpd = float(bins_per_day)
-    within_day = torch.remainder(t, bpd) / bpd
-    n_days = max(1.0, L / bpd)
-    day = torch.div(t, bpd, rounding_mode="floor") / n_days
-    return torch.stack([within_day, day], dim=-1)          # (L, 2)
 
 
 def toeplitz_from_lags(g: torch.Tensor, L: int) -> torch.Tensor:
@@ -233,22 +216,6 @@ def _t2v_code(cfg, state, dim, n) -> torch.Tensor:
     return t2v(n, torch.device("cpu"), torch.float32)
 
 
-def _lff_module(cfg, state, d) -> LearnableFourierMultiDim:
-    """Learnable Fourier Features module, with the trained Wr/MLP if available."""
-    module = LearnableFourierMultiDim(d, n_dims=2, n_freqs=cfg.lf_freqs, gamma=cfg.lf_gamma)
-    if state is not None:
-        wr = find_param(state, "time_pe.Wr")
-        if wr is not None:
-            module.Wr.copy_(wr)
-            for i in (0, 2):                                 # mlp.0 / mlp.2 Linear
-                wk = find_param(state, f"time_pe.mlp.{i}.weight")
-                bk = find_param(state, f"time_pe.mlp.{i}.bias")
-                if wk is not None:
-                    module.mlp[i].weight.copy_(wk)
-                    module.mlp[i].bias.copy_(bk)
-    return module
-
-
 # ---------------------------------------------------------------------------
 # per-PE matrix builders (each returns an (L, L) numpy array)
 # ---------------------------------------------------------------------------
@@ -273,23 +240,6 @@ def build_matrix(pe: str, cfg, state: dict | None) -> np.ndarray:
     # ---- metric clock: Time2Vec ------------------------------------------
     if pe == "time2vec":
         return gram(_t2v_code(cfg, state, t2v_dim, L)).numpy()
-
-    # ---- metric multi-dim Learnable Fourier Features ----------------------
-    if pe == "lff":
-        module = _lff_module(cfg, state, d)
-        pos = time_positions_2d(L, cfg.bins_per_day)       # (L, 2)
-        if cfg.illustrative:
-            # Show the paper's shift-invariant kernel r_i.r_j directly with Wr
-            # rows aligned to daily / semidiurnal / weekly axes (labelled illustrative).
-            n_days = max(1.0, L / cfg.bins_per_day)
-            rows = [[2 * math.pi, 0.0], [4 * math.pi, 0.0], [6 * math.pi, 0.0],
-                    [0.0, 2 * math.pi * n_days], [0.0, 2 * math.pi * n_days / 7]]
-            Wr = torch.tensor(rows, dtype=torch.float32)
-            proj = pos @ Wr.t()
-            r = torch.cat([proj.cos(), proj.sin()], dim=-1) / math.sqrt(Wr.shape[0])
-            return gram(r).numpy()                         # raw Fourier kernel
-        P = module(pos)                                    # (L, d) injected code
-        return gram(P).numpy()
 
     # ---- attention-family: need a real PESelfAttention module -------------
     attn = PESelfAttention(pe if pe != "tpe" else "tpe", d, cfg.n_heads, cfg.max_len)
@@ -398,10 +348,6 @@ def build_encoding_map(pe: str, cfg, state: dict | None):
     if pe == "time2vec":
         return (_t2v_code(cfg, state, t2v_dim, P).numpy(), ypos,
                 "Time2Vec dim (0 = linear, 1+ = sines)", "t2v(tau), concatenated to input", False)
-    if pe == "lff":
-        pos = time_positions_2d(P, cfg.bins_per_day)
-        return (_lff_module(cfg, state, d)(pos).numpy(), ypos, xdim,
-                "LFF[within-day, day-of-week] code", False)
     if pe == "tpe":
         return sinusoidal_pe(P, d, cpu, f32).numpy(), ypos, xdim, "sinusoidal anchor (+ content Gaussian, not shown)", False
 
@@ -455,7 +401,7 @@ ENCMAP_METHODS = ["sinusoidal", "tape", "learnable", "time2vec", "tupe",
                   "rpe", "erpe", "convspe"]
 # Display name of every encoding, used by all four figure modes.
 TITLES = {"sinusoidal": "Sinusoidal", "tape": "tAPE", "learnable": "Learnable",
-          "time2vec": "Time2Vec", "lff": "LFF", "tupe": "TUPE", "tpe": "T-PE",
+          "time2vec": "Time2Vec", "tupe": "TUPE", "tpe": "T-PE",
           "rpe": "RPE", "erpe": "eRPE", "convspe": "ConvSPE"}
 
 
@@ -763,14 +709,12 @@ def main():
     ap.add_argument("--repr-dims", type=int, default=320)
     ap.add_argument("--time2vec-dim", type=int, default=16)
     ap.add_argument("--n-heads", type=int, default=8)
-    ap.add_argument("--lf-freqs", type=int, default=None)
-    ap.add_argument("--lf-gamma", type=float, default=1.0)
     ap.add_argument("--layer", type=int, default=0,
                     help="which transformer layer's attn params to read from --ckpt")
     ap.add_argument("--spe-realizations", type=int, default=512,
                     help="R for the ConvSPE kernel estimate (higher = smoother)")
     ap.add_argument("--illustrative", action="store_true",
-                    help="pin Time2Vec/LFF/eRPE frequencies to the circadian spectrum")
+                    help="pin Time2Vec/eRPE frequencies to the circadian spectrum")
     ap.add_argument("--mark-period", action="store_true",
                     help="overlay dotted lines every bins-per-day lags")
     ap.add_argument("--ckpt", default=None,
