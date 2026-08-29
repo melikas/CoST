@@ -51,8 +51,31 @@ def generate_binomial_mask(B, T, p=0.5):
 SUPPORTED_MASK_MODES = ('none', 'binomial', 'continuous')
 
 
+def seasonal_band_edges(length, bins_per_day):
+    """rFFT bin ranges bracketing the weekly fundamental and the first circadian harmonics.
+
+    D = length // bins_per_day is the 24 h bin (7 for a 672-step window at 96 bins/day), so the
+    harmonics sit at D, 2D, 3D, 4D. Each band spans the midpoints between neighbouring
+    harmonics, so every meaningful period gets its own weights and nothing is double-counted.
+    Falls back to a single full-spectrum band when the window is too short to resolve them,
+    which reproduces the original layer exactly.
+    """
+    total = (length // 2) + 1
+    D = max(1, length // int(bins_per_day))
+    if 4 * D >= total or D < 2:
+        return [(0, total)]
+    edges, centres = [], [D, 2 * D, 3 * D, 4 * D]
+    edges.append((1, (centres[0] + centres[1]) // 2))          # weekly fundamental + 24 h
+    for i in range(1, len(centres)):
+        lo = (centres[i - 1] + centres[i]) // 2
+        hi = ((centres[i] + centres[i + 1]) // 2 if i + 1 < len(centres)
+              else centres[i] + (centres[i] - centres[i - 1]) // 2)
+        edges.append((lo, min(hi, total)))
+    return edges
+
+
 class BandedFourierLayer(nn.Module):
-    def __init__(self, in_channels, out_channels, band, num_bands, length=201):
+    def __init__(self, in_channels, out_channels, band, num_bands, length=201, bounds=None):
         super().__init__()
 
         self.length = length
@@ -64,10 +87,17 @@ class BandedFourierLayer(nn.Module):
         self.band = band  # zero indexed
         self.num_bands = num_bands
 
-        self.num_freqs = self.total_freqs // self.num_bands + (self.total_freqs % self.num_bands if self.band == self.num_bands - 1 else 0)
-
-        self.start = self.band * (self.total_freqs // self.num_bands)
-        self.end = self.start + self.num_freqs
+        if bounds is None:
+            # Equal split of the whole spectrum -- the original behaviour.
+            self.num_freqs = self.total_freqs // self.num_bands + (self.total_freqs % self.num_bands if self.band == self.num_bands - 1 else 0)
+            self.start = self.band * (self.total_freqs // self.num_bands)
+            self.end = self.start + self.num_freqs
+        else:
+            # Explicit edges, so a band can be anchored on a physiological period rather than
+            # on an arbitrary equal division of the spectrum.
+            self.start, self.end = int(bounds[0]), min(int(bounds[1]), self.total_freqs)
+            assert 0 <= self.start < self.end <= self.total_freqs, (bounds, self.total_freqs)
+            self.num_freqs = self.end - self.start
 
 
         # case: from other frequencies
@@ -150,7 +180,7 @@ class CoSTEncoder(nn.Module):
                  hidden_dims=64, depth=10,
                  mask_mode='none', backbone='tcn', pe='sinusoidal',
                  n_time_features=0, time2vec_dim=65, disentangle=True,
-                 bins_per_day=96, mask_prob=0.5):
+                 bins_per_day=96, mask_prob=0.5, seasonal_bands='harmonics'):
         super().__init__()
 
         component_dims = output_dims // 2
@@ -242,8 +272,31 @@ class CoSTEncoder(nn.Module):
             self.tfd = nn.ModuleList(
                 [nn.Conv1d(output_dims, component_dims, k, padding=k-1) for k in kernels]
             )
+            # Bands anchored on the circadian harmonics rather than one band over the whole
+            # spectrum. At bins_per_day=96 and length=672, D=7 is the 24 h bin, so the bands
+            # below bracket the weekly fundamental, 24 h, 12 h, and 8/6 h. Bins above 4D are
+            # deliberately excluded: they are sub-6h content, which this project's hypothesis
+            # (x = trend + seasonal + noise) treats as noise, so it belongs in the residual and
+            # not in the seasonal component. `seasonal_bands` records the layout, since each
+            # band now owns a fixed slice of V^(S).
+            # 'harmonics' (default) anchors one band per circadian harmonic; 'single' is the
+            # ONE full-spectrum band this layer had before banding existed. The choice is
+            # explicit because it changes the architecture, and every run in results_hrd/ from
+            # before the banding commit is 'single' -- a sweep meant to reproduce one of those
+            # must be able to ask for it rather than silently training a different model.
+            assert seasonal_bands in ("harmonics", "single"), seasonal_bands
+            self.seasonal_bands = (seasonal_band_edges(length, bins_per_day)
+                                   if seasonal_bands == "harmonics"
+                                   else [(0, (length // 2) + 1)])
+            nb = len(self.seasonal_bands)
+            # Split component_dims across the bands so V^(S) keeps its contracted width; the
+            # last band absorbs the remainder.
+            widths = [component_dims // nb] * nb
+            widths[-1] += component_dims - sum(widths)
+            self.seasonal_widths = widths
             self.sfd = nn.ModuleList(
-                [BandedFourierLayer(output_dims, component_dims, b, 1, length=length) for b in range(1)]
+                [BandedFourierLayer(output_dims, w, b, nb, length=length, bounds=bd)
+                 for b, (bd, w) in enumerate(zip(self.seasonal_bands, widths))]
             )
 
     def forward(self, x, tcn_output=False, mask=None):  # x: B x T x input_dims
@@ -333,10 +386,9 @@ class CoSTEncoder(nn.Module):
 
         x = x.transpose(1, 2)  # B x T x Co
 
-        season = []
-        for mod in self.sfd:
-            out = mod(x)  # b t d
-            season.append(out)
-        season = season[0]
+        # Concatenate the per-band outputs: with one band this is the original single output,
+        # with several each band contributes its own slice of V^(S).
+        season = [mod(x) for mod in self.sfd]
+        season = season[0] if len(season) == 1 else torch.cat(season, dim=-1)
 
         return trend, self.repr_dropout(season)

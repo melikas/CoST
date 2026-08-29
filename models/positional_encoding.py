@@ -281,6 +281,13 @@ class ConvSPE(nn.Module):
         return a * qbar + b * eps, a * kbar + b * eps
 
 
+# Shaw et al. 2018 use k=16, tuned for sentences. At 15-min bins that clips relative position
+# at 4 h, so every offset beyond it -- including the 24 h period this project exists to model
+# (96 bins) -- collapses onto the same embedding, leaving >95% of a 672-step window's pairs
+# positionally indistinguishable. 96 makes the horizon exactly one day.
+RPE_CLIP_K = 96
+
+
 class PESelfAttention(nn.Module):
     """Multi-head self-attention with a swappable positional-encoding mechanism.
 
@@ -290,7 +297,7 @@ class PESelfAttention(nn.Module):
     """
 
     def __init__(self, method, d_model, n_heads, max_len,
-                 dropout=0.1, conv_kernel=15, spe_realizations=16, rpe_clip_k=16):
+                 dropout=0.1, conv_kernel=15, spe_realizations=16, rpe_clip_k=RPE_CLIP_K):
         super().__init__()
         assert d_model % n_heads == 0, "d_model must be divisible by n_heads"
         self.method = method
@@ -305,7 +312,7 @@ class PESelfAttention(nn.Module):
         self.proj = nn.Linear(d_model, d_model)
         self.drop = nn.Dropout(dropout)
         if method == "rpe":
-            # Shaw et al. 2018 Sec. 3.2: clip(x, k) = max(-k, min(k, x)), k = 16.
+            # Shaw et al. 2018 Sec. 3.2: clip(x, k) = max(-k, min(k, x)); k = RPE_CLIP_K.
             # Both a^K (Eq. 4) and a^V (Eq. 3), shared across heads, unique per layer.
             self.clip_k = rpe_clip_k
             self.rel_k = nn.Parameter(torch.empty(2 * rpe_clip_k + 1, self.dh))

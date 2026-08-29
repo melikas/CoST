@@ -24,6 +24,7 @@ this script emits the per-variant row it needs.
   python experiment_q1.py --variant-dir results_hrd/<run>/<backbone>_<pe>_seed<S>
 """
 import argparse
+from tasks.rq_paths import rq_path
 import json
 import traceback
 
@@ -168,14 +169,14 @@ def main():
     # --- E1.2 headline + full DRS report (own-branch / leak / DIS) -----------------------
     # train_hrd.py already runs this with the SAME masks and the same validation-selected
     # penalty unless --no-rhythm-viz was passed, so reuse it rather than pay for it twice.
-    prev = ctx.variant_dir / "decomposition_recovery.json"
+    prev = rq_path(ctx.variant_dir, "decomposition_recovery.json")
     if prev.exists() and not a.force_drs:
         agg = json.loads(prev.read_text(encoding="utf-8"))
         print(f"[rq1] reusing the DRS train_hrd.py already wrote -> {prev.name}")
     else:
         agg = run_decomposition_recovery(
             ctx.model, ctx.X, ctx.train_mask, ctx.test_mask, d,
-            seq_len=ctx.seq_len, bin_minutes=ctx.bin_minutes, sensor_cols=ctx.sensor_cols,
+            bin_minutes=ctx.bin_minutes, sensor_cols=ctx.sensor_cols,
             seed=ctx.seed, val_mask=ctx.val_mask, pids=ctx.pids)
     res["decomposition"] = agg
     print(f"[rq1] Full->tau={agg['rec_full_trend']:.3f} Full->sigma={agg['rec_full_rhythm']:.3f} "
@@ -222,8 +223,8 @@ def main():
             # Ctrl family: same SSL, disentangler OFF. Headline recovery only -- with one
             # branch there is nothing to leak between, so DIS is undefined, not zero.
             plain = plain_ssl_encoder(ctx.X, ctx.pretrain_mask, ctx.cfg, ctx.n_sensors,
-                                      ctx.device, seed=ctx.seed,
-                                      cache_path=ctx.variant_dir / "plain_encoder.pt")
+                                      ctx.device, seed=ctx.seed, pids=ctx.pids,
+                                      cache_path=rq_path(ctx.variant_dir, "plain_encoder.pt"))
             res["controls"]["plain_ssl"] = dict(zip(
                 ("Full->tau", "Full->sigma"),
                 headline(plain, ctx.X, tau, sig, fit, sel, ctx.test_mask, plain=True)))
@@ -286,8 +287,32 @@ def main():
     else:
         Xs = ctx.X[:, :, :ctx.n_sensors]
         try:
+            # pids=None ON PURPOSE -- and this is the one place it differs from
+            # experiment_q3.py:166, which passes pids and is right to.
+            #
+            # With `pids`, paper_cosinor_features applies the Bingham et al. 1982
+            # population-mean cosinor: one vector per participant, broadcast back over that
+            # participant's rows. For q3 that is correct -- the depression label is
+            # participant-level, so a participant-level rhythm summary is the matching unit.
+            #
+            # For E1.3 it is wrong twice over. (1) Resolution: the probe would fit 876 test
+            # windows against only 36 distinct target values -- pseudo-replication, exactly
+            # what design doc 0.1 rule 4 forbids. (2) Construct: with a participant-constant
+            # target, a representation that merely encodes WHO the person is scores well,
+            # because identity determines the target exactly. The per-window target turns the
+            # question into "does THIS window's embedding encode THIS window's rhythm
+            # parameters", which is the claim E1.3 is supposed to license.
+            #
+            # A window-level cosinor parameter is not a modelling convenience either: RQ2's
+            # convergent validity is built on within-person, between-window drift in acrophase
+            # and amplitude (experiment_q2.py rolls its own single-harmonic fit for precisely
+            # this reason), and it measures rho ~ 0.14 at p < 1e-9. Those markers demonstrably
+            # vary inside a participant, so collapsing them here was internally inconsistent.
+            #
+            # Free: the cache stores the PRE-aggregation per-window fits (the aggregation runs
+            # after _save_cache), so dropping it costs no CosinorPy time.
             cf = paper_cosinor_features(Xs, ctx.bin_minutes, need_mask=ctx.test_mask,
-                                        window_ids=ctx.window_ids, pids=ctx.pids,
+                                        window_ids=ctx.window_ids, pids=None,
                                         cache_path=d / "cosinor_cache.npz")
             out = rhythm_axis_probe(
                 encode(ctx.model, ctx.X, ctx.cfg), Xs, ctx.test_mask, ctx.pids,

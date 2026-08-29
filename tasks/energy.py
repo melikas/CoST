@@ -1,26 +1,20 @@
 """Emotional-energy probes on a frozen CoST representation.
 
-Library first, runnable second::
-
-    python -m tasks.energy --sensor-csv datasets/HRD_RAW_MinuteLevel.csv \
-        --output-dir results_hrd_energy --run-id local
-
-``run_energy_tasks`` takes an already-fitted model and returns / writes metrics; it is
-shared with ``train_hrd.py --energy-probe`` so both paths probe identically. ``main``
-below only adds the pretraining and the argument wiring.
+A library, with no entry point of its own: ``run_energy_tasks`` takes an already-fitted model
+and returns / writes the metrics. Both callers -- ``train_hrd_energy.py`` (pretrain, then
+probe) and ``train_hrd.py --energy-probe`` (reuse the depression run's encoder) -- go through
+it, so the two paths probe identically.
 """
 
-import argparse
 import json
-import time
 
 import numpy as np
 from scipy.stats import rankdata, spearmanr
-from sklearn.linear_model import LogisticRegression, Ridge
+from sklearn.linear_model import Ridge
 from sklearn.pipeline import make_pipeline
 from sklearn.preprocessing import StandardScaler
 
-from tasks._eval_protocols import (best_threshold, binary_metrics,
+from tasks._eval_protocols import (best_threshold, binary_metrics, make_probe,
                                    participant_bootstrap_auc)
 
 # Imported inside main() rather than here: tasks/ is a library first, and these pull in
@@ -52,9 +46,7 @@ def handcrafted_features(X, n_sensors):
 # probes (window-level metrics; split is by participant)
 # --------------------------------------------------------------------------- #
 def probe_binary(feat, ybin, tr, va, te, seed, te_pids=None):
-    clf = make_pipeline(StandardScaler(),
-                        LogisticRegression(C=1.0, max_iter=3000,
-                                           class_weight="balanced", random_state=seed))
+    clf = make_probe("supervised", 1.0, seed)
     clf.fit(feat[tr], ybin[tr])
     thr = best_threshold(ybin[va], clf.predict_proba(feat[va])[:, 1])
     prob = clf.predict_proba(feat[te])[:, 1]
@@ -131,7 +123,7 @@ def regression_table(title, rows):
 
 def run_energy_tasks(model, X, ee, pids, n_sensors, tr, va, te,
                      pool, energy_threshold, seed, out_dir, mode_desc, config,
-                     season_pool=None, ee_win=None, extra_reprs=None):
+                     season_pool=None, ee_win=None, extra_reprs=None, supervised_fn=None):
     """Encode X with the FROZEN `model` and run the 3 emotional-energy tasks on the given
     participant-level masks (tr/va/te), writing report.md + metrics.json to out_dir.
 
@@ -148,7 +140,7 @@ def run_energy_tasks(model, X, ee, pids, n_sensors, tr, va, te,
     # against the SAME comparison set; the caller builds them because only it has the config.
     reps = {"Handcrafted (mean/std)": hc}
     reps.update(extra_reprs or {})
-    reps["CoST (SSL repr)"] = reprs
+    reps["DSSL (SSL repr)"] = reprs
 
     y_reg = ee
     y_hi = (ee >= energy_threshold).astype(int)                                 # task 1
@@ -166,12 +158,30 @@ def run_energy_tasks(model, X, ee, pids, n_sensors, tr, va, te,
     # Participants of the test rows: the unit the bootstrap CI resamples, because a person's
     # ~150 sliding windows overlap by six days and are not independent observations.
     tep = pids[te]
+    # Top rung of the design's ladder: end-to-end supervised, which sees the labels the frozen
+    # probes never do and is therefore a CEILING, not a competitor. Built by the caller --
+    # this module deliberately does not import torch (see the header note), and only the
+    # caller holds the backbone/dims/device. Binary tasks only: the rung is a BCE classifier,
+    # so it has no meaning for the ordinal-regression tasks 2 and 4, and inventing a
+    # regression variant would make the two ladders non-comparable.
+    def _sup(ybin, tag):
+        if supervised_fn is None:
+            return []
+        try:
+            return [("Supervised (end-to-end)", supervised_fn(ybin, tr, va, te, tep, tag))]
+        except Exception as e:      # never let the ceiling rung take the whole probe down
+            print(f"[energy] supervised rung SKIPPED for {tag} (non-fatal): "
+                  f"{type(e).__name__}: {e}")
+            return []
+
     t1 = ([("Majority (chance)", majority_binary(y_hi, tr, te, tep))]
-          + [(n, probe_binary(R, y_hi, tr, va, te, seed, tep)) for n, R in reps.items()])
+          + [(n, probe_binary(R, y_hi, tr, va, te, seed, tep)) for n, R in reps.items()]
+          + _sup(y_hi, "task1_high_energy"))
     t2 = ([("Mean predictor", mean_regression(y_reg, tr, te))]
           + [(n, probe_regression(R, y_reg, tr, te, tep)) for n, R in reps.items()])
     t3 = ([("Majority (chance)", majority_binary(y_wp, tr, te, tep))]
-          + [(n, probe_binary(R, y_wp, tr, va, te, seed, tep)) for n, R in reps.items()])
+          + [(n, probe_binary(R, y_wp, tr, va, te, seed, tep)) for n, R in reps.items()]
+          + _sup(y_wp, "task3_within_person"))
 
     # Tasks 4-5: the SAME input scored against a window-matched target (mean EE over the
     # days the window spans) instead of EE on its last day alone. Tasks 1-3 keep the
@@ -214,8 +224,8 @@ def run_energy_tasks(model, X, ee, pids, n_sensors, tr, va, te,
         f"are correlated, so the independent unit is the participant.\n"
         f"- Labelled probe windows: {int(lab.sum()):,} of {len(ee):,} "
         f"(test = {int(te.sum()):,} windows).\n\n"
-        f"{tbl1}\n{tbl2}\n{tbl3}\n"
-        f"_A representation is useful when CoST beats both the majority/mean baseline "
+        f"{tbl1}\n{tbl2}\n{tbl3}\n{tbl45}"
+        f"_A representation is useful when DSSL beats both the majority/mean baseline "
         f"and the handcrafted mean/std summary._\n"
     )
     (out_dir / "report.md").write_text(report, encoding="utf-8")
@@ -233,101 +243,3 @@ def run_energy_tasks(model, X, ee, pids, n_sensors, tr, va, te,
     print("\n" + report)
     print(f"[energy] saved -> {out_dir/'report.md'} , {out_dir/'metrics.json'}")
     return metrics
-
-# --------------------------------------------------------------------------- #
-# CLI: python -m tasks.energy --sensor-csv ... --output-dir ... --run-id ...
-# --------------------------------------------------------------------------- #
-def parse_args():
-    p = argparse.ArgumentParser(description="Emotional-energy probe on CoST representations")
-    p.add_argument("--sensor-csv", required=True)
-    p.add_argument("--backbone", default="transformer",
-                   choices=["tcn", "transformer"])
-    p.add_argument("--pe", default=None)
-    p.add_argument("--pool", choices=["last", "mean", "max", "meanmax"], default="last",
-                   help="How the 7-day representation is collapsed before the probe. "
-                        "'last' (default) = final timestep, closest to the labelled day.")
-    p.add_argument("--season-pool", choices=["spec", "spec_amp", "spec_phase", "same"],
-                   default="spec",
-                   help="Readout of the SEASONAL half only; see train_hrd.py --season-pool. "
-                        "'same' = use --pool for it too (the DC/MESOR-only ablation).")
-    p.add_argument("--energy-threshold", type=float, default=4.0,
-                   help="EE >= this = 'high-energy day' (default 4 -> ~47%% positive, balanced).")
-    p.add_argument("--window-hours", type=int, default=168)
-    p.add_argument("--bin-minutes", type=int, default=15)
-    p.add_argument("--val-frac", type=float, default=0.15)
-    p.add_argument("--test-frac", type=float, default=0.25)
-    p.add_argument("--repr-dims", type=int, default=320)
-    p.add_argument("--hidden-dims", type=int, default=64)
-    p.add_argument("--depth", type=int, default=10)
-    p.add_argument("--iters", type=int, default=None)
-    p.add_argument("--epochs", type=int, default=None)
-    p.add_argument("--batch-size", type=int, default=64)
-    p.add_argument("--lr", type=float, default=1e-3)
-    p.add_argument("--seed", type=int, default=42)
-    p.add_argument("--gpu", type=int, default=0)
-    p.add_argument("--output-dir", default="./results_hrd_energy")
-    p.add_argument("--run-id", default="local")
-    return p.parse_args()
-
-
-def main():
-    from pathlib import Path
-
-    from cost import CoST
-    from data_processing.data_preprocessing import prepare_hrd_energy_sliding
-    from train_hrd import paper_kernels
-    from utils import init_dl_program
-
-    args = parse_args()
-    if args.pe is None:
-        args.pe = "sinusoidal" if args.backbone == "transformer" else "none"
-    device = init_dl_program(args.gpu if args.gpu >= 0 else "cpu", seed=args.seed)
-    t0 = time.time()
-
-    # 1. data: SLIDING trailing windows -- one 7-day window per labelled day ([D-6, D] ->
-    # EE(D)), stride 1 day (Day1-7->EE7, Day2-8->EE8, ...). X / ee / pids = PROBE windows;
-    # X_pre / pids_pre = the label-free non-overlapping PRETRAIN windows (same CSV read).
-    data = prepare_hrd_energy_sliding(args.sensor_csv, window_hours=args.window_hours,
-                                      bin_minutes=args.bin_minutes)
-    X, ee, pids = data["X"], data["ee"], data["pids"]
-    X_pre, pids_pre = data["X_pretrain"], data["pids_pretrain"]
-    n_sensors = data["n_sensors"]
-    lab = np.isfinite(ee)                                   # windows with a last-day EE label
-    pids_with_label = set(pids[lab])
-
-    # 2. participant-level split -----------------------------------------------------
-    tr_pids, va_pids, te_pids = split_pids(pids_with_label, args.seed,
-                                           args.val_frac, args.test_frac)
-    tr = np.isin(pids, list(tr_pids)) & lab
-    va = np.isin(pids, list(va_pids)) & lab
-    te = np.isin(pids, list(te_pids)) & lab
-    pretrain_mask = ~np.isin(pids_pre, list(te_pids))      # label-free; excludes test pids only
-    print(f"[split] participants: {len(tr_pids)} train / {len(va_pids)} val / {len(te_pids)} test")
-    print(f"[split] labelled probe windows: {int(tr.sum())} train / {int(va.sum())} val / "
-          f"{int(te.sum())} test | pretrain windows: {int(pretrain_mask.sum())}")
-
-    # 3. CoST self-supervised pretraining (unchanged; label-free) --------------------
-    seq_len = X.shape[1]
-    model = CoST(input_dims=X.shape[-1], n_time_features=X.shape[-1] - n_sensors,
-                 kernels=paper_kernels(seq_len), alpha=0.0005, max_train_length=seq_len,
-                 output_dims=args.repr_dims, hidden_dims=args.hidden_dims, depth=args.depth,
-                 backbone=args.backbone, pe=args.pe,
-                 bins_per_day=(24 * 60 // args.bin_minutes),
-                 device=device, lr=args.lr, batch_size=args.batch_size)
-    print(f"[pretrain] backbone={args.backbone} pe={args.pe} on {int(pretrain_mask.sum())} windows ...")
-    model.fit(X_pre[pretrain_mask], n_epochs=args.epochs, n_iters=args.iters, verbose=True)
-
-    # 4. freeze -> encode -> 3 energy tasks -> report (shared with train_hrd --energy-probe)
-    mode_desc = ("**Sliding trailing windows**: one 7-day window per labelled day "
-                 "([D-6, D] -> EE(D)), stride 1 day; windows overlap by 6 days, split stays "
-                 "participant-level so test is out of pretraining.")
-    out = Path(args.output_dir) / args.run_id / f"{args.backbone}_{args.pe}_seed{args.seed}"
-    run_energy_tasks(model, X, ee, pids, n_sensors, tr, va, te,
-                     args.pool, args.energy_threshold, args.seed, out, mode_desc, vars(args),
-                     season_pool=None if args.season_pool == "same" else args.season_pool,
-                     ee_win=data.get("ee_win"))
-    print(f"total time = {(time.time() - t0) / 60:.1f} min")
-
-
-if __name__ == "__main__":
-    main()

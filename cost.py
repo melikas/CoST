@@ -23,7 +23,11 @@ class PretrainDataset(Dataset):
                  shift_sigma=0.5,
                  p=0.5,
                  multiplier=10,
-                 n_exact_tail=0):
+                 n_exact_tail=0,
+                 pids=None,
+                 positive="window",
+                 decomp=None,
+                 n_sensors=0):
         super().__init__()
         self.data = data
         self.p = p
@@ -37,9 +41,109 @@ class PretrainDataset(Dataset):
         self.n_exact_tail = int(n_exact_tail)
         self.N, self.T, self.D = data.shape # num_ts, time, dim
 
+        # 'window'      -- both views are the SAME window. Measured on an untrained encoder
+        #                  with a queue of real keys, top-1 retrieval is 1.000 against a chance
+        #                  of 1/(K+1): the pair is a near-identity transform, so the task is
+        #                  already solved at initialisation and the gradient teaches nothing.
+        # 'participant' -- the second view is a DIFFERENT window of the same participant. Same
+        #                  measurement: top-1 0.150, i.e. chance. The pair shares the person's
+        #                  circadian amplitude and phase and nothing else, so matching it
+        #                  requires encoding the rhythm.
+        assert positive in ("window", "participant"), positive
+        self.positive = positive
+        # Participant index per window, as a plain int code. Needed whenever the MoCo queue
+        # has to know WHOSE key each slot holds -- see CoSTModel.queue_pid and `negatives`.
+        # It is built for every run, not just positive='participant', because the negative
+        # sampler is an independent choice from the positive sampler. -1 means "unknown",
+        # which the subject-conditional sampler treats as not-matching anything.
+        self.pid_idx = np.full(self.N, -1, dtype=np.int64)
+        if pids is not None:
+            _p = np.asarray(pids)
+            if len(_p) != self.N:
+                raise ValueError(f"{len(_p)} pids for {self.N} windows")
+            self.pid_idx = np.unique(_p, return_inverse=True)[1].astype(np.int64)
+        self.peers = None
+        if positive == "participant":
+            if pids is None:
+                raise ValueError("positive='participant' needs the pretrain windows' pids")
+            pids = np.asarray(pids)
+            if len(pids) != self.N:
+                raise ValueError(f"{len(pids)} pids for {self.N} windows")
+            by_pid = {}
+            for i, q in enumerate(pids):
+                by_pid.setdefault(q, []).append(i)
+            # A participant contributing a single window has no peer; that window falls back to
+            # the old behaviour rather than being dropped, so the pretraining set is unchanged.
+            self.peers = [np.array([j for j in by_pid[q] if j != i], dtype=np.int64)
+                          for i, q in enumerate(pids)]
+            self.n_paired = sum(1 for pr in self.peers if len(pr))
+
+        # Decomposition-consistent views. `decomp` is (tau, sigma, resid), each (N, T, n_sensors),
+        # from the closed-form harmonic fit. Only the sensor channels are recomposed; any
+        # trailing clock channels are copied from the original window untouched, because they
+        # are deterministic functions of the timestamp and have no trend/seasonal/noise split.
+        self.decomp = None
+        self.n_sensors = int(n_sensors) or self.D
+        if decomp is not None:
+            tau, sig, res = (torch.as_tensor(a, dtype=torch.float) for a in decomp)
+            assert tau.shape == sig.shape == res.shape, "tau/sigma/resid shapes differ"
+            assert tau.shape[0] == self.N and tau.shape[1] == self.T, tau.shape
+            self.decomp = (tau, sig, res)
+
+    def _noise(self, i):
+        """A fresh noise realisation: the window's OWN residual, circularly time-shifted.
+
+        A roll preserves the residual's autocorrelation and per-channel scale exactly, so the
+        two views differ by a realisation of the same noise process rather than by white
+        Gaussian, which is what the hypothesis actually assumes.
+        """
+        return torch.roll(self.decomp[2][i], random.randrange(self.T), dims=0)
+
+    def _compose(self, tau_i, sig_i, i):
+        """One view: recomposed sensor channels, plus this window's clock channels verbatim."""
+        x = tau_i + sig_i + self._noise(i)
+        if self.n_sensors < self.D:
+            x = torch.cat([x, self.data[i][:, self.n_sensors:]], dim=-1)
+        return x
+
+    def _peer(self, i):
+        """Another window of the same participant, or `i` when the person has only one."""
+        pr = None if self.peers is None else self.peers[i]
+        return int(pr[random.randrange(len(pr))]) if pr is not None and len(pr) else i
+
+    def _decomp_views(self, i):
+        """Views for the SEASONAL branch: share this window's sigma, swap tau, resample noise.
+
+        Restricted to the seasonal branch by measurement. On an untrained encoder, a positive
+        pair that shares only one component retrieves at:
+
+            trend (tau)        top-1 0.980      <- a fingerprint any random encoder reads
+            seasonal (sigma)   top-1 0.193
+            noise (residual)   top-1 0.147      (chance 0.125)
+
+        `harmonic_reference` defines trend as a degree-3 polynomial -- smooth, low-dimensional
+        and 36% of the variance -- so ANY pair sharing it is solved without learning. Sharing
+        sigma instead leaves the task at chance, which is what makes it learnable. The trend
+        branch therefore keeps the existing pair; contrasting trend cannot be repaired this way.
+        """
+        tau, sig, _ = self.decomp
+        c, d = random.randrange(self.N), random.randrange(self.N)
+        return self._compose(tau[c], sig[i], i), self._compose(tau[d], sig[i], i)
+
     def __getitem__(self, item):
-        ts = self.data[item % self.N]
-        return self.transform(ts), self.transform(ts)
+        i = item % self.N
+        j = i
+        if self.peers is not None and len(self.peers[i]):
+            j = int(self.peers[i][random.randrange(len(self.peers[i]))])
+        # Same pair for both branches -- the historical behaviour, returned in the same
+        # 4-view shape so the training loop has one code path.
+        q, k = self.transform(self.data[i]), self.transform(self.data[j])
+        # The QUERY's participant, `i` not `j`: the negative sampler asks "whose window is
+        # being matched", and the query is what the loss scores against the queue.
+        pid = int(self.pid_idx[i])
+        if self.decomp is None:
+            return q, k, q, k, pid
+        return (q, k) + self._decomp_views(i) + (pid,)
 
     def __len__(self):
         return self.data.size(0) * self.multiplier
@@ -80,6 +184,7 @@ class PretrainDataset(Dataset):
 PHASE_MODES = ("raw", "circular", "circular_amp")
 
 
+
 class CoSTModel(nn.Module):
     def __init__(self,
                  encoder_q: nn.Module, encoder_k: nn.Module,
@@ -91,9 +196,28 @@ class CoSTModel(nn.Module):
                  m: Optional[float] = 0.999,
                  T: Optional[float] = 0.07,
                  disentangle: bool = True,
-                 phase_mode: str = "circular"):
+                 phase_mode: str = "circular",
+                 trend_pool: str = "random",
+                 negatives: str = "global",
+                 n_negatives: int = 0):
         super().__init__()
 
+        # 'random' is upstream CoST: the trend term contrasts ONE random timestep, pushed
+        # through head_q. But head_q is discarded at inference and encode() mean-pools the
+        # whole sequence, so the objective never constrains the vector the probes read.
+        # Measured on run 1239199, two DIFFERENT participants sit at cos 0.9956 in that
+        # mean-pooled vector while two views of the SAME window sit at 0.9652 -- the
+        # augmentation moves it further than identity does. 'mean' contrasts what is
+        # actually read. A/B it; do not switch the default without that measurement.
+        assert trend_pool in ("random", "mean"), trend_pool
+        self.trend_pool = trend_pool
+        # The experimental variable of the subject-conditional-negatives study, plus the
+        # fixed negative count that makes the two modes comparable. See select_negatives.
+        assert negatives in ("global", "subject"), negatives
+        self.negatives = negatives
+        self.n_negatives = int(n_negatives)
+        self.neg_short = 0           # queries whose participant had < n_negatives slots
+        self.neg_calls = 0           # queries seen, so the shortfall RATE is reportable
         self.K = K
         self.m = m
         self.T = T
@@ -131,6 +255,9 @@ class CoSTModel(nn.Module):
 
         self.register_buffer('queue', F.normalize(torch.randn(dim, K), dim=0))
         self.register_buffer('queue_ptr', torch.zeros(1, dtype=torch.long))
+        # Whose key sits in each queue slot. -1 = never written, which select_negatives
+        # excludes so the initial random vectors are never contrasted against.
+        self.register_buffer('queue_pid', torch.full((K,), -1, dtype=torch.long))
 
         # GradNorm: learnable weights for the two task losses [trend, seasonal]. Used only
         # when loss balancing = 'gradnorm'; ignored (kept =1) in fixed-alpha mode.
@@ -140,6 +267,7 @@ class CoSTModel(nn.Module):
 
         self.disentangle = disentangle          # False = plain SSL: single rep, no TFD/SFD at all
 
+
     def shared_param(self):
         """Last trainable parameter of the SHARED backbone (before the TFD/SFD split);
         GradNorm measures each task's gradient magnitude with respect to this tensor."""
@@ -147,18 +275,89 @@ class CoSTModel(nn.Module):
         return ps[-1]
 
 
+    def select_negatives(self, pid):
+        """Indices of the queue slots this batch contrasts against -- (N, n_negatives).
+
+        THE experimental variable. `n_negatives` is drawn either way, so the two modes differ
+        in the COMPOSITION of the denominator and in nothing else; sampling a fixed count is
+        what makes them comparable, since InfoNCE improves with more negatives and a
+        subject-conditional queue is inevitably the smaller pool.
+
+          'global'  -- uniform over the whole queue. The shipped behaviour, and degenerate:
+                       the negatives are almost all OTHER participants, so a query is matched
+                       to its own augmented view by participant identity alone. Measured on an
+                       untrained encoder, top-1 retrieval is 1.000 against a chance of
+                       1/(K+1) -- the task is solved at initialisation and teaches nothing.
+          'subject' -- uniform over the queue slots holding keys from the SAME participant.
+                       Identity is then constant across the denominator and cannot separate
+                       anything, so the only thing left to encode is how this window differs
+                       from that person's OTHER windows, i.e. their week-to-week rhythm state.
+
+        Slots that have never been written (queue_pid < 0) are excluded in BOTH modes, so the
+        comparison is not contaminated by the random vectors the queue is initialised with.
+
+        A query whose participant holds fewer than `n_negatives` slots is sampled WITH
+        replacement rather than topped up from other participants. Reverting to a global draw
+        would silently turn that query back into the control condition, which is the one
+        failure this experiment cannot tolerate -- with K/n_pretrain_pids only ~35 at the
+        shipped K=4096 against n_negatives=32 it would have fired constantly. Duplicated
+        negatives merely reweight the denominator; foreign negatives would change what is
+        being tested. `neg_short` counts it so the rate is reportable either way.
+        """
+        # n_negatives <= 0 means "the whole queue", which is the SHIPPED behaviour and the
+        # default. Returning None here keeps that path bit-identical to the original code
+        # rather than approximating it with a large sample -- a default that quietly changed
+        # what every future run contrasts against would invalidate comparisons with every run
+        # already in results_hrd/.
+        if self.n_negatives <= 0 and self.negatives == "global":
+            return None
+        n_neg, dev = self.n_negatives, self.queue.device
+        valid = (self.queue_pid >= 0)
+        pool = valid.nonzero(as_tuple=True)[0]
+        if pool.numel() < n_neg:                      # queue not warm yet: use everything
+            pool = torch.arange(self.K, device=dev)
+        n = pid.shape[0] if pid is not None else 1
+        glob = pool[torch.randint(pool.numel(), (n, n_neg), device=dev)]
+        if self.negatives == "global" or pid is None:
+            self.neg_calls += n
+            return glob
+        idx = glob.clone()
+        for r in range(n):
+            same = (valid & (self.queue_pid == pid[r])).nonzero(as_tuple=True)[0]
+            if same.numel() >= n_neg:
+                idx[r] = same[torch.randperm(same.numel(), device=dev)[:n_neg]]
+            elif same.numel() > 0:
+                idx[r] = same[torch.randint(same.numel(), (n_neg,), device=dev)]
+                self.neg_short += 1
+            else:
+                # This participant has NOTHING in the queue yet -- only reachable in the first
+                # few iterations, before the queue has seen them at all.
+                self.neg_short += 1
+        self.neg_calls += n
+        return idx
+
     def compute_loss(self, q, k, k_negs):
         # compute logits
         # positive logits: Nx1
         l_pos = torch.einsum('nc,nc->n', [q, k]).unsqueeze(-1)
-        # negative logits: NxK
-        l_neg = torch.einsum('nc,ck->nk', [q, k_negs])
+        # negative logits: NxK  (k_negs is (N, n_negatives, C) once the sampler has chosen)
+        l_neg = (torch.einsum('nc,nkc->nk', [q, k_negs]) if k_negs.dim() == 3
+                 else torch.einsum('nc,ck->nk', [q, k_negs]))
 
         # logits: Nx(1+K)
         logits = torch.cat([l_pos, l_neg], dim=1)
 
         # apply temperature
         logits /= self.T
+
+        # Top-1 retrieval: the fraction of queries whose POSITIVE outscores every negative.
+        # This is the project's difficulty measure for the pretext task, and it is recorded
+        # here rather than recomputed elsewhere so it can never drift from the loss it
+        # describes. At 1.000 on an untrained encoder the task is already solved and the
+        # gradient teaches nothing; chance is 1/(1 + n_negatives).
+        with torch.no_grad():
+            self.last_top1 = float((l_pos > l_neg.max(dim=1, keepdim=True).values)
+                                   .float().mean())
 
         # labels: positive key indicators - first dim of each batch
         labels = torch.zeros(logits.shape[0], dtype=torch.long, device=logits.device)
@@ -220,7 +419,7 @@ class CoSTModel(nn.Module):
         return torch.cat([s, c], dim=-1)
 
     def instance_contrastive_loss(self, z1, z2):
-        B, T = z1.size(0), z1.size(1)
+        B = z1.size(0)
         z = torch.cat([z1, z2], dim=0)  # 2B x T x C
         z = z.transpose(0, 1)  # T x 2B x C
         sim = torch.matmul(z, z.transpose(1, 2))  # T x 2B x 2B
@@ -232,13 +431,23 @@ class CoSTModel(nn.Module):
         loss = (logits[:, i, B + i - 1].mean() + logits[:, B + i, i].mean()) / 2
         return loss
 
-    def forward(self, x_q, x_k, update=True, return_parts=False):
+    def _trend_view(self, z, idx):
+        """The vector the trend term contrasts: one timestep (upstream) or the mean."""
+        return z.mean(1) if self.trend_pool == "mean" else z[:, idx]
+
+    def forward(self, x_q, x_k, x_q_s=None, x_k_s=None, update=True, return_parts=False,
+                pid=None):
         # `update=False` runs the loss WITHOUT mutating MoCo state (no momentum
         # update / no queue enqueue) -- used to monitor a held-out validation loss.
         # compute query features
         rand_idx = np.random.randint(0, x_q.shape[1])
 
         q_t, q_s = self.encoder_q(x_q)
+        # The seasonal branch gets its OWN positive pair when the views are branch-specific.
+        # Identical tensors mean the historical single-pair behaviour, and the extra encoder
+        # pass is skipped.
+        if x_q_s is not None and x_q_s is not x_q:
+            _, q_s = self.encoder_q(x_q_s)
 
         # --- plain contrastive SSL (no disentangler): the encoder returns a SINGLE
         #     representation (q_s is None); ONE MoCo on it. NO seasonal FFT loss, and
@@ -246,13 +455,13 @@ class CoSTModel(nn.Module):
         #     is ABSENT (not just its objective). ---
         if not self.disentangle:
             rep_q = q_t if q_s is None else q_t + q_s
-            q = F.normalize(self.head_q(rep_q[:, rand_idx]), dim=-1)
+            q = F.normalize(self.head_q(self._trend_view(rep_q, rand_idx)), dim=-1)
             with torch.no_grad():
                 if update:
                     self._momentum_update_key_encoder()
                 k_t, k_s = self.encoder_k(x_k)
                 rep_k = k_t if k_s is None else k_t + k_s
-                k = F.normalize(self.head_k(rep_k[:, rand_idx]), dim=-1)
+                k = F.normalize(self.head_k(self._trend_view(rep_k, rand_idx)), dim=-1)
             loss = self.compute_loss(q, k, self.queue.clone().detach())
             if update:
                 self._dequeue_and_enqueue(k)
@@ -260,7 +469,7 @@ class CoSTModel(nn.Module):
             return (loss, z) if return_parts else loss
 
         if q_t is not None:
-            q_t = F.normalize(self.head_q(q_t[:, rand_idx]), dim=-1)
+            q_t = F.normalize(self.head_q(self._trend_view(q_t, rand_idx)), dim=-1)
 
         # compute key features
         with torch.no_grad():  # no gradient for keys
@@ -268,11 +477,15 @@ class CoSTModel(nn.Module):
                 self._momentum_update_key_encoder()  # update key encoder
             k_t, k_s = self.encoder_k(x_k)
             if k_t is not None:
-                k_t = F.normalize(self.head_k(k_t[:, rand_idx]), dim=-1)
+                k_t = F.normalize(self.head_k(self._trend_view(k_t, rand_idx)), dim=-1)
 
-        trend_loss = self.compute_loss(q_t, k_t, self.queue.clone().detach())
+            # (N, n_negatives, C): the queue rows this batch actually contrasts against.
+            neg_idx = self.select_negatives(pid)
+        _q = self.queue.clone().detach()
+        k_negs = _q if neg_idx is None else _q.T[neg_idx]
+        trend_loss = self.compute_loss(q_t, k_t, k_negs)
         if update:
-            self._dequeue_and_enqueue(k_t)
+            self._dequeue_and_enqueue(k_t, pid)
 
         # NOTE -- the seasonal branch is deliberately NOT MoCo, and this asymmetry with the
         # trend branch above is intentional (it matches salesforce/CoST upstream exactly):
@@ -286,7 +499,7 @@ class CoSTModel(nn.Module):
         # encoder forward per step (x_q->encoder_q, x_k->encoder_k, x_k->encoder_q).
         # Do NOT "fix" this to encoder_k -- it would diverge from the paper and upstream.
         q_s = F.normalize(q_s, dim=-1)
-        _, k_s = self.encoder_q(x_k)
+        _, k_s = self.encoder_q(x_k if x_k_s is None else x_k_s)
         k_s = F.normalize(k_s, dim=-1)
 
         with torch.autocast(device_type='cuda', enabled=False):
@@ -324,7 +537,7 @@ class CoSTModel(nn.Module):
             param_k.data = param_k.data * self.m + param_q.data * (1 - self.m)
 
     @torch.no_grad()
-    def _dequeue_and_enqueue(self, keys):
+    def _dequeue_and_enqueue(self, keys, pid=None):
         batch_size = keys.shape[0]
 
         ptr = int(self.queue_ptr)
@@ -332,6 +545,11 @@ class CoSTModel(nn.Module):
 
         # replace keys at ptr (dequeue and enqueue)
         self.queue[:, ptr:ptr + batch_size] = keys.T
+        # The owner of each slot moves with it. Without this the queue would say nothing
+        # about whose key it holds and 'subject' negatives could not be selected at all.
+        self.queue_pid[ptr:ptr + batch_size] = (
+            torch.full((batch_size,), -1, dtype=torch.long, device=self.queue_pid.device)
+            if pid is None else pid.to(self.queue_pid.device).long())
 
         ptr = (ptr + batch_size) % self.K
         self.queue_ptr[0] = ptr
@@ -352,8 +570,17 @@ class CoST:
                  time2vec_dim: int = 65,
                  loss_balance: str = "fixed",
                  bins_per_day: int = 96,
+                 seasonal_bands: str = 'harmonics',
                  disentangle: bool = True,
                  jitter_sigma: float = 0.1,
+                 shift_sigma: float = 0.5,
+                 moco_k: int = 4096,
+                 trend_pool: str = "random",
+                 positive_pair: str = "window",
+                 negatives: str = "global",
+                 n_negatives: int = 0,
+                 decomp_aug: bool = False,
+                 n_sensors: int = 0,
                  mask_mode: str = 'none',
                  mask_prob: float = 0.5,
                  phase_mode: str = "circular",
@@ -378,6 +605,15 @@ class CoST:
         # so 'none' reproduces published behaviour and 'binomial'/'continuous' are opt-in.
         # `mask_prob` is the binomial KEEP-probability and is read only under 'binomial'.
         self.jitter_sigma = jitter_sigma
+        # `shift` adds a per-channel constant. Its comment calls that safe because it moves
+        # only the MESOR, i.e. the 0-frequency bin -- true of the INPUT, but the backbone is
+        # non-linear, so it is not true of the representation: measured on run 1239199,
+        # shift alone drops the seasonal readout's self-similarity to 0.739 while jitter alone
+        # leaves it at 0.931. Setting this to 0 removes the augmentation and asks whether the
+        # level-invariance it imposes is what costs MESOR recovery against random-init.
+        self.shift_sigma = shift_sigma
+        self.moco_k = moco_k
+        self.trend_pool = trend_pool
         self.mask_mode = mask_mode
         self.mask_prob = mask_prob
         # The calendar PEs append 2 raw [tod, dow] channels read as a wall-clock index; they
@@ -399,6 +635,7 @@ class CoST:
             time2vec_dim=time2vec_dim,
             disentangle=disentangle,
             bins_per_day=bins_per_day,
+            seasonal_bands=seasonal_bands,
             mask_mode=mask_mode,
             mask_prob=mask_prob,
         ).to(self.device)
@@ -407,25 +644,36 @@ class CoST:
         # plain single representation (--no-disentangle) -> the full output_dims.
         moco_dim = self.net.component_dims if disentangle else self.net.output_dims
 
-        # Queue length. Upstream CoST uses K=4096, sized for its forecasting corpora (single
-        # long series cropped into tens of thousands of overlapping subsequences). This cohort
-        # pretrains on ~3,000 NON-overlapping 7-day windows, so K=4096 > N: the queue then holds
-        # several stale copies of nearly every window, including the query's own, and those
-        # enter the denominator as negatives. MoCo assumes K << N precisely to avoid that
-        # false-negative rate. K=1024 stays well under N and divides the batch size (16 x 64;
-        # both loaders use drop_last=True, so every batch is exactly batch_size and the
-        # `K % batch_size == 0` assert in _dequeue_and_enqueue holds).
-        # Revisit if the pretraining set grows: with a denser pretrain stride, N rises ~7x and
-        # 4096 becomes the better setting again.
+        # Queue length. HELD AT THE UPSTREAM CoST VALUE, 4096.
+        #
+        # A K=1024 change was applied and then reverted unrun. The argument for it is real --
+        # this cohort pretrains on ~3,000 NON-overlapping windows, so K=4096 > N and the queue
+        # holds stale copies of the query's own window as false negatives, which MoCo's K << N
+        # assumption exists to avoid. But it was never measured, and all 17 healthy runs used
+        # 4096 (pretrain loss 0.079-0.537, clean 7-cycle seasonal structure), so it is not the
+        # thing that broke run 19937323 -- MASK_MODE=binomial was (see scripts/run.sh).
+        #
+        # Changing K also moves the loss scale: chance is ln(K+1), so 8.32 nats at 4096 versus
+        # 6.93 at 1024. Altering it in the same run that reverts the mask would make the new
+        # loss incomparable to the historical baseline, which is the one measurement that
+        # verifies the revert worked. Re-baseline first at 4096, then A/B K=1024 on one seed.
+        self.positive_pair = positive_pair
+        # Seasonal-branch views recomposed from each window's own decomposition; see
+        # PretrainDataset._decomp_views for why the trend branch is excluded.
+        self.decomp_aug = bool(decomp_aug)
+        self.n_sensors = int(n_sensors)
         self.cost = CoSTModel(
             self.net,
             copy.deepcopy(self.net),
             kernels=kernels,
             dim=moco_dim,
             alpha=alpha,
-            K=1024,
+            K=moco_k,
             disentangle=disentangle,
             phase_mode=phase_mode,
+            trend_pool=trend_pool,
+            negatives=negatives,
+            n_negatives=n_negatives,
             device=self.device,
         ).to(self.device)
 
@@ -471,35 +719,77 @@ class CoST:
         self.loss_w_log.append(cost.loss_w.detach().cpu().numpy().copy())
         return float(total.item())
 
-    def fit(self, train_data, n_epochs=None, n_iters=None, valid_data=None, verbose=False):
+    def fit(self, train_data, n_epochs=None, n_iters=None, valid_data=None,
+            verbose=False, pids=None, valid_pids=None):
         assert train_data.ndim == 3
 
         if n_iters is None and n_epochs is None:
             n_iters = 200 if train_data.size <= 100000 else 600
 
+        # `pids` must follow every reshape and every dropped row, or a window would be paired
+        # with a peer belonging to somebody else -- silently, and in the direction that makes
+        # the objective look easier.
+        pids = None if pids is None else np.asarray(pids)
+        if pids is not None and len(pids) != len(train_data):
+            raise ValueError(f"{len(pids)} pids for {len(train_data)} pretrain windows")
+
         if self.max_train_length is not None:
             sections = train_data.shape[1] // self.max_train_length
             if sections >= 2:
                 train_data = np.concatenate(split_with_nan(train_data, sections, axis=1), axis=0)
+                if pids is not None:
+                    pids = np.tile(pids, sections)      # split_with_nan stacks the sections
 
         temporal_missing = np.isnan(train_data).all(axis=-1).any(axis=0)
         if temporal_missing[0] or temporal_missing[-1]:
             train_data = centerize_vary_length_series(train_data)
 
-        train_data = train_data[~np.isnan(train_data).all(axis=2).all(axis=1)]
+        keep = ~np.isnan(train_data).all(axis=2).all(axis=1)
+        train_data = train_data[keep]
+        if pids is not None:
+            pids = pids[keep]
 
         # `shift` is a per-channel DC offset (moves only the MESOR / 0-frequency bin), so it
         # preserves every rhythm's phase and amplitude, and is useful (jitter alone is weak).
         multiplier = 1 if train_data.shape[0] >= self.batch_size else math.ceil(self.batch_size / train_data.shape[0])
-        train_dataset = PretrainDataset(torch.from_numpy(train_data).to(torch.float), jitter_sigma=self.jitter_sigma, shift_sigma=0.5, multiplier=multiplier, n_exact_tail=self._n_exact_tail)
+        # Closed-form trend/seasonal split, computed ONCE -- the same decomposition RQ1
+        # scores against, so augmentation and evaluation share one definition.
+        decomp = None
+        if self.decomp_aug:
+            from tasks.decomposition import harmonic_reference
+            ns = self.n_sensors or train_data.shape[-1]
+            xs = np.nan_to_num(train_data[..., :ns], nan=0.0)
+            _tau, _sig = harmonic_reference(xs, self.bins_per_day)
+            decomp = (_tau, _sig, xs - _tau - _sig)
+
+        train_dataset = PretrainDataset(torch.from_numpy(train_data).to(torch.float), jitter_sigma=self.jitter_sigma, shift_sigma=self.shift_sigma, multiplier=multiplier, n_exact_tail=self._n_exact_tail,
+                                        pids=pids, positive=self.positive_pair,
+                                        decomp=decomp, n_sensors=self.n_sensors)
+        if self.positive_pair == "participant" and verbose:
+            print(f"[pretrain] positive pair = another window of the same participant "
+                  f"({train_dataset.n_paired}/{len(train_data)} windows have a peer)")
         train_loader = DataLoader(train_dataset, batch_size=min(self.batch_size, len(train_dataset)), shuffle=True, drop_last=True)
 
         # optional held-out set to monitor the SSL loss over training (no labels used)
         val_loader = None
         if valid_data is not None:
-            vd = valid_data[~np.isnan(valid_data).all(axis=2).all(axis=1)]
+            vdec = None
+            vkeep = ~np.isnan(valid_data).all(axis=2).all(axis=1)
+            vd = valid_data[vkeep]
+            vp = None if valid_pids is None else np.asarray(valid_pids)[vkeep]
+            if self.decomp_aug and len(vd):
+                from tasks.decomposition import harmonic_reference
+                ns = self.n_sensors or vd.shape[-1]
+                vxs = np.nan_to_num(vd[..., :ns], nan=0.0)
+                _vt, _vs = harmonic_reference(vxs, self.bins_per_day)
+                vdec = (_vt, _vs, vxs - _vt - _vs)
             if len(vd) >= self.batch_size:
-                val_ds = PretrainDataset(torch.from_numpy(vd).to(torch.float), jitter_sigma=self.jitter_sigma, shift_sigma=0.5, multiplier=1, n_exact_tail=self._n_exact_tail)
+                # The held-out loss must measure the SAME task, so the validation views are
+                # paired the same way; without pids it falls back to same-window pairing and
+                # would report a different, easier objective.
+                val_ds = PretrainDataset(torch.from_numpy(vd).to(torch.float), jitter_sigma=self.jitter_sigma, shift_sigma=self.shift_sigma, multiplier=1, n_exact_tail=self._n_exact_tail,
+                                         pids=vp, positive=self.positive_pair if vp is not None else "window",
+                                         decomp=vdec, n_sensors=self.n_sensors)
                 val_loader = DataLoader(val_ds, batch_size=min(self.batch_size, len(val_ds)),
                                         shuffle=False, drop_last=True)
 
@@ -562,7 +852,9 @@ class CoST:
                     else:
                         adjust_learning_rate(optimizer, self.lr, self.n_iters, n_iters)
 
-                x_q, x_k = map(lambda x: x.to(self.device), batch)
+                # The 5th item is the QUERY's participant index, used only by the
+                # subject-conditional negative sampler; it is not a model input.
+                x_q, x_k, x_q_s, x_k_s, pid_b = (t.to(self.device) for t in batch)
                 if self.max_train_length is not None and x_q.size(1) > self.max_train_length:
                     window_offset = np.random.randint(x_q.size(1) - self.max_train_length + 1)
                     x_q = x_q[:, window_offset : window_offset + self.max_train_length]
@@ -573,7 +865,7 @@ class CoST:
                 else:
                     optimizer.zero_grad()
                     with torch.autocast(device_type='cuda', dtype=torch.bfloat16):
-                        loss = self.cost(x_q, x_k)
+                        loss = self.cost(x_q, x_k, x_q_s, x_k_s, pid=pid_b)
                     loss.backward()
                     optimizer.step()
                     loss_val = loss.item()
@@ -648,17 +940,20 @@ class CoST:
         total, n = 0.0, 0
         with torch.no_grad():
             for batch in val_loader:
-                x_q, x_k = map(lambda x: x.to(self.device), batch)
+                # The 5th item is the QUERY's participant index, used only by the
+                # subject-conditional negative sampler; it is not a model input.
+                x_q, x_k, x_q_s, x_k_s, pid_b = (t.to(self.device) for t in batch)
                 if self.max_train_length is not None and x_q.size(1) > self.max_train_length:
                     off = np.random.randint(x_q.size(1) - self.max_train_length + 1)
                     x_q = x_q[:, off: off + self.max_train_length]
                     x_k = x_k[:, off: off + self.max_train_length]
                 with torch.autocast(device_type='cuda', dtype=torch.bfloat16):
                     if gradnorm:
-                        lt, ls = self.cost(x_q, x_k, update=False, return_parts=True)
+                        lt, ls = self.cost(x_q, x_k, x_q_s, x_k_s, update=False,
+                                           return_parts=True, pid=pid_b)
                         loss = (self.cost.loss_w.detach() * torch.stack([lt, ls])).sum()
                     else:
-                        loss = self.cost(x_q, x_k, update=False)
+                        loss = self.cost(x_q, x_k, x_q_s, x_k_s, update=False, pid=pid_b)
                 total += loss.item()
                 n += 1
         if was_training:
@@ -831,6 +1126,26 @@ class CoST:
             fn (str): filename.
         '''
         state_dict = torch.load(fn, map_location=self.device)
+        # Checkpoints written BEFORE the seasonal layer was banded hold a single
+        # full-spectrum `sfd.0`; the current encoder builds one BandedFourierLayer per
+        # circadian harmonic. Loading such a file otherwise dies on a shape mismatch, which
+        # silently puts every pre-banding run -- most of results_hrd/ -- out of reach of any
+        # re-evaluation. Rebuilding `sfd` to the checkpoint's own layout restores exactly the
+        # architecture that produced it, so the archived encoder is reproduced rather than
+        # approximated. Nothing about the current default changes.
+        sfd = getattr(self.net, "sfd", None)
+        n_ckpt = len({k.split(".")[1] for k in state_dict if k.startswith("sfd.")})
+        if sfd is not None and n_ckpt and n_ckpt != len(sfd):
+            from models.encoder import BandedFourierLayer
+            w = state_dict["sfd.0.weight"]                 # (num_freqs, in_ch, out_ch)
+            length = 2 * (self.net.sfd[0].total_freqs - 1)
+            self.net.sfd = nn.ModuleList(
+                [BandedFourierLayer(int(w.shape[1]), int(w.shape[2]), b, n_ckpt, length=length)
+                 for b in range(n_ckpt)]).to(self.device)
+            self.net.seasonal_bands = [(m.start, m.end) for m in self.net.sfd]
+            self.net.seasonal_widths = [m.out_channels for m in self.net.sfd]
+            print(f"[load] checkpoint predates seasonal banding: rebuilt sfd with {n_ckpt} "
+                  f"band(s) of width {int(w.shape[2])} to match it")
         self.net.load_state_dict(state_dict)
 
 

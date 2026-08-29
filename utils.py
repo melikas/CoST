@@ -3,6 +3,8 @@
 training entry points (``init_dl_program``)."""
 import random
 
+from sklearn.model_selection import train_test_split
+
 import numpy as np
 import torch
 
@@ -89,7 +91,7 @@ def pid_majority_label(labels):
 
     Canonical definition, shared so the three places that need a per-participant label cannot
     drift apart: the split's `pid_summary_label` (globem_preprocessing), the probe's
-    subject-level metrics (hrd_rhythm._agg_participant) and the supervised baselines'
+    subject-level metrics (_eval_protocols.participant_aggregate) and the supervised baselines'
     (train_hrd.participant_aggregate).
 
     In WEEKLY mode a participant's windows carry DIFFERENT labels over time (each window takes
@@ -117,3 +119,19 @@ def pid_majority_label(labels):
     majority IS that label and this is a no-op."""
     m = float(np.asarray(labels).mean())
     return 1 if m > 0.5 else 0          # explicit: ties (m == 0.5) -> 0
+
+
+def stratified_pid_holdout(unique_pids, pid_label, frac, seed):
+    """Split participant ids into (rest, held) at the participant level."""
+    pids = sorted(unique_pids)
+    if len(pids) < 2 or frac <= 0:
+        return set(pids), set()
+    y = [pid_label.get(p, 0) for p in pids]
+    n_held = min(max(1, int(round(len(pids) * frac))), len(pids) - 1)
+    try:
+        rest, held = train_test_split(pids, test_size=n_held, stratify=y, random_state=seed)
+    except ValueError:
+        rng = np.random.default_rng(seed)
+        perm = list(rng.permutation(np.array(pids)))
+        held, rest = perm[:n_held], perm[n_held:]
+    return set(rest), set(held)

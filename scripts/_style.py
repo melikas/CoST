@@ -1,7 +1,7 @@
 """Shared figure style for the ``scripts/`` plotting entry points.
 
 Single source of the project palette and axis styling, imported by
-``dataset_stats.py`` and ``results_figures.py`` so their two figure sets cannot
+``dataset_stats.py`` and ``collect_results.py`` so their two figure sets cannot
 drift apart. Importing this selects the Agg backend, so import it before pyplot.
 
 ``C_HRD`` / ``C_GLB`` are categorical slots 1 and 2; the pair was validated for

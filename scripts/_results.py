@@ -4,12 +4,11 @@
 the SAME layout and this one module serves both:
 
     <results-dir>/<run>/<variant>/metrics.json                 required
-                                  probe_scores.json            subject-level probe outputs
                                   decomposition_recovery.json  DIS / recovery / leak
 
-``collect_results.py`` (tables) and ``results_figures.py`` (figures) both read that tree.
-Keeping the walk, the partial-file guard and the variant identity here is what stops the
-two from disagreeing about what a run is.
+``collect_results.py`` reads that tree through this module for both its tables and its
+panels. Keeping the walk, the partial-file guard and the variant identity here is what
+stops any two readers from disagreeing about what a run is.
 
 A variant is identified by ``Variant(run, backbone, pe, holdout, label, seed)``. ``holdout``
 and ``label`` belong in the key on purpose: ``--holdout`` folds test DIFFERENT populations
@@ -19,11 +18,18 @@ exactly where a key that ignored them would silently average unrelated cells tog
 """
 import json
 from collections import namedtuple
+import sys
 from pathlib import Path
+
+sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
+from tasks.rq_paths import rq_path
 
 Variant = namedtuple("Variant", "run backbone pe holdout label seed")
 
-SIDECARS = {"d": "decomposition_recovery.json", "views": "probe_scores.json"}
+# `probe_scores.json` used to be a second sidecar. Nothing has written it since the probe
+# was rewritten, so every reader of it was dead code; it is gone rather than left to look
+# like an optional input.
+SIDECARS = {"d": "decomposition_recovery.json"}
 
 
 def read_json(fp):
@@ -71,12 +77,12 @@ def load_variants(results_dir, runs=None, exclude=(), drop_seeds=()):
         k = variant_key(m, fp)
         if k.backbone in exclude or (k.run, k.seed) in drop_seeds:
             continue
-        rec = {"m": m, "d": {}, "views": {}}
+        rec = {"m": m, "d": {}}
         for key, name in SIDECARS.items():
-            side = fp.parent / name
+            side = rq_path(fp.parent, name, create=False)
             j = read_json(side) if side.exists() else None
             if j is not None:
-                rec[key] = j.get("views", j) if key == "views" else j
+                rec[key] = j
         out[k] = rec
     return out
 

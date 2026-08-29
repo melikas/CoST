@@ -12,11 +12,10 @@ WARNING -- unlike every other baseline in this project, this one is NOT free: it
 self-supervised pretraining per (seed, variant). Budget for it explicitly. The trained weights
 are cached to `cache_path`, so the first caller pays and later ones reload.
 
-Deliberately NOT importing train_hrd: train_hrd imports baselines.*, so the reverse edge would
-be a cycle. paper_kernels is therefore inlined below (7 lines, kept identical).
+Deliberately NOT importing train_hrd: train_hrd imports baselines.*, so the reverse edge
+would be a cycle. The encoder comes from model_build instead, which both sides share.
 """
 import json
-import math
 from pathlib import Path
 
 import numpy as np
@@ -26,36 +25,22 @@ from sklearn.metrics import (accuracy_score, balanced_accuracy_score, f1_score,
 from sklearn.pipeline import make_pipeline
 from sklearn.preprocessing import StandardScaler
 
-from cost import CoST
+from model_build import build_model
 from tasks._eval_protocols import best_threshold, participant_aggregate
 
 
-def _paper_kernels(seq_len):
-    """CoST mixture-of-AR-experts kernels (copy of train_hrd.paper_kernels; see module note)."""
-    L = max(0, int(math.floor(math.log2(max(seq_len // 2, 1)))))
-    return [2 ** i for i in range(L + 1)]
 
 
 def plain_ssl_encoder(X, pretrain_mask, cfg, n_sensors, device, seed=42, cache_path=None,
-                      verbose=True):
+                      verbose=True, pids=None):
     """Pretrain (or reload) the non-disentangled twin of this run's encoder, frozen on return.
 
     `pretrain_mask` must be the SAME window set the disentangled model saw -- i.e. every
     non-test window -- or the comparison is confounded by data rather than by the split.
     """
-    seq_len = X.shape[1]
-    mtl = cfg.get("max_train_length")
-    model = CoST(
-        input_dims=X.shape[-1], n_time_features=int(X.shape[-1]) - int(n_sensors),
-        kernels=cfg.get("kernels") or _paper_kernels(seq_len), alpha=cfg["alpha"],
-        max_train_length=seq_len if mtl is None else min(mtl, seq_len),
-        output_dims=cfg["repr_dims"], hidden_dims=cfg["hidden_dims"], depth=cfg["depth"],
-        backbone=cfg["backbone"], pe=cfg["pe"], time2vec_dim=cfg["time2vec_dim"],
-        loss_balance=cfg["loss_balance"], bins_per_day=24 * 60 // cfg["bin_minutes"],
-        disentangle=False,                                   # <-- the only difference
-        jitter_sigma=cfg["jitter_sigma"], mask_mode=cfg["mask_mode"],
-        mask_prob=cfg["mask_keep_prob"], phase_mode=cfg["phase_encoding"],
-        device=device, lr=cfg["lr"], batch_size=cfg["batch_size"])
+    # `disentangle=False` IS the control; every other argument must match the
+    # disentangled twin, which is why this goes through the shared builder.
+    model = build_model(cfg, X, n_sensors, device, disentangle=False)
 
     # The cache is keyed by the PRETRAINING CONFIG, not by the file path alone. This control
     # only means anything if it saw exactly what the disentangled model saw, and a cached file
@@ -67,7 +52,8 @@ def plain_ssl_encoder(X, pretrain_mask, cfg, n_sensors, device, seed=42, cache_p
     key = {k: cfg.get(k) for k in ("backbone", "pe", "repr_dims", "hidden_dims", "depth",
                                    "alpha", "lr", "batch_size", "iters", "epochs",
                                    "jitter_sigma", "mask_mode", "mask_keep_prob",
-                                   "phase_encoding", "loss_balance", "time2vec_dim")}
+                                   "phase_encoding", "loss_balance", "time2vec_dim",
+                                   "shift_sigma", "moco_k", "trend_pool")}
     key["n_pretrain_windows"] = int(pretrain_mask.sum())
     key["seed"] = int(seed)
     key_path = cache_path.with_suffix(".key.json") if cache_path else None
@@ -87,7 +73,10 @@ def plain_ssl_encoder(X, pretrain_mask, cfg, n_sensors, device, seed=42, cache_p
             print(f"[plain-ssl] pretraining the non-disentangled twin on "
                   f"{int(pretrain_mask.sum())} windows (this is a REAL pretraining) ...")
         np.random.seed(seed)
-        model.fit(X[pretrain_mask], n_iters=cfg.get("iters"), n_epochs=cfg.get("epochs"),
+        # the control must see the SAME pretext task, or it stops being a control for it
+        model.fit(X[pretrain_mask],
+                  pids=None if pids is None else np.asarray(pids)[pretrain_mask],
+                  n_iters=cfg.get("iters"), n_epochs=cfg.get("epochs"),
                   verbose=verbose)
         if cache_path is not None:
             model.save(cache_path)
@@ -102,14 +91,15 @@ def encode_plain(model, X, cfg, batch=256):
 
 
 def plain_ssl_baseline_row(X, y, pids, train_mask, val_mask, test_mask, pretrain_mask, cfg,
-                           n_sensors, name="CoST plain (no disentangle)", device="cuda",
+                           n_sensors, name="DSSL plain (no disentangle)", device="cuda",
                            seed=42, probe_c=0.1, cache_path=None):
     """Separability-table row dict, same keys as `supervised_baseline_row`.
 
     The probe, the threshold rule and the participant aggregation are the ones the
     disentangled representation is scored with, so only the representation differs.
     """
-    model = plain_ssl_encoder(X, pretrain_mask, cfg, n_sensors, device, seed, cache_path)
+    model = plain_ssl_encoder(X, pretrain_mask, cfg, n_sensors, device, seed, cache_path,
+                              pids=pids)
     R = encode_plain(model, X, cfg)
 
     clf = make_pipeline(StandardScaler(),

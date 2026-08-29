@@ -9,6 +9,7 @@ The split is READ from metrics.json ("test_pids"), not re-derived, so the held-o
 participants are bit-identical to the depression run no matter what changes upstream.
 """
 import hashlib
+from tasks.rq_paths import rq_path
 import json
 import pickle
 from pathlib import Path
@@ -17,10 +18,13 @@ from types import SimpleNamespace
 import numpy as np
 import torch
 
-from cost import CoST
 from data_processing.data_preprocessing import prepare_hrd_dataset
 from models.positional_encoding import CALENDAR_PES
-from train_hrd import paper_kernels, stratified_pid_holdout
+# `encode` is re-exported: experiment_q1/q2/q3 import it from here so every RQ script encodes
+# through the one builder without each reaching into model_build separately.
+from model_build import build_model, encode_repr as encode   # noqa: F401
+from model_build import random_init_model as _random_init_model
+from utils import stratified_pid_holdout
 
 # The plain-SSL control is the ONLY baseline that costs a real pretraining, so it is trained
 # just for these reference configurations -- the same two the supervised baselines already use
@@ -28,17 +32,29 @@ from train_hrd import paper_kernels, stratified_pid_holdout
 # against its OWN disentangled twin, which is what leaves `disentangle` as the single
 # difference; it is deliberately NOT a common yardstick under the other variants, where
 # backbone and PE would differ too.
-PLAIN_REF = {("tcn", "none"), ("tcn", "time2vec"), ("transformer", "sinusoidal")}
+PLAIN_REF = {("tcn", "none"), ("tcn", "circular"), ("tcn", "time2vec"),
+             ("transformer", "sinusoidal")}
+# ("tcn","circular") is here because the RQ3 ladder has a "DSSL plain (no disentangle)" RUNG
+# (experiment_q3.py:181). A variant outside PLAIN_REF silently gets a ladder one rung SHORTER
+# than the others, so its Delta AUC column is not comparable to theirs -- which defeats the
+# point of running the variant at all when the question is "what does the time reference
+# frame change". Membership costs one extra SSL pretraining per (seed, variant).
 
 # Preprocessing-relevant config keys: two runs agreeing on these produce the same windows,
 # so one cached dataset serves every variant of an array task (the CSV is 53.5M rows).
-_DATA_KEYS = ("sensor_csv", "window_hours", "bin_minutes", "label_col", "max_missing",
-              "max_window_missing", "no_zscore", "with_clock_features", "pe")
+_DATA_KEYS = ("dataset", "sensor_csv", "window_hours", "bin_minutes", "label_col",
+              "max_missing", "max_window_missing", "no_zscore", "with_clock_features", "pe",
+              # GLOBEM-only, and they MUST be in the key: two GLOBEM runs differing only in
+              # window_days or the labelling mode would otherwise hash to the same cache entry
+              # and the second would silently be handed the first one's windows.
+              "window_days", "stride_days", "globem_label", "globem_anchor_weekday")
 # Bumped whenever prepare_hrd_dataset gains a KEY, not just when a config value changes.
 # None of _DATA_KEYS moves when a new field is added, so without this a pickle written by
 # the previous schema is a cache HIT and the new field silently arrives as None.
 #   2 -> added "ee_win" (window-matched emotional energy) for RQ2 layer 3.
-_SCHEMA_VERSION = 2
+#   3 -> _dataset dispatches on cfg["dataset"], and the GLOBEM window arguments joined
+#        _DATA_KEYS. Any cache written before this cannot know which dataset it holds.
+_SCHEMA_VERSION = 3
 
 
 def _dataset(cfg, cache_dir):
@@ -49,51 +65,65 @@ def _dataset(cfg, cache_dir):
     if fp is not None and fp.exists():
         print(f"[ctx] dataset cache hit -> {fp}")
         return pickle.loads(fp.read_bytes())
-    data = prepare_hrd_dataset(
-        cfg["sensor_csv"], window_hours=cfg["window_hours"], bin_minutes=cfg["bin_minutes"],
-        label_col=cfg["label_col"], max_missing=cfg["max_missing"],
-        max_window_missing=cfg["max_window_missing"], z_score=not cfg["no_zscore"],
-        clock_features=cfg["with_clock_features"], calendar_index=cfg["pe"] in CALENDAR_PES)
+    # Mirrors train_hrd.py's own dispatch (train_hrd.py:693). Without it every RQ script
+    # rebuilt the HRD windows whatever the run actually trained on, so a GLOBEM variant would
+    # be analysed against a different cohort entirely -- silently, since the shapes still fit.
+    if cfg.get("dataset") == "globem":
+        from data_processing.globem_preprocessing import prepare_globem_dataset
+        data = prepare_globem_dataset(
+            cfg["sensor_csv"],
+            window_days=cfg.get("window_days", 28),
+            stride_days=cfg.get("stride_days", 7),
+            # train_hrd now writes the rewritten name back onto args, so a current config
+            # names a real GLOBEM column. Configs written before that fix still carry the HRD
+            # default, and the same rewrite is applied here so they remain analysable.
+            label_col=("LABEL_ENDPOINT" if cfg["label_col"] == "depression_status_endpoint"
+                       else cfg["label_col"]),
+            z_score=not cfg["no_zscore"],
+            clock_features=cfg["with_clock_features"],
+            weekly_labels=(cfg.get("globem_label") == "weekly"),
+            anchor_weekday=cfg.get("globem_anchor_weekday", 0))
+    else:
+        data = prepare_hrd_dataset(
+            cfg["sensor_csv"], window_hours=cfg["window_hours"],
+            bin_minutes=cfg["bin_minutes"],
+            label_col=cfg["label_col"], max_missing=cfg["max_missing"],
+            max_window_missing=cfg["max_window_missing"], z_score=not cfg["no_zscore"],
+            clock_features=cfg["with_clock_features"],
+            calendar_index=cfg["pe"] in CALENDAR_PES)
     if fp is not None:
         fp.write_bytes(pickle.dumps(data, protocol=4))
     return data
 
 
-def _build_model(cfg, X, n_sensors, device):
-    """CoST constructed with the same arguments train_hrd.py used (train_hrd.py:782)."""
-    seq_len = X.shape[1]
-    mtl = cfg.get("max_train_length")
-    return CoST(
-        input_dims=X.shape[-1], n_time_features=int(X.shape[-1]) - int(n_sensors),
-        kernels=cfg.get("kernels") or paper_kernels(seq_len), alpha=cfg["alpha"],
-        max_train_length=seq_len if mtl is None else min(mtl, seq_len),
-        output_dims=cfg["repr_dims"], hidden_dims=cfg["hidden_dims"], depth=cfg["depth"],
-        backbone=cfg["backbone"], pe=cfg["pe"], time2vec_dim=cfg["time2vec_dim"],
-        loss_balance=cfg["loss_balance"], bins_per_day=24 * 60 // cfg["bin_minutes"],
-        disentangle=cfg["disentangle"], jitter_sigma=cfg["jitter_sigma"],
-        mask_mode=cfg["mask_mode"], mask_prob=cfg["mask_keep_prob"],
-        phase_mode=cfg["phase_encoding"], device=device, lr=cfg["lr"],
-        batch_size=cfg["batch_size"])
 
 
 def load_context(variant_dir, cache_dir=None, gpu=0):
     """Everything the experiment scripts need, with the trained encoder frozen in eval mode."""
     variant_dir = Path(variant_dir)
-    meta = json.loads((variant_dir / "metrics.json").read_text(encoding="utf-8"))
+    meta = json.loads((rq_path(variant_dir, "metrics.json")).read_text(encoding="utf-8"))
     cfg = meta["config"]
     data = _dataset(cfg, cache_dir)
     X, y = data["X"], data["y"]
     pids = np.asarray(data["pids"]).astype(str)
     device = torch.device(f"cuda:{gpu}" if gpu >= 0 and torch.cuda.is_available() else "cpu")
 
-    model = _build_model(cfg, X, data["n_sensors"], device)
-    model.load(variant_dir / "encoder.pt")
+    model = build_model(cfg, X, data["n_sensors"], device)
+    model.load(rq_path(variant_dir, "encoder.pt"))
     model.net.eval()
 
     # Split recovered from the run itself, never recomputed.
     test_pids = set(map(str, meta["test_pids"]))
     test_mask = np.isin(pids, list(test_pids))
-    pid_label = {p: int(y[pids == p][0]) for p in np.unique(pids)}
+    # One label per participant. Taking any window's y is right for HRD, where the endpoint
+    # label is repeated on all of a person's windows -- but GLOBEM's weekly mode marks a window
+    # with no survey in its span as y=-1, and the first window is often one of those, which
+    # would enter the probe as a third class. `pid_summary_label` is the majority of that
+    # person's LABELLED windows and is what the split itself is stratified on, so it is the
+    # right source whenever the dataset provides it.
+    summary = data.get("pid_summary_label") or {}
+    pid_label = {p: int(summary.get(p, y[pids == p][0])) for p in np.unique(pids)}
+    pid_label = {p: v for p, v in pid_label.items() if v >= 0}
     cohort = data["labeled_pids"] if cfg["cohort"] == "labeled" else data["consistent_pids"]
     pool = sorted({str(p) for p in cohort if str(p) in pid_label} - test_pids)
     rem, val = stratified_pid_holdout(pool, pid_label, cfg["val_frac"], cfg["split_seed"])
@@ -129,29 +159,28 @@ def wants_plain_ssl(ctx):
 
 
 def random_init_model(ctx):
-    """The RQ1/RQ3 negative control: same architecture, weights never trained.
+    """ctx-shaped binding of model_build.random_init_model -- the ONE negative control.
 
-    Seeded explicitly -- an unseeded control redraws its weights on every invocation, so the
-    same variant would report a different control AUC each run and the comparison it exists
-    to support would not be reproducible.
+    The seasonal layout is copied from the TRAINED encoder rather than from the config. Runs
+    predating the `seasonal_bands` key cannot state their own layout and the answer differs
+    between them -- pre-banding runs are single-band, post-banding ones are not -- so a config
+    default would give some archived runs a control of a different architecture. "Same
+    architecture, weights never trained" has to be true by construction, not by luck.
     """
-    torch.manual_seed(ctx.seed)
-    m = _build_model(ctx.cfg, ctx.X, ctx.n_sensors, ctx.device)
-    m.net.eval()
-    return m
+    sfd = getattr(ctx.model.net, "sfd", None)
+    cfg = dict(ctx.cfg)
+    if sfd is not None:
+        cfg["seasonal_bands"] = "single" if len(sfd) == 1 else "harmonics"
+    return _random_init_model(cfg, ctx.X, ctx.n_sensors, ctx.device, ctx.seed)
 
 
-def encode(model, X, cfg, batch=256):
-    """Window-pooled [V^(T); V^(S)], exactly the readout train_hrd.py probes."""
-    sp = None if cfg["season_pool"] == "same" else cfg["season_pool"]
-    return model.encode(X, mode="forecasting", pool=cfg["pool"], season_pool=sp,
-                        batch_size=batch).squeeze(1)
+
 
 
 def out_dir(ctx, name):
-    d = ctx.variant_dir / name
-    d.mkdir(parents=True, exist_ok=True)
-    return d
+    """The folder rq_paths assigns to this experiment's artifacts. Resolved from a filename
+    rather than hard-coded, so the RQ->folder table stays the single source of truth."""
+    return rq_path(ctx.variant_dir, f"{name}.json").parent
 
 
 def save(d, stem, obj):

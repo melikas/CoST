@@ -29,3 +29,18 @@ __pycache__/
 # IDE
 .vscode/
 .idea/
+
+# Transfer archives: the tarballs used to push code to the cluster and pull
+# results back. Both are derived -- the working tree is the source of truth for
+# what goes up, and results_hrd/ (already ignored) for what comes down.
+*.tgz
+*.tar.gz
+
+# Scratch trees from local one-off tests. Named with a leading underscore so
+# they sort together and never collide with a real package.
+/_*/
+
+# Stray caches. tasks/rhythm.py writes paper_cosinor_topk<N>_cache.npz next to
+# the variant dir; running against a variant dir at the repo root lands it here
+# instead of under results_hrd/.
+/*.npz

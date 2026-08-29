@@ -1,4 +1,4 @@
-"""Shared evaluation protocols: participant-level aggregation, thresholds, metrics.
+"""Shared evaluation protocol: the probe, participant-level aggregation, thresholds, metrics.
 
 Lifted verbatim from ``train_hrd.py`` so that every task scores its predictions the
 same way without importing the training script. Upstream CoST keeps the same slot
@@ -8,8 +8,65 @@ import math
 
 import numpy as np
 from scipy.stats import rankdata
+from sklearn.covariance import LedoitWolf
+from sklearn.decomposition import PCA
+from sklearn.linear_model import LogisticRegression
 from sklearn.metrics import (accuracy_score, balanced_accuracy_score, f1_score,
                              matthews_corrcoef, roc_auc_score)
+from sklearn.pipeline import make_pipeline
+from sklearn.preprocessing import StandardScaler
+
+
+class AnomalyProbe:
+    """Semi-supervised alternative to the LR probe: fits a robust (Ledoit-Wolf shrinkage)
+    Gaussian on ONLY the non-depressed (y==0) side of the training fold -- learning what
+    "normal" circadian/activity structure looks like -- then scores every window by its
+    Mahalanobis distance to that healthy distribution, RANK-normalised to (0, 1] so it
+    plugs into the existing threshold search (`best_threshold` scans a [0.05, 0.95] grid)
+    exactly like a probability. Higher score = further from "normal" = more depression-like.
+    fit()/predict_proba() match the sklearn interface used everywhere else, so this is a
+    drop-in swap for the LogisticRegression probe -- no other code needs to change."""
+
+    def __init__(self):
+        self.scaler = StandardScaler()
+        self.cov = LedoitWolf()
+
+    def fit(self, X, y):
+        Xn = self.scaler.fit_transform(np.asarray(X)[np.asarray(y) == 0])   # non-dep side only
+        self.cov.fit(Xn)
+        return self
+
+    def predict_proba(self, X):
+        d = self.cov.mahalanobis(self.scaler.transform(X))     # squared Mahalanobis distance
+        score = rankdata(d) / len(d)                            # -> (0, 1], rank-normalised
+        return np.stack([1 - score, score], axis=1)
+
+
+def clamp_pca(n_pca, n_samples, n_features):
+    """Largest usable PCA width: sklearn requires n_components <= min(n_samples, n_features).
+
+    The pool here is tens of participants, so a requested 50 would raise inside a CV fold that
+    only has ~60 training rows. Returns 0 when PCA is disabled."""
+    if not n_pca or n_pca <= 0:
+        return 0
+    return max(1, min(int(n_pca), int(n_samples) - 1, int(n_features)))
+
+
+def make_probe(mode, C, seed, n_pca=0):
+    """Probe factory: 'supervised' = the standard 2-class LR probe; 'anomaly' = the
+    non-depressed-only Mahalanobis probe above. Same fit/predict_proba interface either way.
+
+    `n_pca` > 0 inserts PCA between the scaler and the classifier. It sits INSIDE the pipeline
+    on purpose: train_hrd.probe_cv_within_pool refits the pipeline per fold, so the
+    re-estimated on each fold's training participants only and never see the held-out ones."""
+    if mode == "anomaly":
+        return AnomalyProbe()
+    steps = [StandardScaler()]
+    if n_pca and n_pca > 0:
+        steps.append(PCA(n_components=int(n_pca), random_state=seed))
+    steps.append(LogisticRegression(C=C, max_iter=3000,
+                                    class_weight="balanced", random_state=seed))
+    return make_pipeline(*steps)
 
 
 def fast_auc(y_true, y_prob):
@@ -23,6 +80,67 @@ def fast_auc(y_true, y_prob):
         return float("nan")
     r = rankdata(y_prob)
     return float((r[y == 1].sum() - n1 * (n1 + 1) / 2) / (n1 * (len(y) - n1)))
+
+
+def per_participant_mean(feat, pids, circular=False):
+    """Each participant's windows collapsed to one feature vector, plus the participant ids.
+
+    The mean half of `persubject_rows`, factored out because the train_hrd.py headline probe
+    broadcasts it back over each person's rows. `circular=True` averages angles on the unit
+    circle --
+    the arithmetic mean of 350 deg and 10 deg is 180 deg, which is the wrong answer for a
+    phase view.
+    """
+    uniq = np.unique(pids)
+    rows = [feat[pids == p] for p in uniq]
+    out = (np.array([np.angle(np.exp(1j * r).mean(axis=0)) for r in rows]) if circular
+           else np.array([r.mean(axis=0) for r in rows]))
+    return out, uniq
+
+
+# The penalty grid the canonical per-participant probe selects from. Section E1.2 forbids
+# pinning it by hand; RQ3's --probe-c overrides it.
+PROBE_C_GRID = (0.01, 0.1, 1.0, 10.0)
+
+
+def persubject_rows(feat, pids, y, mask, circular=False):
+    """The `persubject` probe unit of design doc 0.1: one row per participant, [mean | std].
+
+    The std half is part of the definition, not an add-on -- within-person variability of the
+    latent state is itself a candidate marker, and no single window expresses it.
+
+    `circular=True` averages the mean half on the unit circle, for views whose columns are
+    ANGLES (the seasonal phase spectra): the arithmetic mean of 350 deg and 10 deg is 180 deg,
+    which is the wrong centre. The std half stays the plain arithmetic spread -- a circular
+    dispersion is a different statistic on a different scale, and substituting one here would
+    change what the column means rather than preserve it. Angular views are the only place the
+    std half should be read with that caveat.
+    """
+    mu, ps = per_participant_mean(feat[mask], pids[mask], circular=circular)
+    sd = np.array([feat[mask & (pids == q)].std(0) for q in ps])
+    ys = np.array([int(y[mask & (pids == q)][0]) for q in ps])
+    return np.hstack([mu, sd]), ys, ps
+
+
+def fit_persubject_probe(feat, pids, y, train_mask, val_mask, seed,
+                         c_grid=PROBE_C_GRID, n_pca=0, circular=False):
+    """Canonical probe for a participant-level label: `persubject` rows, penalty selected on
+    the participant-disjoint validation split (E1.2 -- never fixed by hand).
+
+    Falls back to the middle of the grid when no usable validation split exists, which is the
+    only situation in which the penalty is not selected from data.
+    """
+    Xtr, ytr, _ = persubject_rows(feat, pids, y, train_mask, circular)
+    fit = lambda c: make_probe("supervised", c, seed,
+                               clamp_pca(n_pca, len(Xtr), Xtr.shape[1])).fit(Xtr, ytr)
+    val = None if val_mask is None else (val_mask & ~train_mask)
+    if val is None or not val.any():
+        return fit(c_grid[len(c_grid) // 2])
+    Xva, yva, _ = persubject_rows(feat, pids, y, val, circular)
+    if len(set(yva)) < 2:
+        return fit(c_grid[len(c_grid) // 2])
+    return fit(max(c_grid,
+                   key=lambda c: roc_auc_score(yva, fit(c).predict_proba(Xva)[:, 1])))
 
 
 def participant_aggregate(pids, probs, labels):
@@ -89,7 +207,9 @@ def participant_bootstrap_auc(y_true, y_prob, pids, n_boot=1000, seed=0, alpha=0
 def binary_metrics(y_true, y_prob, thr):
     y_true = np.asarray(y_true)
     y_pred = (y_prob >= thr).astype(int)
-    auroc = roc_auc_score(y_true, y_prob) if len(np.unique(y_true)) > 1 else 0.5
+    # NaN, not 0.5, when the truth is single-class: AUROC is undefined there, and 0.5 is a
+    # fabricated number that reads as a real chance-level result.
+    auroc = roc_auc_score(y_true, y_prob) if len(np.unique(y_true)) > 1 else float("nan")
     # clinical rates: sensitivity = TP/(TP+FN) = fraction of depressed caught; specificity =
     # TN/(TN+FP) = fraction of non-depressed correctly cleared. Reported so the summary table
     # carries them for the SSL models too (the separability baselines already report them).
@@ -108,6 +228,39 @@ def binary_metrics(y_true, y_prob, thr):
         "specificity": float(tn / (tn + fp)) if (tn + fp) else float("nan"),
         "threshold": float(thr),
     }
+
+
+def within_person_macro_metrics(pids, y_true, y_prob, thr):
+    """Within-person metrics, averaged over participants (macro average).
+
+    Used when the label varies WITHIN a participant (emotional energy: one label per day).
+    There is then no participant-level label to pool to, so `participant_aggregate` is
+    meaningless -- it would pair a person's mean probability with one arbitrary day's label.
+    The honest participant-level question is instead asked inside each person: does the probe
+    rank THIS person's high-energy days above their own low-energy days? That is computed per
+    participant and averaged, so every person counts once regardless of how many windows they
+    contribute.
+
+    Participants whose test days are all one class are skipped -- AUC is undefined there. If
+    fewer than two participants survive that filter the average is not interpretable, so every
+    metric is returned as NaN rather than as a number resting on one person.
+    """
+    pids = np.asarray(pids)
+    y_true = np.asarray(y_true)
+    keys = ("auc_roc", "accuracy", "balanced_accuracy", "mcc", "f1",
+            "sensitivity", "specificity")
+    per, n = {}, 0
+    for pid in np.unique(pids):
+        sel = pids == pid
+        if len(np.unique(y_true[sel])) < 2:
+            continue
+        for k, v in binary_metrics(y_true[sel], y_prob[sel], thr).items():
+            if k in keys and not np.isnan(v):
+                per.setdefault(k, []).append(v)
+        n += 1
+    if n < 2:
+        return {k: float("nan") for k in keys}
+    return {k: float(np.mean(per[k])) if per.get(k) else float("nan") for k in keys}
 
 
 def prevalence_transport(sens, spec, prevalence):

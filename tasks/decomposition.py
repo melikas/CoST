@@ -33,6 +33,7 @@ Called from train_hrd.py with the in-memory model/data; emits, per variant:
   * decomposition_recovery.json      - aggregates (rec_full_*, branch recovery, leak, DIS)
 """
 import json
+from tasks.rq_paths import rq_path
 from pathlib import Path
 
 import numpy as np
@@ -256,18 +257,18 @@ def _save_table(names, wT, rFullT, rT, rST, wS, rFullS, rS, rTS, agg, variant_di
     lam = agg["ridge_alpha"]
     note = ("Ridge penalty selected on a held-out set -- "
             f"{agg['ridge_alpha_selection']}, {agg['n_alpha_select_windows']} windows -- "
-            f"from the CoST grid {agg['ridge_alpha_grid']}. "
+            f"from the DSSL grid {agg['ridge_alpha_grid']}. "
             f"lambda*: Full->tau={lam['rec_full_trend']:g} Full->sig={lam['rec_full_rhythm']:g} "
             f"V^T->tau={lam['rec_trend_branch']:g} V^S->sig={lam['rec_rhythm_branch']:g} "
             f"leak V^S->tau={lam['leak_into_trend']:g} leak V^T->sig={lam['leak_into_rhythm']:g}")
 
     csv = (",".join(cols) + "\n" + "\n".join(",".join(r) for r in rows)
            + "\n# " + foot + "\n# " + note)              # one comment line each, no newlines
-    (variant_dir / "decomposition_recovery.csv").write_text(csv, encoding="utf-8")
+    (rq_path(variant_dir, "decomposition_recovery.csv")).write_text(csv, encoding="utf-8")
     md = ("| " + " | ".join(cols) + " |\n| " + " | ".join("---" for _ in cols) + " |\n"
           + "\n".join("| " + " | ".join(r) + " |" for r in rows)
           + f"\n\n*{foot}*\n\n*{note}*\n")               # separate italic paragraphs
-    (variant_dir / "decomposition_recovery.md").write_text(md, encoding="utf-8")
+    (rq_path(variant_dir, "decomposition_recovery.md")).write_text(md, encoding="utf-8")
 
 
 def _save_figure(names, rFullT, rT, rST, rFullS, rS, rTS, agg, variant_dir, tag):
@@ -295,12 +296,12 @@ def _save_figure(names, rFullT, rT, rST, rFullS, rS, rTS, agg, variant_dir, tag)
                  f"diagnostic DIS={agg['DIS']:.2f} ({'entangled' if agg['DIS'] < 0 else 'split'})",
                  fontsize=11, fontweight="bold")
     fig.tight_layout(rect=[0, 0, 1, 0.92])
-    fig.savefig(variant_dir / "decomposition_recovery.png", dpi=200, bbox_inches="tight")
+    fig.savefig(rq_path(variant_dir, "decomposition_recovery.png"), dpi=200, bbox_inches="tight")
     plt.close(fig)
 
 
 def run_decomposition_recovery(model, X, train_mask, test_mask, variant_dir,
-                               seq_len, bin_minutes, sensor_cols=None, seed=42,
+                               bin_minutes, sensor_cols=None, seed=42,
                                batch_size=128, period_hours=24.0, alpha=None,
                                alphas=RIDGE_ALPHAS, val_mask=None, pids=None,
                                time_stride=4):
@@ -364,6 +365,6 @@ def run_decomposition_recovery(model, X, train_mask, test_mask, variant_dir,
 
     _save_table(names, wT, rFullT, rT, rST, wS, rFullS, rS, rTS, agg, variant_dir, tag)
     _save_figure(names, rFullT, rT, rST, rFullS, rS, rTS, agg, variant_dir, tag)
-    (variant_dir / "decomposition_recovery.json").write_text(json.dumps(agg, indent=2),
+    (rq_path(variant_dir, "decomposition_recovery.json")).write_text(json.dumps(agg, indent=2),
                                                              encoding="utf-8")
     return agg

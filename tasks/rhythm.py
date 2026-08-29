@@ -25,6 +25,7 @@ It produces, per variant, inside the variant's own results folder:
 Called from train_hrd.py with the in-memory model/data (no checkpoint reload).
 """
 import json
+from tasks.rq_paths import rq_path
 from pathlib import Path
 
 import numpy as np
@@ -33,18 +34,19 @@ from torch.nn.functional import normalize as l2normalize
 from models.positional_encoding import position_matrix
 from baselines.cosinor import N_PARAMS
 from tasks.decomposition import RIDGE_ALPHAS, _ridge_fit
+from tasks._eval_protocols import (best_threshold, binary_metrics, make_probe,
+                                   fit_persubject_probe, participant_aggregate,
+                                   persubject_rows,
+                                   within_person_macro_metrics)
 
 import matplotlib
 matplotlib.use("Agg")
 import matplotlib.pyplot as plt
 from sklearn.manifold import TSNE
-from sklearn.linear_model import LogisticRegression
 from sklearn.decomposition import PCA
 from sklearn.model_selection import GroupKFold
-from sklearn.pipeline import make_pipeline
 from sklearn.preprocessing import StandardScaler
-from sklearn.metrics import (roc_auc_score, f1_score, accuracy_score, r2_score,
-                             silhouette_score, balanced_accuracy_score, matthews_corrcoef)
+from sklearn.metrics import r2_score, silhouette_score
 
 # Okabe-Ito colour-blind-safe palette (widely used in reputable publications)
 CLASS_COLORS = ["#0072B2", "#D55E00"]            # depression endpoint: 0 blue, 1 vermillion
@@ -53,7 +55,7 @@ CLASS_COLORS = ["#0072B2", "#D55E00"]            # depression endpoint: 0 blue, 
 # --------------------------------------------------------------------------- #
 # 1. Representation extraction
 # --------------------------------------------------------------------------- #
-def extract_representations(model, X, batch_size=256, pool="mean"):
+def extract_representations(model, X, batch_size=256, pool="mean", season_pool=None):
     """Return the learned representations of every window in X.
 
     full   (N, repr_dims)        : [V^(T); V^(S)] window-pooled rep (model.encode, `pool`) --
@@ -74,11 +76,16 @@ def extract_representations(model, X, batch_size=256, pool="mean"):
     here they are an analysis view (kept full-dim with strong L2 in the probe, see separability_table).
     """
     eps = 1e-6                                                   # same eps as cost.py
-    full = model.encode(X, mode="forecasting", pool=pool).squeeze(1)   # (N, repr_dims)
-    d = model.net.component_dims
-    # `full` is [trend-part; season-part] with equal halves for every pool mode
-    # (each half may be >d when pool='meanmax'), so split on the midpoint.
-    half = full.shape[1] // 2
+    # `season_pool` comes from the run's config and governs the seasonal half everywhere --
+    # here, in model_build.encode_repr, and in the train_hrd headline probe. Passing it is not
+    # optional: omitting it built a time-pooled seasonal half here while RQ3 built a spectral
+    # one, and both were reported as "Full [V^(T);V^(S)]".
+    full = model.encode(X, mode="forecasting", pool=pool, season_pool=season_pool,
+                        batch_size=batch_size).squeeze(1)
+    # The trend half is time-pooled whatever the seasonal readout is, so its width is
+    # component_dims (doubled by 'meanmax', which concatenates mean and max). The halves are
+    # NOT equal under a spectral seasonal readout, so the midpoint is the wrong boundary.
+    half = model.net.component_dims * (2 if pool == "meanmax" else 1)
     trend, season = full[:, :half], full[:, half:]
 
     org = model.net.training
@@ -105,8 +112,12 @@ def extract_representations(model, X, batch_size=256, pool="mean"):
         # instead of pooled over time. Directly comparable with the `season` row above: same
         # weights, same windows, only the readout differs -- and time pooling provably keeps
         # only the DC bin (see CoST._seasonal_spectral).
-        "season_spec": model.encode(X, mode="forecasting", pool=pool,
-                                    season_pool="spec").squeeze(1)[:, half:],
+        # Explicit spectral readout, kept only when the configured one is NOT already
+        # spectral -- otherwise it is the same array as `season` and would appear twice in the
+        # table under two names.
+        "season_spec": (None if season_pool == "spec" else
+                        model.encode(X, mode="forecasting", pool=pool, season_pool="spec",
+                                     batch_size=batch_size).squeeze(1)[:, half:]),
     }
 
 
@@ -119,14 +130,32 @@ def representation_views(rep):
         "Full [V^(T);V^(S)]":  rep["full"],
         "Trend V^(T)":         rep["trend"],
         "Season V^(S)":        rep["season"],
-        "Season V^(S) spectral": rep["season_spec"],
+        **({} if rep.get("season_spec") is None
+           else {"Season V^(S) spectral": rep["season_spec"]}),
         "Seasonal amp":   rep["amp"],
         "Seasonal phase": rep["phase"],
     }
 
 
-def cosinor_markers_per_channel(cf, n_channels, top_k=2):
-    """Per-window (amplitude, acrophase) for EACH channel separately -- each (N, n_channels).
+def cosinor_markers_per_channel(cf, n_channels, top_k=2, bins_per_day=96, tol=0.05):
+    """Per-window CIRCADIAN (amplitude, acrophase, MESOR) for EACH channel -- each (N, C).
+
+    The fitted period closest to 24 h is used, and a window whose fits contain no circadian
+    period is NaN. This is not a refinement, it is a correctness requirement. The period is
+    chosen per window by a Fisher periodogram (baselines/cosinor.py::periodogram), so the
+    dominant block is often NOT circadian: measured on the real cohort over 569 windows it is
+    within 5% of 24 h for 95.8% of HR windows, 93.1% of Steps, 99.3% of is_asleep -- but only
+    64.7% of screen windows, whose dominant period reaches 12 h at the 10th percentile and
+    168 h at the 90th.
+
+    Two things broke while the period was free. (1) The angle 2*pi*phi/P lives on the circle of
+    THAT window's period, so a 06:00 peak is 1.571 rad under a 24 h fit and 0.224 rad under a
+    168 h fit -- the same physical time, a different angle, pooled into one regression.
+    (2) rhythm_axis_probe converts the angular error with 12/pi, i.e. 2*pi -> 24 h, which is
+    wrong by a factor P/96 for any other period. Fixing the period fixes both at once.
+
+    Windows dropped here need no extra bookkeeping: the probe filters on np.isfinite(target),
+    so the surviving count already appears as `n_windows` for every marker.
 
     There is deliberately no second cosinor implementation: the markers used to validate the
     latent space are read from the same `paper_cosinor_features` matrix that serves as the
@@ -140,16 +169,23 @@ def cosinor_markers_per_channel(cf, n_channels, top_k=2):
     """
     A, TH, M = [], [], []
     for c in range(n_channels):
-        b = (c * top_k) * N_PARAMS                      # dominant-period block of this channel
-        per = cf[:, b].astype(np.float64)
-        M.append(cf[:, b + 1].astype(np.float64))       # MESOR (COSINOR_PARAM_COLS[1])
-        A.append(cf[:, b + 2].astype(np.float64))       # Amplitude
-        ph = cf[:, b + 4].astype(np.float64)            # Acrophase, in bins since midnight
-        TH.append(np.where(per > 0, 2 * np.pi * ph / np.maximum(per, 1e-9), 0.0))
+        B = np.stack([cf[:, (c * top_k + k) * N_PARAMS:(c * top_k + k + 1) * N_PARAMS]
+                      for k in range(top_k)], axis=1).astype(np.float64)   # (N, top_k, 12)
+        per = B[:, :, 0]                                       # fitted period, in bins
+        rel = np.where(per > 0, np.abs(per - bins_per_day) / bins_per_day, np.inf)
+        k = np.argmin(rel, axis=1)                             # block closest to 24 h
+        pick = np.take_along_axis(B, k[:, None, None], axis=1)[:, 0, :]
+        good = np.take_along_axis(rel, k[:, None], axis=1)[:, 0] <= tol
+        M.append(np.where(good, pick[:, 1], np.nan))           # MESOR
+        A.append(np.where(good, pick[:, 2], np.nan))           # Amplitude
+        # Acrophase is a peak time in bins since midnight. Dividing by bins_per_day -- never by
+        # the fitted period -- puts every window on the SAME 24 h circle, which is what makes
+        # the angles comparable and the hours conversion in rhythm_axis_probe correct.
+        TH.append(np.where(good, 2 * np.pi * pick[:, 4] / bins_per_day, np.nan))
     return np.stack(A, 1), np.stack(TH, 1), np.stack(M, 1)
 
 
-def cosinor_markers(cf, n_channels, top_k=2):
+def cosinor_markers(cf, n_channels, top_k=2, bins_per_day=96):
     """DISPLAY-ONLY pooled summary: one (amplitude, acrophase) per window. NOT a construct.
 
     Never use this as a probe target. Sleep runs roughly ANTIPHASE to activity and heart rate
@@ -165,8 +201,11 @@ def cosinor_markers(cf, n_channels, top_k=2):
     scatter point. Everything that makes a claim -- E1.3's `rhythm_axis_probe` -- uses
     `cosinor_markers_per_channel` and reports each channel on its own.
     """
-    A, TH, _ = cosinor_markers_per_channel(cf, n_channels, top_k)
-    return A.mean(1), np.angle((A * np.exp(1j * TH)).sum(1))
+    A, TH, _ = cosinor_markers_per_channel(cf, n_channels, top_k, bins_per_day)
+    # A non-circadian channel is NaN above. It enters the amplitude-weighted circular mean
+    # with weight 0, which is exactly right: no circadian rhythm means no circadian amplitude.
+    A0, TH0 = np.nan_to_num(A), np.nan_to_num(TH)
+    return A0.mean(1), np.angle((A0 * np.exp(1j * TH0)).sum(1))
 
 
 def frequency_analysis(model, rep, variant_dir, seq_len, bin_minutes, top_k=8):
@@ -213,7 +252,7 @@ def frequency_analysis(model, rep, variant_dir, seq_len, bin_minutes, top_k=8):
     for i in range(n):
         per = "inf" if not np.isfinite(period[i]) else f"{period[i]:.3f}"
         lines.append(f"{i},{per},{importance[i]:.6f},{weight_phase[i]:.6f},{spectrum[i]:.6f}")
-    (variant_dir / "frequency_spectrum.csv").write_text("\n".join(lines), encoding="utf-8")
+    (rq_path(variant_dir, "frequency_spectrum.csv")).write_text("\n".join(lines), encoding="utf-8")
 
     # JSON: top-k periods (excluding DC f=0) + the key circadian / 12 h / weekly bins
     def _topk(vals):
@@ -237,7 +276,7 @@ def frequency_analysis(model, rep, variant_dir, seq_len, bin_minutes, top_k=8):
         "top_by_repr_amplitude": _topk(spectrum),
         "key_periods": {"24h_circadian": _at(24.0), "12h": _at(12.0), "168h_weekly": _at(168.0)},
     }
-    (variant_dir / "frequency_spectrum.json").write_text(json.dumps(summary, indent=2), encoding="utf-8")
+    (rq_path(variant_dir, "frequency_spectrum.json")).write_text(json.dumps(summary, indent=2), encoding="utf-8")
 
     # NOTE: frequency_spectrum.png is intentionally NOT produced (removed on request).
     # The per-bin weight-importance / representation-amplitude data still live in
@@ -313,7 +352,7 @@ def group_spectrum_contrast(rep, y, mask, pids, variant_dir, seq_len, bin_minute
         lines.append(f"{i},{per},{amp_mean[0][i]:.6f},{amp_mean[1][i]:.6f},"
                      f"{amp_mean[1][i] - amp_mean[0][i]:.6f},"
                      f"{ph_mean[0][i]:.6f},{ph_mean[1][i]:.6f},{dphi[i]:.6f}")
-    (variant_dir / "frequency_contrast.csv").write_text("\n".join(lines), encoding="utf-8")
+    (rq_path(variant_dir, "frequency_contrast.csv")).write_text("\n".join(lines), encoding="utf-8")
 
     # ---- merged figure: amplitude (top) + phase (bottom) ----
     # every test-group window is a faint curve with the bold group mean over it (full distribution
@@ -376,7 +415,7 @@ def group_spectrum_contrast(rep, y, mask, pids, variant_dir, seq_len, bin_minute
         fig.suptitle(f"Seasonal-representation spectrum by {spectrum_title_noun}  —  {tag}",
                      fontsize=13, fontweight="bold", color=INK, x=0.012, ha="left")
         fig.tight_layout(rect=[0, 0, 1, 0.96])
-        fig.savefig(variant_dir / "frequency_contrast.png", dpi=200, bbox_inches="tight",
+        fig.savefig(rq_path(variant_dir, "frequency_contrast.png"), dpi=200, bbox_inches="tight",
                     facecolor="white")
         plt.close(fig)
     except Exception as e:
@@ -384,7 +423,7 @@ def group_spectrum_contrast(rep, y, mask, pids, variant_dir, seq_len, bin_minute
     return {"n_depressed": n_dep, "n_nondepressed": n_non}
 
 
-def group_spectrum_heatmap(rep, y, mask, pids, variant_dir, seq_len, bin_minutes, dS,
+def group_spectrum_heatmap(rep, y, mask, variant_dir, seq_len, bin_minutes, dS,
                            tag="", label_names=None):
     """The FULL seasonal field (period x dS latent channels) WITHOUT collapsing the channels --
     the structure the line figure's mean-over-channels hides. One 2x3 grid: rows = amplitude /
@@ -448,11 +487,55 @@ def group_spectrum_heatmap(rep, y, mask, pids, variant_dir, seq_len, bin_minutes
         fig.suptitle(f"Seasonal amp/phase field — period × {dS} channels — {tag}\n"
                      "phase panels: grey = low amplitude (phase unreliable)",
                      fontsize=12, fontweight="bold")
-        fig.savefig(variant_dir / "frequency_heatmap.png", dpi=200, facecolor="white")
+        fig.savefig(rq_path(variant_dir, "frequency_heatmap.png"), dpi=200, facecolor="white")
         plt.close(fig)
     except Exception as e:
         print(f"[spectrum-heatmap] skipped ({type(e).__name__}: {e})")
     return {"Ffreq": Ffreq, "dS": dS}
+
+
+def _shared_pc1(seq):
+    """(n_win, T, d) -> (n_win, T): every window projected on ONE direction, so the weeks stay
+    comparable and the waveform keeps the branch's dominant variance.
+
+    The previous summary was `seq.mean(-1)`, the mean ACROSS channels. Channels carry their own
+    phase and sign, so that average cancels: measured on run 1239199, only 4.1-11.0% of the
+    24 h amplitude survived it, i.e. the panel was drawing cancellation residue. The leading
+    principal direction of the participant's own windows carries 70-79% of the variance
+    instead, and one direction shared by all weeks is what makes first-vs-last a comparison of
+    the person rather than of two arbitrary projections.
+
+    The sign of a principal direction is arbitrary; it is fixed by forcing the largest-magnitude
+    loading positive (the svd_flip convention), so re-running cannot mirror the figure.
+    """
+    A = seq.reshape(-1, seq.shape[-1])
+    g = A.mean(0)
+    v = np.linalg.svd(A - g, full_matrices=False)[2][0]
+    v = v * np.sign(v[np.argmax(np.abs(v))])
+    return (seq - g) @ v
+
+
+PHASE_K = 2.079
+
+
+def _phase_where_defined(a, ph, k=PHASE_K):
+    """Phase, blanked wherever the amplitude that carries it is at the noise floor.
+
+    A Fourier phase is undefined at zero amplitude, and `atan2` returns a value regardless, so
+    drawing the whole curve gave half the panel to a dense zigzag between +/-pi that carries no
+    information -- and, because the wrap is a branch cut rather than a real jump, invited
+    reading a phase SHIFT off it.
+
+    THRESHOLD, derived rather than chosen. Under circular-Gaussian noise the FFT magnitude is
+    Rayleigh(sigma), whose median is sigma*sqrt(2*ln 2) = 1.1774*sigma and whose 95th
+    percentile is sigma*sqrt(2*ln 20) = 2.4477*sigma. Their ratio, 2.079, is therefore the
+    multiple of the OBSERVED median at which a bin is significant at the 5% per-bin level --
+    and the median is the right reference because most bins in this spectrum are noise, so it
+    estimates sigma robustly while the mean would be dragged up by the harmonics themselves.
+    On run 1239199 the 24 h bin sits 19.5-61.3x above that floor.
+    """
+    a = np.asarray(a, float)
+    return np.where(a >= k * float(np.median(a)), np.asarray(ph, float), np.nan)
 
 
 def participant_trajectory_figures(model, X, y, pids, baseline_by_pid, rep, variant_dir,
@@ -461,9 +544,10 @@ def participant_trajectory_figures(model, X, y, pids, baseline_by_pid, rep, vari
     -- one per (baseline, endpoint) depression-status trajectory {dep->dep, non->non,
     dep->non, non->dep} -- plot that SAME participant's FIRST vs LAST window, four panels:
     seasonal amplitude and phase (vs period, reusing the already-computed `rep` spectra), the
-    raw TREND sequence V^(T) and the raw SEASONAL sequence V^(S) (each mean over its dS
-    channels) vs time-within-window. The two time-domain panels are the waveform view of what
-    the two frequency-domain panels above describe as a spectrum; panel 4 is dropped in plain
+    TREND sequence V^(T) and the SEASONAL sequence V^(S) vs time-within-window, each projected
+    onto the leading principal direction of THAT participant's own windows. The two
+    time-domain panels are the waveform view of what the two frequency-domain panels above
+    describe as a spectrum; panel 4 is dropped in plain
     (--no-disentangle) mode, where the encoder has no seasonal branch. The bold
     colors are "first week" vs "last week" of ONE person, not two different people; every week
     IN BETWEEN is drawn as a faint grey line so the whole within-person trajectory is visible --
@@ -537,11 +621,11 @@ def participant_trajectory_figures(model, X, y, pids, baseline_by_pid, rep, vari
                 xb = torch.from_numpy(X[idx]).float().to(model.device)
                 trend_seq, season_seq = model.net(xb)      # (n_win, T, dS); season None if plain
                 model.net.train(org)
-            trend_mean = trend_seq.mean(dim=-1).cpu().numpy()           # (n_win, T)
+            trend_mean = _shared_pc1(trend_seq.cpu().numpy())            # (n_win, T)
             # V^(S) in the TIME domain -- the counterpart of the trend panel. The amp/phase
             # panels show the SAME seasonal branch in the FREQUENCY domain, so this fourth
             # box is what those spectra actually look like as a waveform across the week.
-            season_mean = (season_seq.mean(dim=-1).cpu().numpy()
+            season_mean = (_shared_pc1(season_seq.cpu().numpy())
                            if season_seq is not None else None)         # (n_win, T) or None
         except Exception as e:
             print(f"[trajectory] {pid} trend sequence skipped ({type(e).__name__}: {e})")
@@ -558,15 +642,18 @@ def participant_trajectory_figures(model, X, y, pids, baseline_by_pid, rep, vari
             # in-between weeks first (faint grey), so the bold first/last lines sit on top
             for w in range(1, n_win - 1):
                 axA.plot(xr, ap[w][0], color=MUTED, lw=0.9, alpha=0.35)
-                axP.plot(xr, ap[w][1], color=MUTED, lw=0.9, alpha=0.35)
+                axP.plot(xr, _phase_where_defined(*ap[w]), color=MUTED, lw=0.9, alpha=0.35,
+                         marker=".", ms=2.5)
                 axT.plot(t_axis, trend_mean[w], color=MUTED, lw=0.9, alpha=0.35)
                 if axS is not None:
                     axS.plot(t_axis, season_mean[w], color=MUTED, lw=0.9, alpha=0.35)
             # bold first + last week on top
             axA.plot(xr, ap[0][0], color=COL["first"], lw=2.2)
             axA.plot(xr, ap[-1][0], color=COL["last"], lw=2.2)
-            axP.plot(xr, ap[0][1], color=COL["first"], lw=2.2)
-            axP.plot(xr, ap[-1][1], color=COL["last"], lw=2.2)
+            axP.plot(xr, _phase_where_defined(*ap[0]), color=COL["first"], lw=2.2,
+                     marker="o", ms=4)
+            axP.plot(xr, _phase_where_defined(*ap[-1]), color=COL["last"], lw=2.2,
+                     marker="o", ms=4)
             axT.plot(t_axis, trend_mean[0], color=COL["first"], lw=2.2)
             axT.plot(t_axis, trend_mean[-1], color=COL["last"], lw=2.2)
             if axS is not None:
@@ -575,14 +662,22 @@ def participant_trajectory_figures(model, X, y, pids, baseline_by_pid, rep, vari
             panels = [
                 (axA, "period (h)", "seasonal amplitude |F|", True),
                 (axP, "period (h)", "seasonal phase ∠F (rad)", True),
-                (axT, "time within window (h)", "trend V^(T)  (mean over channels)", False),
+                (axT, "time within window (h)", "trend V^(T)  (PC1 of this participant)", False),
             ]
             if axS is not None:
                 panels.append((axS, "time within window (h)",
-                               "seasonal V^(S)  (mean over channels)", False))
+                               "seasonal V^(S)  (PC1 of this participant)", False))
             for ax, xlab, ylab, logx in panels:
                 if logx:
                     ax.set_xscale("log"); ax.set_xlim(xr.max(), xr.min())
+                    # Named periods, not decades: 10^2 and 10^1 left the one line the figure
+                    # exists to show -- 24 h -- unlabelled.
+                    tk = [t for t in (168, 24, 12, 8, 6, 4, 2) if xr.min() <= t <= xr.max()]
+                    ax.set_xticks(tk); ax.set_xticklabels([f"{t}h" for t in tk], fontsize=8)
+                    ax.minorticks_off()
+                    for h, cc in ((24, "#c0392b"), (12, "#3b9ad9")):
+                        if xr.min() <= h <= xr.max():
+                            ax.axvline(h, color=cc, lw=1.0, ls="--", alpha=.7, zorder=0)
                 else:
                     # day boundaries -- the circadian structure of V^(S) is only readable
                     # against them (and they make the trend panel comparable)
@@ -601,7 +696,7 @@ def participant_trajectory_figures(model, X, y, pids, baseline_by_pid, rep, vari
             fig.suptitle(f"{pid}  ({tag})  --  first vs last week  ({n_win} weeks total)",
                          fontsize=12, fontweight="bold")
             fig.tight_layout(rect=[0, 0, 1, 0.96])
-            fig.savefig(variant_dir / f"participant_trajectory_{pid}.png", dpi=200,
+            fig.savefig(rq_path(variant_dir, f"participant_trajectory_{pid}.png"), dpi=200,
                        bbox_inches="tight", facecolor="white")
             plt.close(fig)
             print(f"[trajectory] {pid} ({tag}, {n_win} weeks) -> participant_trajectory_{pid}.png")
@@ -612,88 +707,38 @@ def participant_trajectory_figures(model, X, y, pids, baseline_by_pid, rep, vari
 # --------------------------------------------------------------------------- #
 # 2. Quantitative separability table
 # --------------------------------------------------------------------------- #
-def _agg_participant(pids, prob, y):
-    uniq = np.unique(pids)
-    p = np.array([prob[pids == u].mean() for u in uniq])
-    l = np.array([int(y[pids == u][0]) for u in uniq])
-    return p, l
 
 
-def _metrics(y_true, prob, thr=0.5):
-    """AUC (threshold-free) + threshold metrics at `thr`. Balanced accuracy and MCC are
-    added alongside F1/Acc: on the (near-)balanced test set F1 saturates at ~0.667 for a
-    degenerate all-positive classifier, while MCC is 0 there -- a more honest operating-point
-    score. Sensitivity (recall/TPR) and specificity (TNR) are the clinical rates: sensitivity
-    = TP/(TP+FN) = fraction of depressed caught, specificity = TN/(TN+FP) = fraction of
-    non-depressed correctly cleared."""
-    y_true = np.asarray(y_true)
-    pred = (prob >= thr).astype(int)
-    auc = roc_auc_score(y_true, prob) if len(np.unique(y_true)) > 1 else float("nan")
-    tp = int(((pred == 1) & (y_true == 1)).sum()); fn = int(((pred == 0) & (y_true == 1)).sum())
-    tn = int(((pred == 0) & (y_true == 0)).sum()); fp = int(((pred == 1) & (y_true == 0)).sum())
-    sens = tp / (tp + fn) if (tp + fn) else float("nan")     # recall / true-positive rate
-    spec = tn / (tn + fp) if (tn + fp) else float("nan")     # true-negative rate
-    return {
-        "auc": auc,
-        "f1": f1_score(y_true, pred, zero_division=0),
-        "acc": accuracy_score(y_true, pred),
-        "bacc": balanced_accuracy_score(y_true, pred),
-        "mcc": matthews_corrcoef(y_true, pred),
-        "sensitivity": sens,
-        "specificity": spec,
-    }
 
 
-def _macro_participant_metrics(pids, y_true, prob, thr):
-    """Within-person metrics, averaged over participants (macro average).
-
-    Used when the label varies WITHIN a participant (emotional energy: one label per day).
-    There is then no participant-level label to pool to, so `_agg_participant` is meaningless
-    -- it would pair a person's mean probability with one arbitrary day's label. The honest
-    participant-level question is instead asked inside each person: does the probe rank THIS
-    person's high-energy days above their own low-energy days? That is computed per
-    participant and averaged, so every person counts once regardless of how many windows they
-    contribute.
-
-    Participants whose test days are all one class are skipped -- AUC is undefined there.
-    If fewer than two participants survive that filter the average is not interpretable, so
-    every metric is returned as NaN rather than as a number resting on one person.
-    """
-    pids = np.asarray(pids)
-    y_true = np.asarray(y_true)
-    keys = ("auc", "f1", "acc", "bacc", "mcc", "sensitivity", "specificity")
-    per = {}
-    n = 0
-    for p in np.unique(pids):
-        sel = pids == p
-        if len(np.unique(y_true[sel])) < 2:
-            continue
-        for k, v in _metrics(y_true[sel], prob[sel], thr).items():
-            if not np.isnan(v):
-                per.setdefault(k, []).append(v)
-        n += 1
-    if n < 2:
-        return {k: float("nan") for k in keys}
-    return {k: float(np.mean(per[k])) if per.get(k) else float("nan") for k in keys}
 
 
-def _best_threshold(y_true, prob):
-    """Decision threshold in [0.05, 0.95] that maximises BALANCED ACCURACY (= Youden's J up
-    to a constant). Mirrors train_hrd.best_threshold so the separability metrics use the same
-    operating point as the downstream model. Balanced accuracy scores a degenerate
-    all-one-class predictor at 0.5, so -- unlike F1-max -- it never selects the collapsed
-    threshold when a genuinely discriminative one exists (fixes the MCC=0 failure)."""
-    best_thr, best_ba = 0.5, -1.0
-    for thr in np.linspace(0.05, 0.95, 37):
-        ba = balanced_accuracy_score(y_true, (prob >= thr).astype(int))
-        if ba > best_ba:
-            best_ba, best_thr = ba, float(thr)
-    return best_thr
+def _persubject_row(name, native, note, clf, R, pids, y, train_mask, val_mask, test_mask, seed):
+    """One table row from a fitted canonical per-participant probe. Rows are already people,
+    so the Win* and Subj* columns are the same measurement and are reported as such."""
+    Xte, yte, _ = persubject_rows(R, pids, y, test_mask, "phase" in name.lower())
+    prob = clf.predict_proba(Xte)[:, 1]
+    thr = 0.5
+    if val_mask is not None and int(np.sum(val_mask)) > 0:
+        val = val_mask & ~train_mask
+        if val.any():
+            Xva, yva, _ = persubject_rows(R, pids, y, val, "phase" in name.lower())
+            if len(set(yva)) > 1:
+                thr = best_threshold(yva, clf.predict_proba(Xva)[:, 1])
+    m = binary_metrics(yte, prob, thr)
+    return {"Representation": name, "Dim": native, "Thr": float(thr),
+            "Win AUC": m["auc_roc"], "Win F1": m["f1"], "Win Acc": m["accuracy"],
+            "Win BAcc": m["balanced_accuracy"], "Win MCC": m["mcc"],
+            "Win Sens": m["sensitivity"], "Win Spec": m["specificity"],
+            "Subj AUC": m["auc_roc"], "Subj F1": m["f1"], "Subj Acc": m["accuracy"],
+            "Subj BAcc": m["balanced_accuracy"], "Subj MCC": m["mcc"],
+            "Subj Sens": m["sensitivity"], "Subj Spec": m["specificity"],
+            "_highdim_note": note}
 
 
 def separability_table(views, y, pids, train_mask, test_mask, val_mask=None, seed=42,
                        highdim_threshold=2000, highdim_C=0.01, dim_labels=None,
-                       pca_views=None, lowdim_C=1.0, agg_views=None, macro_pids=None):
+                       pca_views=None, lowdim_C=1.0, persubject=False, macro_pids=None):
     """Fit a logistic-regression probe on each representation (train split) and score it
     on the held-out test split, at window and participant level.
 
@@ -708,12 +753,14 @@ def separability_table(views, y, pids, train_mask, test_mask, val_mask=None, see
     FULL -- no PCA -- and regularised with a strong L2 penalty (small `highdim_C`); the
     small representations (Full/Trend/Season/Cosinor, p < n) use `lowdim_C`.
 
-    `agg_views` (set of view names): for these views the feature of EACH participant is first
-    averaged over ALL of that participant's windows (circular mean for phase views), then
-    broadcast back, so the one-window-per-participant probe row carries a STABLE per-person
-    estimate instead of a single noisy week. Applied identically to train / val / test, so the
-    aggregation is consistent (and stays pseudo-replication-free -- still one sample per
-    participant). Intended for the noisy high-dimensional Seasonal amp/phase views.
+    `persubject=True` switches every view to the CANONICAL participant-level estimator in
+    _eval_protocols (`persubject_rows` + `fit_persubject_probe`): one row per participant
+    holding [mean | std] of their windows, with the penalty selected on the participant-
+    disjoint validation split. That is the unit design doc 0.1 declares primary for the
+    depression endpoint, and E1.2's rule that the penalty is never fixed by hand. RQ3 probes
+    through the same two functions, so the two evaluations cannot disagree by protocol.
+    `highdim_C` / `lowdim_C` and the mean-only aggregation they went with apply to the
+    window-row units (`last`, `all`) only.
 
     `pca_views` {view_name: n_components}: for those views the probe first reduces the
     features with PCA **fit on the TRAIN split only** (PCA lives inside the pipeline, so
@@ -728,42 +775,34 @@ def separability_table(views, y, pids, train_mask, test_mask, val_mask=None, see
     AUC is threshold-free. `dim_labels` gives the readable 'Ffreq×dS' form for the FFT views."""
     dim_labels = dim_labels or {}
     pca_views = pca_views or {}
-    agg_views = agg_views or set()
     use_val = val_mask is not None and int(np.sum(val_mask)) > 0
     n_train = int(np.sum(train_mask))
     rows = []
     yte, pte = y[test_mask], pids[test_mask]
     for name, R in views.items():
         agg_note = None
-        if name in agg_views:
-            # per-person feature: average this view over ALL of the person's windows (circular
-            # mean for phase), then broadcast. The one-window-per-participant probe row then
-            # carries a stable per-person estimate, identical for train / val / test.
-            circ = "phase" in name.lower()
-            R = R.copy()
-            for pid in np.unique(pids):
-                sel = pids == pid
-                R[sel] = (np.angle(np.exp(1j * R[sel]).mean(axis=0)) if circ
-                          else R[sel].mean(axis=0))
-            agg_note = f"{name}: per-participant mean over all windows"
+        if persubject:
+            # Canonical participant-level estimator -- the single implementation RQ3 also uses.
+            n_pca = int(pca_views.get(name, 0))
+            circ = "phase" in name.lower()          # angular columns -> circular mean
+            clf = fit_persubject_probe(R, pids, y, train_mask, val_mask, seed,
+                                       n_pca=n_pca, circular=circ)
+            native = f"PCA{n_pca}" if n_pca else f"2x{dim_labels.get(name, R.shape[1])}"
+            note = f"{name} = [mean|std] per participant, C selected on val"
+            rows.append(_persubject_row(name, native, note, clf, R, pids, y,
+                                        train_mask, val_mask, test_mask, seed))
+            continue
         if name in pca_views:
             # PCA fit on TRAIN only (in-pipeline, leakage-safe). At most n_train-1 comps.
             n_comp = max(2, min(int(pca_views[name]), R.shape[1], n_train - 1))
-            clf = make_pipeline(
-                StandardScaler(),
-                PCA(n_components=n_comp, random_state=seed),
-                LogisticRegression(C=1.0, max_iter=3000, class_weight="balanced", random_state=seed),
-            )
+            clf = make_probe("supervised", 1.0, seed, n_comp)
             native = f"PCA{n_comp}"
             note = (f"{name} = PCA {n_comp} comps (fit on train) <- "
                     f"{dim_labels.get(name, R.shape[1])}")
         else:
             highdim = R.shape[1] > highdim_threshold    # amp/phase spectra: p >> n
             C = highdim_C if highdim else lowdim_C       # strong L2 for p>>n, else downstream --probe-c
-            clf = make_pipeline(
-                StandardScaler(),
-                LogisticRegression(C=C, max_iter=3000, class_weight="balanced", random_state=seed),
-            )
+            clf = make_probe("supervised", C, seed)
             native = dim_labels.get(name, str(R.shape[1]))
             note = (f"{name} = {native} dims kept in full, strong L2 (C={C:g})"
                     if highdim else None)
@@ -774,29 +813,29 @@ def separability_table(views, y, pids, train_mask, test_mask, val_mask=None, see
         # per-representation decision threshold, tuned on the participant-aggregated
         # validation split (matches the downstream model); 0.5 if no validation split.
         if use_val:
-            vp, vl = _agg_participant(pids[val_mask],
-                                     clf.predict_proba(R[val_mask])[:, 1], y[val_mask])
-            thr = _best_threshold(vl, vp)
+            vp, vl = participant_aggregate(pids[val_mask],
+                                           clf.predict_proba(R[val_mask])[:, 1], y[val_mask])
+            thr = best_threshold(vl, vp)
         else:
             thr = 0.5
 
-        w = _metrics(yte, prob, thr)
+        w = binary_metrics(yte, prob, thr)
         if macro_pids is not None:
             # per-DAY label: average the metric computed inside each participant
-            p = _macro_participant_metrics(np.asarray(macro_pids)[test_mask], yte, prob, thr)
+            p = within_person_macro_metrics(np.asarray(macro_pids)[test_mask], yte, prob, thr)
         else:
             # participant-level label: pool each person's windows into one sample
-            pp, pl = _agg_participant(pte, prob, yte)
-            p = _metrics(pl, pp, thr)
+            pp, pl = participant_aggregate(pte, prob, yte)
+            p = binary_metrics(pl, pp, thr)
         row = {
             "Representation": name,
             "Dim": native,
             "Thr": float(thr),
-            "Win AUC": w["auc"], "Win F1": w["f1"], "Win Acc": w["acc"],
-            "Win BAcc": w["bacc"], "Win MCC": w["mcc"],
+            "Win AUC": w["auc_roc"], "Win F1": w["f1"], "Win Acc": w["accuracy"],
+            "Win BAcc": w["balanced_accuracy"], "Win MCC": w["mcc"],
             "Win Sens": w["sensitivity"], "Win Spec": w["specificity"],
-            "Subj AUC": p["auc"], "Subj F1": p["f1"], "Subj Acc": p["acc"],
-            "Subj BAcc": p["bacc"], "Subj MCC": p["mcc"],
+            "Subj AUC": p["auc_roc"], "Subj F1": p["f1"], "Subj Acc": p["accuracy"],
+            "Subj BAcc": p["balanced_accuracy"], "Subj MCC": p["mcc"],
             "Subj Sens": p["sensitivity"], "Subj Spec": p["specificity"],
         }
         full_note = "; ".join(n for n in (note, agg_note) if n)
@@ -839,7 +878,7 @@ def save_table(rows, variant_dir, table_tag="", unit_note=""):
     # CSV
     csv = ",".join(cols) + "\n" + "\n".join(
         ",".join(cell_of(r, c) for c in cols) for r in rows)
-    (variant_dir / f"{stem}.csv").write_text(csv, encoding="utf-8")
+    (rq_path(variant_dir, f"{stem}.csv")).write_text(csv, encoding="utf-8")
 
     # Markdown
     md = ("| " + " | ".join(cols) + " |\n"
@@ -847,7 +886,7 @@ def save_table(rows, variant_dir, table_tag="", unit_note=""):
           + "\n".join("| " + " | ".join(cell_of(r, c) for c in cols) + " |" for r in rows))
     if note_line:
         md += f"\n\n*{note_line}*\n"
-    (variant_dir / f"{stem}.md").write_text(md, encoding="utf-8")
+    (rq_path(variant_dir, f"{stem}.md")).write_text(md, encoding="utf-8")
 
     # Rendered PNG (best subject AUC highlighted)
     def _auc(i):
@@ -884,7 +923,7 @@ def save_table(rows, variant_dir, table_tag="", unit_note=""):
         fig.text(0.5, 0.005, note_line, ha="center", va="bottom",
                  fontsize=7, style="italic", color="0.35")
     fig.tight_layout()
-    fig.savefig(variant_dir / f"{stem}.png", dpi=200, bbox_inches="tight")
+    fig.savefig(rq_path(variant_dir, f"{stem}.png"), dpi=200, bbox_inches="tight")
     plt.close(fig)
 
 
@@ -996,7 +1035,7 @@ def label_embedding_figure(views, y, idx, variant_dir, fname, method, embed, hea
         axes[j].axis("off")
     fig.suptitle(heading, fontsize=13, fontweight="bold")
     fig.tight_layout(rect=[0, 0, 1, 0.96])
-    fig.savefig(variant_dir / fname, dpi=200, bbox_inches="tight")
+    fig.savefig(rq_path(variant_dir, fname), dpi=200, bbox_inches="tight")
     plt.close(fig)
 
 
@@ -1029,7 +1068,8 @@ def clinical_marker_tsne(emb_view, Xs, idx, variant_dir, bin_minutes, seed, tag,
     regularity). A smooth colour gradient => the latent space is organised by rhythm biology. One
     t-SNE, three colourings (amplitude/IS = viridis; acrophase = cyclic, coloured as hour-of-day)."""
     variant_dir = Path(variant_dir)
-    amp, acro = cosinor_markers(cf, n_sensors, top_k)            # clock-anchored, subject-level
+    amp, acro = cosinor_markers(cf, n_sensors, top_k,
+                                int(round(24 * 60 / bin_minutes)))   # clock-anchored
     acro_h = (acro % (2 * np.pi)) * 24 / (2 * np.pi)             # peak hour of day
     IS = _interdaily_stability(Xs, int(round(24 * 60 / bin_minutes)))
     emb = _tsne(np.asarray(emb_view)[idx], seed)
@@ -1047,7 +1087,7 @@ def clinical_marker_tsne(emb_view, Xs, idx, variant_dir, bin_minutes, seed, tag,
     fig.suptitle(f"Latent space coloured by clinical circadian markers  —  {tag}",
                  fontsize=12, fontweight="bold")
     fig.tight_layout(rect=[0, 0, 1, 0.95])
-    fig.savefig(variant_dir / fname, dpi=200, bbox_inches="tight")
+    fig.savefig(rq_path(variant_dir, fname), dpi=200, bbox_inches="tight")
     plt.close(fig)
 
 
@@ -1079,27 +1119,117 @@ def _bin_of_week(window_ids, T, bin_minutes):
     return (s0[:, None] + np.arange(T)[None, :]) % (7 * bpd)
 
 
+def _clock_variance(u, tod, pid_of_window):
+    """How much of the per-bin embedding's variance is explained by CLOCK TIME, and how much
+    by WHO the person is. BEYOND the paper (see docs/METHODOLOGY.md).
+
+    WavesFM never needed this: it had one model that did not degenerate. Our runs produce two
+    OPPOSITE degeneracies that a similarity plot cannot tell apart, because both draw a clean
+    curve:
+      * collapse to one direction -- every bin's embedding is nearly identical (cos ~ 1), so
+        the "rhythm" is a numerical wobble that autoscaling inflates to full panel height;
+      * collapse to one frequency -- the embedding is a perfect function of clock time and
+        NOTHING else, identical for every participant, which draws a flawless sinusoid while
+        carrying zero information about anyone.
+    Only the second number separates them: a representation that is useful for RQ1-RQ3 must
+    vary with the clock AND still differ between people at the same hour.
+
+    Each fraction is the share of total variance explained by that factor ALONE (a one-way
+    sum of squares). They are NOT orthogonal and do not sum to 1 -- clock and participant are
+    correlated whenever people wear the device on different schedules -- so read each against
+    zero, never as a partition.
+    """
+    flat = u.reshape(-1, u.shape[-1])
+    g = flat.mean(0)
+    ss_tot = float(((flat - g) ** 2).sum())
+    if ss_tot <= 0:
+        return {"clock_var_frac": None, "participant_var_frac": None}
+
+    def explained(key):
+        ss = 0.0
+        for k in np.unique(key):
+            m = key == k
+            ss += m.sum() * float(((flat[m].mean(0) - g) ** 2).sum())
+        return round(ss / ss_tot, 5)
+
+    pw = np.repeat(np.asarray(pid_of_window), u.shape[1])
+    return {"clock_var_frac": explained(tod.ravel()),
+            "participant_var_frac": explained(pw)}
+
+
+def _single_mode_r2(s, bpd):
+    """R^2 of s(lag) against ONE cosine at exactly 1 cycle/day. ~1.0 means the representation
+    is a single Fourier mode: a perfect clock, and nothing else."""
+    if len(s) < 2 * bpd or bpd <= 0:
+        return None
+    lag = np.arange(len(s), dtype=float)
+    A = np.stack([np.ones_like(lag), np.cos(2 * np.pi * lag / bpd),
+                  np.sin(2 * np.pi * lag / bpd)], 1)
+    fit = A @ np.linalg.lstsq(A, s, rcond=None)[0]
+    ss = float(((s - s.mean()) ** 2).sum())
+    return round(1 - float(((s - fit) ** 2).sum()) / ss, 5) if ss > 0 else None
+
+
+def _period_power(s, bin_minutes):
+    """Share of s(lag)'s periodic power sitting at each period, and the 24 h / 12 h shares.
+
+    `s(lag)` is already the mean cosine between two bins `lag` apart, so its own spectrum says
+    which periods the representation REPEATS at. The window is 168 h, so period 168/k hours
+    lands on integer bin k: 24 h is bin 7 and 12 h is bin 14, both exact -- no interpolation.
+
+    Bin k=1 (the 168 h "weekly" line) is deliberately NOT reported. One cycle inside a one-week
+    window is a trend, not a rhythm: nothing distinguishes it from a slow drift, and reporting
+    it as a circaseptan period would be an artefact of the window length. The paper reads
+    circaseptan structure the other way, as a flattening of the Sat/Sun peaks, which stays
+    visible in the anchored columns.
+
+    Power is normalised by the total EXCLUDING the DC bin, so the numbers are shares of the
+    part of s(lag) that actually oscillates, not of its mean level.
+    """
+    f = np.abs(np.fft.rfft(s - s.mean()))
+    tot = float(f[1:].sum())
+    if tot <= 0:
+        return None, None, None, None
+    per = np.array([float("inf")] + [len(s) * bin_minutes / 60.0 / k
+                                     for k in range(1, len(f))])
+    frac = f / tot
+    at = lambda h: int(round(len(s) * bin_minutes / 60.0 / h))
+    k24, k12 = at(24.0), at(12.0)
+    p24 = round(float(frac[k24]), 5) if 1 <= k24 < len(f) else None
+    p12 = round(float(frac[k12]), 5) if 1 <= k12 < len(f) else None
+    return per, frac, p24, p12
+
+
 def circadian_similarity_figure(model, X, pids, mask, variant_dir, bin_minutes, tag,
                                 table_tag="", batch_size=256, window_ids=None,
-                                anchor_hour=9, max_windows=400, n_anchor=16, seed=42):
-    """WavesFM Fig. 14, reproduced on this cohort: the DENSITY of pairwise cosine similarities,
-    not just their mean. Two representations are compared as the paper compares its two
-    (Stage I vs Stage II): CoST's trend branch V^(T) against its seasonal branch V^(S), the one
-    that is supposed to carry rhythm.
+                                n_sensors=None, anchors=(0, 9), max_windows=400,
+                                n_anchor=16, seed=42):
+    """WavesFM Fig. 14 reproduced on this cohort, with its layout and its FIXED axes.
 
-    Three columns per branch:
-      (a) Fig. 14a -- every sampled pair against the TIME DISTANCE between its two bins. A
-          circadian representation ridges at 1, 2, 3 ... days; a merely smooth one decays.
-      (b) Fig. 14b/c -- every bin against its position in the WEEK, referenced to each window's
-          own ``anchor_hour`` bin on Monday. Peaks recurring each day at the anchor hour are
-          the circadian cycle; a flattening over Sat/Sun is the circaseptan (weekday/weekend)
-          shift the paper reports.
-      (c) one line per PARTICIPANT: their own similarity profile folded onto a single 24 h
-          clock. This is the individual-level view -- a group density can look rhythmic while
-          no single person is, and this panel shows whether the cycle is really per-person.
+    The paper compares the INPUT of its temporal encoder (per-bin Stage I embeddings) against
+    that encoder's OUTPUT, on one shared y axis, to show what the temporal model adds. The
+    same three rows here: the raw sensor bins that enter the encoder, then the two branches
+    that come out of it.
 
-    Everything is indexed by CALENDAR time via ``window_ids`` (see ``_bin_of_week``), so the
-    x axes mean clock time whether or not the windows were midnight-aligned."""
+    Columns are the paper's Fig. 14 exactly:
+      (a) every intra-window pair against the TIME DISTANCE between its two bins;
+      (b), (c) every bin against its position in the WEEK, referenced to that window's own
+          Monday `anchors[0]`:00 and `anchors[1]`:00 bin. Two anchors, not one, because that
+          is the paper's own control: a rhythm visible under only one reference hour is a
+          property of the reference, not of the representation.
+
+    Vectors are compared after their per-window temporal mean is removed, and every panel is
+    drawn on a FIXED [-1, 1] cosine axis. This is the single most important
+    difference from the previous version, which let matplotlib autoscale each panel: a
+    diurnal swing of 0.006 and one of 1.99 were then drawn at identical visual height, so
+    seeds differing by a factor of 500 looked alike and a fully collapsed representation
+    looked like a textbook circadian rhythm. The paper fixes its own axis at 0.2-1.0 for
+    exactly this reason.
+
+    `n_sensors` selects the raw row's channels; the appended clock features are excluded
+    because they are deterministic 24 h cosines and would draw a perfect rhythm by
+    construction. Without it the raw row is skipped rather than silently drawn from them.
+    """
     variant_dir = Path(variant_dir)
     bpd = int(round(24 * 60 / bin_minutes))
     idx = np.where(mask)[0]
@@ -1115,92 +1245,196 @@ def circadian_similarity_figure(model, X, pids, mask, variant_dir, bin_minutes, 
 
     org = model.net.training
     model.net.eval()
-    seqs = {"Trend V^(T)": [], "Season V^(S)": []}
+    seqs = {}
+    if n_sensors:
+        seqs["Raw sensor bins\n(model INPUT)"] = Xs[:, :, :int(n_sensors)].astype(np.float32)
+    # The backbone output, i.e. the representation BEFORE the trend/seasonal split. This is
+    # what makes the figure answer the paper's actual question on our architecture: WavesFM
+    # contrasts the input of its temporal encoder with that encoder's output, and the step
+    # this project contributes is the DISENTANGLING, not the backbone. Without this row the
+    # figure collapses two stages into one, so a degenerate V^(S) cannot be attributed --
+    # a backbone that already lost the structure and an SFD that destroyed it look identical.
+    # Free: `tcn_output=True` is the encoder's own early exit, no second forward pass of the
+    # disentanglers and no change to the model.
+    hb_l, tr_l, se_l = [], [], []
+    split = bool(getattr(model.net, "disentangle", True))
     with torch.no_grad():
         for i in range(0, len(Xs), batch_size):
             xb = torch.from_numpy(Xs[i:i + batch_size]).float().to(model.device)
+            if split:
+                hb_l.append(model.net(xb, tcn_output=True).float().cpu().numpy())
             tr, se = model.net(xb)
-            seqs["Trend V^(T)"].append(tr.float().cpu().numpy())
+            tr_l.append(tr.float().cpu().numpy())
             if se is not None:
-                seqs["Season V^(S)"].append(se.float().cpu().numpy())
+                se_l.append(se.float().cpu().numpy())
     model.net.train(org)
-    seqs = {k: np.concatenate(v, 0) for k, v in seqs.items() if v}
+    # Only when there IS a split: with disentangle=False the backbone output already IS the
+    # single representation (models/encoder.py), so the row would be an exact duplicate.
+    if hb_l:
+        seqs["Backbone h\n(BEFORE disentangling)"] = np.concatenate(hb_l, 0)
+    seqs[("DSSL trend V^(T)\n(AFTER)" if split else "DSSL representation\n(no disentangling)")
+         ] = np.concatenate(tr_l, 0)
+    if se_l:
+        seqs["DSSL season V^(S)\n(AFTER)"] = np.concatenate(se_l, 0)
 
     T = Xs.shape[1]
-    anchor_bow = anchor_hour * 60 // bin_minutes            # Monday, anchor_hour:00
-    ai = np.argmax(bow == anchor_bow, axis=1)               # a 7-day window hits it exactly once
     days = ["Mon", "Tue", "Wed", "Thu", "Fri", "Sat", "Sun"]
     out = {}
+    nrow, ncol = len(seqs), 2 + len(anchors)     # +1 for the period spectrum
+    fig, axes = plt.subplots(nrow, ncol, figsize=(4.9 * ncol, 3.5 * nrow), squeeze=False)
 
-    fig, axes = plt.subplots(len(seqs), 3, figsize=(16.5, 4.3 * len(seqs)), squeeze=False)
     for r, (name, S) in enumerate(seqs.items()):
-        u = S / (np.linalg.norm(S, axis=-1, keepdims=True) + 1e-8)
+        # The cosine is taken on the TIME-CENTRED sequence. For the seasonal branch the
+        # temporal mean IS the k=0 coefficient of an irfft, and the seasonal loss and readout
+        # both select f = (1, D, 2D, 3D, 4D) under the guard `0 < i` (cost.py:688), so bin 0
+        # is never trained -- it is a free parameter. Measured on run 1239199 it is 7-20x
+        # longer than the oscillating part, which pinned every seasonal cosine above 0.97,
+        # drew the row as a flat line at the top of the panel, and raised COLLAPSED on a
+        # branch that carries 20-27% of its power at 24 h. Centring removes the untrained
+        # offset from the comparison; `dc_ac` keeps its size visible as a number, so nothing
+        # is hidden -- the level is reported instead of silently dominating the geometry.
+        mu = S.mean(1, keepdims=True)
+        dc_ac = float(np.linalg.norm(mu, axis=-1).mean()
+                      / (np.sqrt(((S - mu) ** 2).sum(-1)).mean() + 1e-12))
+        Sc = S - mu
+        u = Sc / (np.linalg.norm(Sc, axis=-1, keepdims=True) + 1e-8)
         n = len(u)
 
-        # ---- (a) density vs time distance -------------------------------------------
+        # ---- (a) density vs time distance (paper Fig. 14a) ---------------------------
         a = rng.integers(0, T, size=(n, n_anchor))
         sim_a = np.einsum('nad,ntd->nat', u[np.arange(n)[:, None], a], u)
         lag_a = np.abs(a[:, :, None] - np.arange(T)[None, None, :]) * bin_minutes / 1440.0
         ax = axes[r][0]
-        ax.hexbin(lag_a.ravel(), sim_a.ravel(), gridsize=90, cmap="Reds", mincnt=1, bins="log")
+        ax.hexbin(lag_a.ravel(), sim_a.ravel(), gridsize=90, cmap="Reds", mincnt=1,
+                  bins="log", extent=(0, T * bin_minutes / 1440.0, -1, 1))
         for d in range(1, 8):
             ax.axvline(d, color="0.55", lw=0.6, alpha=0.7)
         ax.set_xlabel("time distance (days)", fontsize=9)
-        ax.set_ylabel(f"{name}\ncosine similarity", fontsize=9)
-        ax.set_title("(a) all intra-window pairs vs time distance", fontsize=9)
+        if r == 0:
+            ax.set_title("(a) all intra-window pairs", fontsize=9.5, pad=20)
 
-        # ---- (b) density across the week, anchored to Monday anchor_hour -------------
-        # The anchor bin is kept, exactly as in the paper: every window is anchored to the SAME
-        # bin-of-week, so masking it would empty that column and punch a hole at the very
-        # reference point. Its cos = 1 IS the reference, and the daily peak at the anchor hour
-        # is the finding, not an artefact.
-        sim_b = np.einsum('nd,ntd->nt', u[np.arange(n), ai], u)
-        ax = axes[r][1]
-        ax.hexbin(bow.ravel(), sim_b.ravel(), gridsize=90, cmap="Reds", mincnt=1, bins="log")
-        prof = (np.bincount(bow.ravel(), sim_b.ravel(), 7 * bpd)
-                / np.maximum(np.bincount(bow.ravel(), minlength=7 * bpd), 1))
-        ax.plot(np.arange(7 * bpd), prof, color="#3b9ad9", lw=1.4, label="weighted avg")
-        for d in range(1, 7):
-            ax.axvline(d * bpd, color="0.55", lw=0.6, alpha=0.7)
-        ax.set_xticks(np.arange(7) * bpd + bpd // 2); ax.set_xticklabels(days, fontsize=8)
-        ax.set_title(f"(b) referenced to each window's Mon {anchor_hour:02d}:00 bin", fontsize=9)
-        ax.legend(fontsize=7, loc="lower right")
+        # ---- (b..) density across the week, one column per anchor (paper Fig. 14b/c) --
+        prof0 = None
+        for c, ah in enumerate(anchors):
+            anchor_bow = ah * 60 // bin_minutes                 # Monday, ah:00
+            ai = np.argmax(bow == anchor_bow, axis=1)           # a 7-day window hits it once
+            # The anchor bin is KEPT, exactly as in the paper: every window is referenced to
+            # the same bin-of-week, so masking it would punch a hole at the reference point.
+            # Its cos = 1 IS the reference, and the daily peak there is the finding.
+            sim_b = np.einsum('nd,ntd->nt', u[np.arange(n), ai], u)
+            ax = axes[r][1 + c]
+            ax.hexbin(bow.ravel(), sim_b.ravel(), gridsize=90, cmap="Reds", mincnt=1,
+                      bins="log", extent=(0, 7 * bpd, -1, 1))
+            prof = (np.bincount(bow.ravel(), sim_b.ravel(), 7 * bpd)
+                    / np.maximum(np.bincount(bow.ravel(), minlength=7 * bpd), 1))
+            ax.plot(np.arange(7 * bpd), prof, color="#3b9ad9", lw=1.4, label="weighted avg")
+            for d in range(1, 7):
+                ax.axvline(d * bpd, color="0.55", lw=0.6, alpha=0.7)
+            ax.set_xticks(np.arange(7) * bpd + bpd // 2)
+            ax.set_xticklabels(days, fontsize=8)
+            if r == 0:
+                ax.set_title(f"({chr(98 + c)}) referenced to Mon {ah:02d}:00", fontsize=9.5, pad=20)
+            if r == 0 and c == 0:
+                ax.legend(fontsize=7, loc="lower right")
+            if prof0 is None:
+                prof0 = prof
 
-        # ---- (c) per-participant 24 h profile ----------------------------------------
-        ax, tod = axes[r][2], bow % bpd
-        curves = []
-        for p in np.unique(pm):
-            m = pm == p
-            c = (np.bincount(tod[m].ravel(), sim_b[m].ravel(), bpd)
-                 / np.maximum(np.bincount(tod[m].ravel(), minlength=bpd), 1))
-            curves.append(c); ax.plot(np.arange(bpd), c, color="0.55", lw=0.6, alpha=0.45)
-        curves = np.array(curves)
-        ax.plot(np.arange(bpd), np.median(curves, 0), color="#c0392b", lw=2.0, label="median")
-        ax.axvline(anchor_bow, color="#3b9ad9", lw=1.0, ls="--", label=f"{anchor_hour:02d}:00")
-        ax.set_xticks(np.arange(0, bpd, bpd // 4))
-        ax.set_xticklabels([f"{h:02d}h" for h in range(0, 24, 6)], fontsize=8)
-        ax.set_title(f"(c) per-participant 24 h profile  (n={len(curves)})", fontsize=9)
-        ax.legend(fontsize=7); ax.grid(alpha=0.2)
+        s = _sim_vs_distance(Sc)
 
-        s = _sim_vs_distance(S)
-        # Peak-to-trough of the group 24 h profile: how much of the daily swing survives
-        # averaging, i.e. how strongly the representation is organised by clock time.
-        day_prof = prof.reshape(7, bpd).mean(0)
-        out[name] = {
-            "circadian_index": float(s[bpd] - 0.5 * (s[bpd // 2] + s[bpd + bpd // 2])),
-            "diurnal_amplitude": float(day_prof.max() - day_prof.min()),
-            # Fraction of participants whose OWN profile swings at least half as much as the
-            # group's -- the group density can be rhythmic while few individuals are.
-            "frac_participants_rhythmic": float(np.mean(
-                (curves.max(1) - curves.min(1)) >= 0.5 * (day_prof.max() - day_prof.min()))),
-            "mean_similarity": float(s.mean()), "n_windows": int(n),
-            "s_curve": [round(float(x), 5) for x in s], "bins_per_day": int(bpd)}
+        # ---- (last) WHICH periods does it repeat at? --------------------------------
+        # Panel (a) shows that something recurs daily; this says whether 24 h is actually
+        # the dominant period or whether the recurrence sits somewhere else -- which is the
+        # documented artefact signature (banding at the window length rather than at 24 h).
+        per, frac, p24, p12 = _period_power(s, bin_minutes)
+        ax = axes[r][ncol - 1]
+        if per is not None:
+            keep = slice(1, len(frac))
+            ax.plot(per[keep], frac[keep], color="0.35", lw=1.0)
+            ax.fill_between(per[keep], 0, frac[keep], color="0.75", alpha=.6)
+            for h, cc in ((24.0, "#c0392b"), (12.0, "#3b9ad9")):
+                ax.axvline(h, color=cc, lw=1.2, ls="--")
+                ax.text(h, 1.0, f" {h:.0f}h", color=cc, fontsize=8, va="top", ha="left")
+            ax.set_xscale("log")
+            ax.set_xlim(4, 168)
+            ax.set_xticks([6, 12, 24, 48, 168])
+            ax.set_xticklabels(["6h", "12h", "24h", "48h", "1wk"], fontsize=8)
+        ax.set_ylim(0, 1)                       # a SHARE -- fixed, like every other panel
+        ax.set_xlabel("period", fontsize=9)
+        if r == 0:
+            ax.set_title(f"({chr(98 + len(anchors))}) periods present", fontsize=9.5, pad=20)
+        ax.text(0.0, 1.012,
+                ("24 h share " + ("n/a" if p24 is None else format(p24, ".1%"))
+                 + "   |   12 h share " + ("n/a" if p12 is None else format(p12, ".1%"))),
+                transform=ax.transAxes, fontsize=8.5, color="0.35", va="bottom")
+
+        day_prof = prof0.reshape(7, bpd).mean(0)
+        amp = float(day_prof.max() - day_prof.min())
+        r2 = _single_mode_r2(s, bpd)
+        stat = {"diurnal_amplitude": amp,
+                "circadian_index": float(s[bpd] - 0.5 * (s[bpd // 2] + s[bpd + bpd // 2])),
+                "mean_similarity": float(s.mean()),
+                # ~1.0 => a perfect clock and nothing else (see _single_mode_r2)
+                "single_mode_r2": r2,
+                # Shares of s(lag)'s oscillating power at the two biological periods a 168 h
+                # window can resolve. High 24 h share says the representation REPEATS daily;
+                # it does NOT say the daily pattern is the participant's own -- read it next
+                # to participant_var_frac, which is what separates biology from a clock.
+                "power_24h": p24, "power_12h": p12,
+                "n_windows": int(n),
+                "s_curve": [round(float(x), 5) for x in s], "bins_per_day": int(bpd)}
+        stat["dc_ac_ratio"] = round(dc_ac, 4)
+        stat.update(_clock_variance(
+            S / (np.linalg.norm(S, axis=-1, keepdims=True) + 1e-8), bow % bpd, pm))
+        # Two opposite degeneracies, both of which used to be drawn as a healthy rhythm.
+        # Every LEARNED row is judged -- the backbone's as well, since localising the collapse
+        # to the backbone or to the disentangler is the reason that row exists. Only the raw
+        # row is exempt: it is the model's INPUT, whatever the sensors happened to record,
+        # which on a strongly diurnal channel is legitimately close to a single mode.
+        #
+        # The first test used to be `mean_similarity > 0.95`, i.e. "every vector points the
+        # same way". Centring makes that quantity ~0 by construction, so it is now dead as a
+        # test -- and it was never the right one: a seasonal branch with a DC/AC of 17.5x
+        # tripped it while carrying 20-27% of its power at 24 h. A large offset is reported
+        # (`dc_ac_ratio`), not judged. What actually makes a row useless is carrying no
+        # rhythm once that offset is removed, which is what NO RHYTHM tests.
+        #
+        # THRESHOLD. `power_24h` is a share of the magnitude spectrum of s(lag) excluding DC.
+        # With no structure the L/2 non-DC bins are exchangeable, so each has expected share
+        # 1 / (L/2) -- 0.30% at L = 672. Three times that null is the floor here: the flat
+        # control measures 0.3% and a real seasonal branch 13.7-27.2%, two orders apart, so
+        # the exact multiple is not load-bearing; it only has to sit inside that gap.
+        null_share = 2.0 / max(len(s), 2)
+        flag = "" if name.startswith("Raw") else (
+            "NO RHYTHM (flat once the offset is removed)"
+            if (p24 is not None and p24 < 3 * null_share) else
+            "COLLAPSED to one frequency" if (r2 or 0) > 0.95 and amp > 1.5 else "")
+        stat["degenerate"] = flag
+        out[name.replace("\n", " ")] = stat
+
+        pv = stat.get("participant_var_frac")
+        axes[r][0].set_ylabel(name + "\ncosine (mean-removed)", fontsize=9)
+        # Above the row, not inside it: at the bottom of the axes this line sat on top of the
+        # very density it describes, and on a collapsed row that density is exactly there.
+        axes[r][0].text(0.0, 1.012,
+                        "diurnal swing " + format(amp, ".3f")
+                        + "   |   DC/AC " + format(dc_ac, ".1f") + "x"
+                        + "   |   between-person var "
+                        + ("n/a" if pv is None else format(pv, ".1%"))
+                        + (("   |   " + flag) if flag else ""),
+                        transform=axes[r][0].transAxes, fontsize=8.5,
+                        color="#b30000" if flag else "0.35", va="bottom")
+        for c in range(ncol):
+            if c < ncol - 1:                           # the spectrum panel is a share, 0..1
+                axes[r][c].set_ylim(-1, 1)             # FIXED axis -- the whole point
+            axes[r][c].grid(alpha=0.15)
 
     fig.suptitle(f"Circadian structure of the representation  -  {tag}"
-                 + (f"  ({table_tag})" if table_tag else ""), fontsize=12, fontweight="bold")
-    fig.tight_layout(rect=[0, 0, 1, 0.95])
+                 + (f"  ({table_tag})" if table_tag else "")
+                 + "\ncosine axis fixed to [-1, 1] in every panel, so rows and runs are "
+                   "directly comparable", fontsize=11.5, fontweight="bold")
+    fig.tight_layout(rect=[0, 0, 1, 0.94])
     stem = f"circadian_similarity_{table_tag}" if table_tag else "circadian_similarity"
-    fig.savefig(variant_dir / f"{stem}.png", dpi=180, bbox_inches="tight")
+    fig.savefig(rq_path(variant_dir, f"{stem}.png"), dpi=180, bbox_inches="tight")
     plt.close(fig)
     return out
 
@@ -1281,7 +1515,7 @@ def position_geometry_figure(model, variant_dir, seq_len, bin_minutes, tag, tabl
                  + (f"  ({table_tag})" if table_tag else ""), fontsize=12, fontweight="bold")
     fig.tight_layout(rect=[0, 0, 1, 0.94])
     stem = f"position_geometry_{table_tag}" if table_tag else "position_geometry"
-    fig.savefig(variant_dir / f"{stem}.png", dpi=200, bbox_inches="tight")
+    fig.savefig(rq_path(variant_dir, f"{stem}.png"), dpi=200, bbox_inches="tight")
     plt.close(fig)
     # Two different lag profiles, so two different readings of the same question -- how much
     # the code separates times of day. Factorized: P_tod wraps at midnight, so the profile runs
@@ -1336,19 +1570,44 @@ def _oof_ridge_selected(F, Y, groups, cv, alphas, seed):
         Y = Y[:, None]
     pred = np.full((len(F), Y.shape[1]), np.nan)
     chosen, degenerate = [], False
-    rng = np.random.RandomState(seed)
+    # `seed` is retained in the signature for call-site compatibility but no longer changes the
+    # result: the penalty is now chosen on a deterministic inner GroupKFold rather than on a
+    # random quarter, so this probe is reproducible across seeds by construction.
     for tr, te in cv.split(F, Y[:, 0], groups):
-        g = np.unique(groups[tr])
-        rng.shuffle(g)
-        sel = np.isin(groups[tr], g[:max(1, int(round(0.25 * len(g))))])
-        fit = ~sel
-        if not fit.any() or not sel.any():       # too few participants to carve a selection
-            fit = sel = np.ones(len(tr), bool)   # degenerate: selected on the fitted rows
+        gtr = groups[tr]
+        n_inner = int(min(4, len(np.unique(gtr))))
+        if len(alphas) > 1 and n_inner >= 2:
+            # lambda* is chosen on an inner GroupKFold and the criterion is SUMMED over its
+            # folds, not read off a single random quarter of the participants.
+            #
+            # A single draw was the previous rule, and at this cohort size it is unusable: the
+            # quarter is ~9 participants, so lambda* is picked from ~9 people and swings wildly
+            # between outer folds. Measured on run 1608369, one marker selected
+            # [5.0, 1000.0, 50.0, 1000.0, 0.01] across its five folds -- five orders of
+            # magnitude -- and the fold that drew 0.01 fits essentially unpenalised, which sent
+            # that marker's pooled R2 to -27.8. Across the 32-dim runs 22% of marker-seed cells
+            # landed below zero, the worst at -705. A correctly penalised ridge cannot do much
+            # worse than predicting the mean (R2 ~ 0), so those values described the SELECTION,
+            # not the representation, and they are what the RQ1 comparison between
+            # configurations was resting on.
+            #
+            # Averaging over inner folds costs almost nothing -- `_ridge_fit` pays the Gram
+            # eigendecomposition once per inner fold and reads the entire grid off it -- and it
+            # is applied identically to the encoder, the raw-PCA reference and the random-init
+            # control, so no rung gains an advantage from the change.
+            err = np.zeros(len(alphas))
+            for f_i, s_i in GroupKFold(n_splits=n_inner).split(F[tr], Y[tr][:, 0], gtr):
+                inner = _ridge_fit(F[tr][f_i], Y[tr][f_i])
+                for j, a in enumerate(alphas):
+                    r = inner(a, F[tr][s_i]) - Y[tr][s_i]
+                    err[j] += float(np.sqrt((r ** 2).mean()) + np.abs(r).mean())
+            a_star = float(alphas[int(np.argmin(err))])
+        elif len(alphas) > 1:
+            # Fewer than two participants to split on: no honest selection is possible.
             degenerate = True
-        if len(alphas) > 1:
-            inner = _ridge_fit(F[tr][fit], Y[tr][fit])
+            inner = _ridge_fit(F[tr], Y[tr])
             err = [float(np.sqrt((r ** 2).mean()) + np.abs(r).mean())
-                   for r in (inner(a, F[tr][sel]) - Y[tr][sel] for a in alphas)]
+                   for r in (inner(a, F[tr]) - Y[tr] for a in alphas)]
             a_star = float(alphas[int(np.argmin(err))])
         else:
             a_star = float(alphas[0])
@@ -1389,7 +1648,8 @@ def rhythm_axis_probe(emb, Xs, mask, pids, bin_minutes, variant_dir, seed, cf,
     convention for both probes. The lambda* actually used is reported per marker."""
     emb, pm = np.asarray(emb)[mask], pids[mask]
     Xm = Xs[mask]
-    AMP, ACRO, MESOR = cosinor_markers_per_channel(np.asarray(cf)[mask], n_sensors, top_k)
+    AMP, ACRO, MESOR = cosinor_markers_per_channel(
+        np.asarray(cf)[mask], n_sensors, top_k, int(round(24 * 60 / bin_minutes)))
     IS = _interdaily_stability(Xm, int(round(24 * 60 / bin_minutes)), per_channel=True)
     names = ([str(s) for s in sensor_cols][:n_sensors] if sensor_cols is not None
              else [f"ch{c}" for c in range(n_sensors)])
@@ -1499,10 +1759,10 @@ def rhythm_axis_probe(emb, Xs, mask, pids, bin_minutes, variant_dir, seed, cf,
                      "correct for multiplicity before calling one channel significant.*")
         used = sorted({a for v in out.values() for a in v.get("ridge_alpha_per_fold", ())})
         lines.append(f"\n*Ridge penalty selected INSIDE each fold on held-out participants -- "
-                     f"the same rule as E1.2 (CoST grid {alphas[0]:g} ... {alphas[-1]:g}, "
+                     f"the same rule as E1.2 (DSSL grid {alphas[0]:g} ... {alphas[-1]:g}, "
                      f"minimising RMSE + MAE), never hand-set. lambda* used across folds and "
                      f"markers: {', '.join(f'{a:g}' for a in used)}.*")
-        (Path(variant_dir) / f"{stem}.md").write_text("\n".join(lines), encoding="utf-8")
+        rq_path(variant_dir, f"{stem}.md").write_text("\n".join(lines), encoding="utf-8")
     return out
 
 
@@ -1513,7 +1773,8 @@ def rhythm_axis_probe(emb, Xs, mask, pids, bin_minutes, variant_dir, seed, cf,
 def run_hrd_rhythm_analysis(model, X, y, pids, train_mask, test_mask, variant_dir,
                             seq_len, bin_minutes, sensor_cols=None, seed=42,
                             label_names=None, max_tsne_points=3000, batch_size=256,
-                            val_mask=None, baseline_rows=None, window_ids=None, pool="mean",
+                            val_mask=None, baseline_rows=None, extra_views=None,
+                            window_ids=None, pool="mean", season_pool=None,
                             probe_sel=None, probe_c=1.0, paper_cosinor_topk=2,
                             baseline_by_pid=None, subject_aggregate=True,
                             label_noun="endpoint", table_tag="", headline_unit="last"):
@@ -1523,8 +1784,7 @@ def run_hrd_rhythm_analysis(model, X, y, pids, train_mask, test_mask, variant_di
     per participant, so figures/metrics are aggregated to one point per subject. Set it
     False for a per-DAY label (emotional energy): each WINDOW is its own unit -- a synthetic
     unique id per window makes the per-subject aggregations collapse to a pooled per-day
-    contrast, the per-person averaging (agg_views) and the subject-level embeddings are
-    skipped. ``label_noun`` only relabels the figure headings (e.g. 'emotional energy')."""
+    contrast, the per-person averaging and the subject-level embeddings are skipped. ``label_noun`` only relabels the figure headings (e.g. 'emotional energy')."""
     variant_dir = Path(variant_dir)
     label_names = label_names or {0: "non-depressed (0)", 1: "depressed (1)"}
     tag = f"{model.net.backbone} / {model.net.pe}"
@@ -1540,7 +1800,8 @@ def run_hrd_rhythm_analysis(model, X, y, pids, train_mask, test_mask, variant_di
         [f"ch{c}" for c in range(n_sensors)]
     Xs = X[:, :, :n_sensors]
 
-    rep = extract_representations(model, X, batch_size=batch_size, pool=pool)
+    rep = extract_representations(model, X, batch_size=batch_size, pool=pool,
+                                  season_pool=season_pool)
     views = representation_views(rep)
     # Classical benchmark = EXACT clone of the paper's CosinorPy model (Yan et al. 2022),
     # probed by the SAME logistic-regression probe as every other view (LR-only, as asked).
@@ -1562,7 +1823,7 @@ def run_hrd_rhythm_analysis(model, X, y, pids, train_mask, test_mask, variant_di
               f"install CosinorPy to enable the paper-cosinor baseline")
         traceback.print_exc()
         try:                          # surface the reason IN the results folder, not only the
-            (variant_dir / "paper_cosinor.FAILED.txt").write_text(   # SLURM stdout log
+            (rq_path(variant_dir, "paper_cosinor.FAILED.txt")).write_text(   # SLURM stdout log
                 f"paper_cosinor_features failed: {type(e).__name__}: {e}\n\n"
                 + traceback.format_exc(), encoding="utf-8")
         except Exception:
@@ -1592,7 +1853,7 @@ def run_hrd_rhythm_analysis(model, X, y, pids, train_mask, test_mask, variant_di
                   f"n1={gc['n_depressed']}, n0={gc['n_nondepressed']}) -> "
                   f"{variant_dir/'frequency_contrast.png'}")
         # full (period x dS) field WITHOUT collapsing channels -- the complete 337x160 picture
-        group_spectrum_heatmap(rep, y, test_mask, pids_agg, variant_dir, seq_len, bin_minutes,
+        group_spectrum_heatmap(rep, y, test_mask, variant_dir, seq_len, bin_minutes,
                                int(model.net.component_dims), tag=tag, label_names=label_names)
     except Exception as e:
         import traceback
@@ -1633,12 +1894,19 @@ def run_hrd_rhythm_analysis(model, X, y, pids, train_mask, test_mask, variant_di
     # 0.003 AUC while claiming to be a dimensionality-matched control. 20 components against
     # ~58 training participants is a real 3:1 reduction, and being below the clamp it also
     # applies identically to the 'all' unit, so the three units stay comparable.
+    # The RQ3 utility ladder's two CONTROLS, scored on exactly the rows of this table so the
+    # two objects answer the same question with the same probe. Without them the separability
+    # table ranks only representations that were all produced by a trained, disentangled
+    # encoder -- so it can say which branch is best, but not whether TRAINING or DISENTANGLING
+    # bought anything, which is what RQ1 and RQ3 are actually asking.
+    for _n, _v in (extra_views or {}).items():
+        views[_n] = np.asarray(_v)
+        dim_labels[_n] = str(views[_n].shape[1])
+
     PCA_TARGET = 20
     pca_views = {}
-    # The noisy Seasonal amp/phase views are averaged PER PARTICIPANT over all of that
-    # person's windows (a stable per-person circadian estimate) instead of one noisy week --
-    # applied identically to train / val / test, and still one sample per participant.
-    agg_views = set()
+    # Per-participant averaging of the noisy Seasonal amp/phase views is decided PER UNIT in
+    # the probe-unit loop below (`u_agg`), which is the only place it is read.
     if Ffreq:
         views["Seasonal amp (PCA)"] = rep["amp"]
         views["Seasonal phase (PCA)"] = rep["phase"]
@@ -1646,8 +1914,6 @@ def run_hrd_rhythm_analysis(model, X, y, pids, train_mask, test_mask, variant_di
         dim_labels["Seasonal phase (PCA)"] = ffts
         pca_views.update({"Seasonal amp (PCA)": PCA_TARGET,
                           "Seasonal phase (PCA)": PCA_TARGET})
-        agg_views = {"Seasonal amp", "Seasonal phase",
-                     "Seasonal amp (PCA)", "Seasonal phase (PCA)"}
     # Dimensionality-matched counterparts of the LOW-dim views as well. Without them the table
     # compares representations that differ in WIDTH as much as in content (320 vs 160 vs 96
     # against only ~58 training participants), so "Full beats Cosinor" could just mean "320
@@ -1656,23 +1922,26 @@ def run_hrd_rhythm_analysis(model, X, y, pids, train_mask, test_mask, variant_di
     # 'Full' number remains comparable to metrics.json.
     # Assignment is a REFERENCE to the existing array, not a copy: the PCA happens inside the
     # probe pipeline at fit time, so these rows cost no extra memory.
+    # Only views WIDER than the target get a twin. Below it the "reduction" is a no-op --
+    # n_comp is clamped to the view's own width -- so the twin would be the same row printed
+    # twice under a name promising a dimensionality-matched control. It also keeps the
+    # 1-column Majority view away from PCA, which cannot run on it at all.
     for _base in ["V (encoder pre-decomp)", "Full [V^(T);V^(S)]", "Trend V^(T)",
-                  "Season V^(S)", COSINOR_VIEW]:
-        if _base in views:
+                  "Season V^(S)", COSINOR_VIEW] + list(extra_views or {}):
+        if _base in views and np.asarray(views[_base]).shape[1] > PCA_TARGET:
             _pn = f"{_base} (PCA)"
             views[_pn] = views[_base]
             dim_labels[_pn] = dim_labels.get(_base, str(np.asarray(views[_base]).shape[1]))
             pca_views[_pn] = PCA_TARGET
-    if not subject_aggregate:
-        agg_views = set()          # per-DAY label: never average a person's windows together
-
-    # rigorous metric 1: separability of each representation (learned vs cosinor).
-    # Evaluate the CLASSIFICATION on the SAME unit as the downstream headline: one last-week
-    # window per participant when --probe-last-window is on (train/val are already restricted
-    # upstream). Without this the probe trained on last-week windows but was scored on ALL
-    # windows -- a train/test mismatch that made the 'Full' row disagree with metrics.json.
-    # The spectra / embeddings below intentionally still use ALL windows (richer, per-pid mean).
-    sep_test_mask = (test_mask & probe_sel) if probe_sel is not None else test_mask
+    # A per-DAY label must never have a person's windows averaged together (it would destroy
+    # the label); the loop below enforces that by giving the 'all' unit an empty u_agg.
+    #
+    # Historical note kept because the bug is easy to reintroduce: the classification must be
+    # SCORED on the same unit the probe was TRAINED on. It once trained on last-week windows
+    # and scored on every window, which made the 'Full' row disagree with metrics.json. Each
+    # unit below now derives its own train/test masks, so the mismatch cannot recur. The
+    # spectra / embeddings further down intentionally still use ALL windows (richer per-pid
+    # mean) -- that is a different computation, not the probe.
 
     # --- probe-unit ablation -------------------------------------------------------------
     # The incoming train/val masks are already restricted to whatever unit the headline probe
@@ -1681,12 +1950,13 @@ def run_hrd_rhythm_analysis(model, X, y, pids, train_mask, test_mask, variant_di
     # probe_sel is all-True when the caller ran --probe-unit all.
     #   all         every window is a probe sample.
     #   last        one window per participant (the most recent).
-    #   persubject  same rows as 'last', but each view is first averaged over ALL of that
-    #               participant's windows (circular mean for phase views) via agg_views, so
-    #               the single row carries the person's whole record.
-    # NOTE: 'persubject' here is a per-participant MEAN of each view. The headline probe in
-    # train_hrd.py --probe-unit persubject uses [mean|std] of the encoder embedding; the std
-    # half has no meaning for the circular phase views, so it is not replicated in this table.
+    #   persubject  one row per participant holding [mean | std] of that participant's
+    #               windows -- the unit design doc 0.1 declares primary for this label, built
+    #               by the single canonical implementation in _eval_protocols that the
+    #               train_hrd.py headline probe and the RQ3 ladder also call. The penalty is
+    #               selected on the participant-disjoint validation split (E1.2: never fixed
+    #               by hand). For the angular phase views the mean half uses the circular
+    #               mean; see persubject_rows for the caveat on their std half.
     # For a per-DAY label (emotional energy) the label varies within a participant, so
     # averaging a person's windows would destroy it -- 'persubject' is skipped there.
     def _pid_set(m):
@@ -1697,12 +1967,26 @@ def run_hrd_rhythm_analysis(model, X, y, pids, train_mask, test_mask, variant_di
         last_sel[np.where(pids == _p)[0][-1]] = True
 
     tr_pids, va_pids = _pid_set(train_mask), _pid_set(val_mask)
-    units = ["all", "last", "persubject"] if subject_aggregate else ["all"]
+    # 'all' is DROPPED for a participant-level label. Design doc 0.1: ~26 windows per person
+    # all carry the same value, so it is pseudo-replication -- long-record participants
+    # dominate the fit and the window-level intervals are optimistically tight. Only the two
+    # units the design actually sanctions remain: 'persubject' (primary) and 'last'
+    # (sensitivity check). It stays for a per-DAY label, where it is the ONLY valid unit --
+    # see the else branch.
+    units = ["last", "persubject"] if subject_aggregate else ["all"]
     if subject_aggregate:
-        unit_note = ("units: all = every window; last = one (most recent) window per "
-                     f"participant; persubject = one row per participant, each view averaged "
-                     f"over all their windows ('{COSINOR_VIEW}' excepted -- its vector mixes "
-                     "angular and linear parameters, so it stays the last-window fit). "
+        unit_note = ("units: last = one (most recent) window per participant (sensitivity "
+                     f"check); persubject = one row per participant, each view averaged "
+                     f"over all their windows -- the PRIMARY unit for this participant-level "
+                     f"label. '{COSINOR_VIEW}' is the one view NOT averaged here, and its two "
+                     "rows are therefore IDENTICAL across the two units: "
+                     "paper_cosinor_features already collapsed it to one vector per "
+                     "participant upstream (population-mean cosinor, phases averaged as "
+                     "angles), so every window of a person carries the same vector and there "
+                     "is nothing left to average. Read its 'last' and 'persubject' rows as one "
+                     "number reported twice, NOT as evidence that the unit choice does not "
+                     "matter. 'all' is omitted on purpose: every window of a person carries "
+                     "the same label, so it is pseudo-replication (design doc 0.1). "
                      "Subj* = each participant pooled to one sample (mean probability).")
     else:
         # A per-DAY label. 'last' would score one arbitrary day per person (36 rows out of
@@ -1718,12 +2002,14 @@ def run_hrd_rhythm_analysis(model, X, y, pids, train_mask, test_mask, variant_di
 
     rows = []
     for unit in units:
-        if unit == "all":
+        if unit in ("all", "persubject"):
+            # 'persubject' aggregates each person's windows itself, so it must see ALL of
+            # them: restricting to `last_sel` would leave one window per person and collapse
+            # the [mean|std] row's std half to zero.
             u_tr = np.isin(pids, list(tr_pids))
             u_va = np.isin(pids, list(va_pids)) if va_pids else None
             u_te = test_mask
-            u_agg = set()
-        else:                                            # 'last' and 'persubject' share rows
+        else:                                            # 'last': one window per participant
             u_tr = np.isin(pids, list(tr_pids)) & last_sel
             u_va = (np.isin(pids, list(va_pids)) & last_sel) if va_pids else None
             u_te = test_mask & last_sel
@@ -1732,20 +2018,26 @@ def run_hrd_rhythm_analysis(model, X, y, pids, train_mask, test_mask, variant_di
             # (Acrophase, Orthophase, Bathyphase) inside each 12-parameter block, and the
             # circular branch in separability_table keys off the view NAME, so it would
             # arithmetic-average those angles (mean of 350 deg and 10 deg -> 180, not 0).
-            # Leaving it out means its 'persubject' row is the same last-window fit as the
-            # 'last' block, which is stated in the footnote, rather than a wrong number.
+            # It needs no averaging here anyway: paper_cosinor_features was called with
+            # `pids`, so it ALREADY collapsed each participant to one vector upstream, with
+            # the phase columns averaged as angles (baselines/cosinor.py::_aggregate_to_subject
+            # -- the correct circular mean, which is exactly what this branch cannot do).
+            # Consequence, verified on run 19937323 across all 12 variant-seeds: the Cosinor
+            # 'last' and 'persubject' rows come out bit-identical, because every window of a
+            # person already carries the same vector. That is one number printed twice, not a
+            # robustness result -- the footnote now says so, because the earlier wording
+            # ("stays the last-window fit") described something the code does not do.
             # startswith, not set-difference: this must also exclude the "(PCA)" counterpart
             # of the cosinor view, whose vector mixes angular and linear parameters just the
             # same and so must not be arithmetically averaged either.
-            u_agg = ({v for v in views if not v.startswith(COSINOR_VIEW)}
-                     if unit == "persubject" else set())
+
         if int(u_tr.sum()) < 4 or int(u_te.sum()) < 2 or len(np.unique(y[u_tr])) < 2:
             print(f"[rhythm] probe-unit '{unit}' skipped (too few rows: "
                   f"train={int(u_tr.sum())}, test={int(u_te.sum())})")
             continue
         u_rows = separability_table(views, y, pids_agg, u_tr, u_te, val_mask=u_va,
                                     seed=seed, dim_labels=dim_labels, pca_views=pca_views,
-                                    lowdim_C=probe_c, agg_views=u_agg,
+                                    lowdim_C=probe_c, persubject=(unit == "persubject"),
                                     # per-day label: pids_agg is one id PER WINDOW, so the
                                     # Subj* columns must group by the REAL participant instead
                                     # (otherwise they silently duplicate the Win* columns --
@@ -1800,11 +2092,14 @@ def run_hrd_rhythm_analysis(model, X, y, pids, train_mask, test_mask, variant_di
         circ = circadian_similarity_figure(model, X, pids, test_mask, variant_dir,
                                            bin_minutes, tag, table_tag=table_tag,
                                            batch_size=batch_size, window_ids=window_ids,
-                                           seed=seed)
+                                           n_sensors=n_sensors, seed=seed)
         for k, v in circ.items():
-            print(f"[circadian] {k:<28} index = {v['circadian_index']:+.3f}  "
-                  f"diurnal amp = {v['diurnal_amplitude']:.3f}  "
-                  f"rhythmic participants = {v['frac_participants_rhythmic']:.0%}")
+            _pv = v.get('participant_var_frac')
+            print(f"[circadian] {k:<26} swing = {v['diurnal_amplitude']:.4f}  "
+                  f"mean cos = {v['mean_similarity']:+.4f}  "
+                  f"1-mode R2 = {(v.get('single_mode_r2') or float('nan')):.3f}  "
+                  f"between-person var = " + ('n/a' if _pv is None else format(_pv, '.1%'))
+                  + (('  <<< ' + v['degenerate']) if v.get('degenerate') else ''))
     except Exception as e:
         print(f"[circadian] figure skipped ({type(e).__name__}: {e})")
 
@@ -1891,5 +2186,5 @@ def run_hrd_rhythm_analysis(model, X, y, pids, train_mask, test_mask, variant_di
         "circadian_similarity": circ,
         "position_geometry": posgeom,
     }
-    (variant_dir / "hrd_rhythm.json").write_text(json.dumps(summary, indent=2), encoding="utf-8")
+    (rq_path(variant_dir, "hrd_rhythm.json")).write_text(json.dumps(summary, indent=2), encoding="utf-8")
     return summary

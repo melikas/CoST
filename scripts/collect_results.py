@@ -5,7 +5,6 @@ For each results_hrd/<run>/<variant>/ it reads:
   * metrics.json      - downstream depression classification (AUC / F1 / Acc)
   * hrd_rhythm.json   - rhythm metrics (FFT-alignment, per-representation probe
                         AUCs incl. the classical cosinor baseline), if present.
-  * probe_scores.json - subject-level (label, probe score) pairs, if present.
 
 It prints/writes a table sorted by participant-level AUC and, when rhythm metrics
 are available, saves a cross-variant scatter of rhythm capture (how well the
@@ -13,9 +12,9 @@ latent recovers the true circadian amplitude, R^2) vs participant AUC with its
 Pearson correlation -> the central claim "do rhythm-capturing encodings predict
 better?".
 
-From the probe scores it also saves probe_score_report.png: the endpoint separation
-on the probe's decision axis, with the ROC averaged over a variant's seeds and a
-+/-1 sd band -- the multi-seed view no single run can produce.
+It also renders the two cross-variant panels (written to --fig-dir):
+    figC_pe_dissociation.png   positional encoding: prediction vs disentanglement
+    figD_clock_ablation.png    paired calendar-channel on/off (needs --clock-on/--clock-off)
 
 Run:  python scripts/collect_results.py --results-dir results_hrd [--csv summary.csv]
 """
@@ -28,7 +27,10 @@ from pathlib import Path
 import numpy as np
 
 sys.path.insert(0, str(Path(__file__).resolve().parent))
-from _results import iter_metrics, read_json, variant_key   # noqa: E402  (shared results reader)
+sys.path.insert(0, str(Path(__file__).resolve().parents[1]))   # repo root, for `tasks`
+from tasks.rq_paths import rq_path                                   # noqa: E402
+from _results import (census, iter_metrics, load_variants,   # noqa: E402
+                      read_json, variant_key)                # shared results reader
 
 
 # EVERY representation the probe scores in hrd_rhythm.json, as (row key, separability names --
@@ -116,7 +118,7 @@ def read_rhythm(metrics_fp):
            "wt_imp_24h": nan, "rep_amp_24h": nan}
     out.update({col: nan for col, _ in _PROBE_VIEWS})
     out.update({_bacc_key(col): nan for col, _ in _PROBE_VIEWS})
-    rj = metrics_fp.parent / "hrd_rhythm.json"
+    rj = rq_path(metrics_fp.parent, "hrd_rhythm.json", create=False)
     if rj.exists():
         try:
             sep = json.loads(rj.read_text(encoding="utf-8")).get("separability", {})
@@ -133,7 +135,7 @@ def read_rhythm(metrics_fp):
                         break
         except (json.JSONDecodeError, OSError):
             pass
-    dj = metrics_fp.parent / "decomposition_recovery.json"
+    dj = rq_path(metrics_fp.parent, "decomposition_recovery.json", create=False)
     if dj.exists():
         try:
             d = json.loads(dj.read_text(encoding="utf-8"))
@@ -151,7 +153,7 @@ def read_rhythm(metrics_fp):
             out["rec_person_RA"] = d.get("rec_person_RA", nan)
         except (json.JSONDecodeError, OSError):
             pass
-    fj = metrics_fp.parent / "frequency_spectrum.json"
+    fj = rq_path(metrics_fp.parent, "frequency_spectrum.json", create=False)
     if fj.exists():
         try:
             circ = (json.loads(fj.read_text(encoding="utf-8"))
@@ -173,7 +175,7 @@ def read_base_models(metrics_fp):
     """[(model_name, {auc,f1,mcc,bacc,sensitivity,specificity})] for the base/reference models
     (cosinor + supervised baselines) in this folder's hrd_rhythm.json. Subject-level metrics,
     the same unit as the SSL models' participant_level. Empty if the file is missing/partial."""
-    rj = metrics_fp.parent / "hrd_rhythm.json"
+    rj = rq_path(metrics_fp.parent, "hrd_rhythm.json", create=False)
     if not rj.exists():
         return []
     try:
@@ -299,157 +301,6 @@ def rhythm_vs_prediction(rows, out_png):
 
 HEADLINE_VIEW = "Full [V^(T);V^(S)]"             # matches hrd_rhythm.HEADLINE_VIEW
 ROC_GRID = np.linspace(0, 1, 101)                # common FPR grid for vertical ROC averaging
-
-
-def read_probe_scores(results_dir):
-    """{(backbone, pe): {seed: {view: {y, prob, auc}}}} from every variant's probe_scores.json.
-
-    These are the subject-level (label, score) pairs the per-variant figure plots for ONE seed;
-    pooling them here is what makes the +/-1 sd ROC band possible."""
-    out = {}
-    for fp in sorted(Path(results_dir).rglob("probe_scores.json")):
-        d = read_json(fp)                        # shared partial-file guard (scripts/_results.py)
-        if d is None:
-            continue
-        # `label` is in the key for the same reason `holdout` is: weekly and endpoint are
-        # different prediction targets, so their ROC bands must not be pooled. HRD writes
-        # "-" for both, so this is a no-op there and only bites on GLOBEM sweeps.
-        key = (d.get("backbone", "?"), d.get("pe", "?"),
-               d.get("holdout") or "-", d.get("globem_label", "-"))
-        out.setdefault(key, {})[str(d.get("seed", "?"))] = d.get("views", {})
-    return out
-
-
-def _mean_roc(samples):
-    """(mean_tpr, sd_tpr, [auc per seed]) on ROC_GRID by vertical averaging over seeds.
-
-    Vertical averaging (interpolate TPR onto a shared FPR grid, then average) is the standard
-    way to combine ROC curves whose thresholds do not line up -- here the seeds are independent
-    runs with different score scales, so per-threshold averaging would be meaningless."""
-    from sklearn.metrics import roc_curve, roc_auc_score
-    tprs, aucs = [], []
-    for y, prob in samples:
-        y, prob = np.asarray(y, dtype=int), np.asarray(prob, dtype=float)
-        if len(np.unique(y)) < 2:
-            continue
-        fpr, tpr, _ = roc_curve(y, prob)
-        t = np.interp(ROC_GRID, fpr, tpr)
-        t[0] = 0.0
-        tprs.append(t)
-        aucs.append(float(roc_auc_score(y, prob)))
-    if not tprs:
-        return None, None, []
-    tprs = np.vstack(tprs)
-    return tprs.mean(axis=0), tprs.std(axis=0), aucs
-
-
-def probe_score_report(results_dir, out_png, view=HEADLINE_VIEW):
-    """Cross-seed honest picture of the endpoint separation -- the run-level companion to each
-    variant's hrd_probe_scores.png, and the replacement for the label-coloured t-SNE panels.
-
-    Left   : subject-level probe scores by endpoint for the best variant, POOLED over its seeds
-             (one point per participant per seed) -- the overlap IS the finding.
-    Middle : that variant's ROC, mean over seeds with a +/-1 sd band (vertical averaging),
-             against the chance diagonal.
-    Right  : mean +/- sd AUC over seeds for EVERY model, sorted, with the 0.5 chance line --
-             the cross-variant answer to 'which representation separates the groups?'.
-
-    Returns the {(backbone, pe): (mean_auc, sd, n_seeds)} it plotted, or None if unavailable."""
-    try:
-        import matplotlib
-        matplotlib.use("Agg")
-        import matplotlib.pyplot as plt
-    except Exception:
-        return None
-    scores = read_probe_scores(results_dir)
-    if not scores:
-        return None
-
-    # per-variant seed samples for `view` (skip variants whose runs predate probe_scores.json)
-    per_variant = {}
-    for key, seeds in scores.items():
-        s = [(v[view]["y"], v[view]["prob"]) for v in seeds.values() if view in v]
-        if s:
-            per_variant[key] = s
-    if not per_variant:
-        return None
-
-    summary = {}
-    for key, s in per_variant.items():
-        _, _, aucs = _mean_roc(s)
-        if aucs:
-            summary[key] = (float(np.mean(aucs)), float(np.std(aucs)), len(aucs))
-    if not summary:
-        return None
-    best = max(summary, key=lambda k: summary[k][0])
-
-    fig, (ax_d, ax_r, ax_f) = plt.subplots(1, 3, figsize=(16.5, 4.9))
-    class_colors = ["#0072B2", "#D55E00"]                    # 0 non-depressed, 1 depressed
-    class_names = {0: "non-depressed (0)", 1: "depressed (1)"}
-
-    # ---- left: pooled score distribution of the best variant ------------------
-    y = np.concatenate([np.asarray(a, dtype=int) for a, _ in per_variant[best]])
-    prob = np.concatenate([np.asarray(b, dtype=float) for _, b in per_variant[best]])
-    bins = np.linspace(prob.min(), prob.max(), 25) if prob.max() > prob.min() else 10
-    for c in np.unique(y):
-        m = y == c
-        col = class_colors[int(c) % len(class_colors)]
-        ax_d.hist(prob[m], bins=bins, histtype="stepfilled", alpha=0.45, color=col,
-                  label=f"{class_names.get(int(c), c)}  (n={int(m.sum())})")
-        ax_d.hist(prob[m], bins=bins, histtype="step", lw=1.6, color=col)
-        ax_d.axvline(prob[m].mean(), color=col, ls="--", lw=1.2)
-    gap = prob[y == 1].mean() - prob[y == 0].mean()
-    ax_d.set_title(f"probe score by endpoint  --  {best[0]}/{best[1]}\n"
-                   f"{summary[best][2]} seeds pooled, {view}", fontsize=10)
-    ax_d.set_xlabel("predicted P(depressed)", fontsize=9)
-    ax_d.set_ylabel("participant-seed pairs", fontsize=9)
-    ax_d.annotate(f"mean gap = {gap:+.3f}", xy=(0.02, 0.97), xycoords="axes fraction",
-                  va="top", ha="left", fontsize=9,
-                  bbox=dict(boxstyle="round,pad=0.35", fc="white", ec="0.7", alpha=0.9))
-    ax_d.legend(loc="upper right", fontsize=8, framealpha=0.85)
-    ax_d.tick_params(labelsize=8); ax_d.grid(alpha=0.2)
-
-    # ---- middle: mean ROC +/- 1 sd over seeds ---------------------------------
-    mtpr, stpr, aucs = _mean_roc(per_variant[best])
-    ax_r.plot([0, 1], [0, 1], color="0.6", ls="--", lw=1, label="chance (AUC 0.500)")
-    ax_r.fill_between(ROC_GRID, np.clip(mtpr - stpr, 0, 1), np.clip(mtpr + stpr, 0, 1),
-                      color=class_colors[1], alpha=0.20, lw=0, label="+/-1 sd over seeds")
-    ax_r.plot(ROC_GRID, mtpr, color=class_colors[1], lw=2,
-              label=f"mean ROC (AUC {np.mean(aucs):.3f} +/- {np.std(aucs):.3f})")
-    from sklearn.metrics import roc_curve                    # lazy: keeps sklearn optional
-    for (ys, ps) in per_variant[best]:                       # the individual seeds, faint
-        if len(np.unique(np.asarray(ys, dtype=int))) < 2:
-            continue
-        f_, t_, _ = roc_curve(np.asarray(ys, dtype=int), np.asarray(ps, dtype=float))
-        ax_r.plot(f_, t_, color=class_colors[1], lw=0.8, alpha=0.35)
-    ax_r.set_xlim(0, 1); ax_r.set_ylim(0, 1)
-    ax_r.set_title(f"ROC over {len(aucs)} seeds  --  {best[0]}/{best[1]}", fontsize=10)
-    ax_r.set_xlabel("false-positive rate  (1 - specificity)", fontsize=9)
-    ax_r.set_ylabel("true-positive rate  (sensitivity)", fontsize=9)
-    ax_r.legend(loc="lower right", fontsize=8, framealpha=0.85)
-    ax_r.tick_params(labelsize=8); ax_r.grid(alpha=0.2)
-
-    # ---- right: every model's AUC, mean +/- sd over seeds ---------------------
-    order = sorted(summary, key=lambda k: summary[k][0])
-    ypos = np.arange(len(order))
-    means = np.array([summary[k][0] for k in order])
-    sds = np.array([summary[k][1] for k in order])
-    ax_f.axvline(0.5, color="0.45", ls="--", lw=1.3, label="chance (0.5)")
-    ax_f.errorbar(means, ypos, xerr=sds, fmt="o", ms=5, color="#0072B2",
-                  ecolor="#0072B2", elinewidth=1.2, capsize=3, lw=0)
-    ax_f.set_yticks(ypos)
-    ax_f.set_yticklabels([f"{k[0][:2]}/{k[1]}  (n={summary[k][2]})" for k in order], fontsize=8)
-    ax_f.set_xlabel("subject-level AUC  (mean +/- sd over seeds)", fontsize=9)
-    ax_f.set_title(f"every variant, {view}", fontsize=10)
-    ax_f.legend(loc="lower right", fontsize=8, framealpha=0.85)
-    ax_f.tick_params(labelsize=8); ax_f.grid(alpha=0.2, axis="x")
-
-    fig.suptitle("Depression-endpoint separation on the probe's decision axis "
-                 "(held-out HRD test set)", fontsize=12, fontweight="bold")
-    fig.tight_layout(rect=[0, 0, 1, 0.93])
-    fig.savefig(out_png, dpi=200, bbox_inches="tight")
-    plt.close(fig)
-    return summary
 
 
 def print_aggregated(rows):
@@ -757,7 +608,7 @@ def pe_contrast(results_dir, ref=("tcn", "none"), metric="sigma", n_boot=2000, s
     """
     by = {}                                     # (backbone, pe) -> {seed: sufficient stats}
     for fp, d in iter_metrics(results_dir):
-        side = fp.parent / "rq1" / "rq1.json"
+        side = rq_path(fp.parent, "rq1.json", create=False)
         j = read_json(side) if side.exists() else None
         if j and j.get("bootstrap"):
             k = variant_key(d, fp)
@@ -817,6 +668,116 @@ def pe_contrast(results_dir, ref=("tcn", "none"), metric="sigma", n_boot=2000, s
     return rows
 
 
+def circadian_landscape(results_dir, out_png):
+    """Cross-variant view of the circadian analysis. BEYOND the paper: WavesFM compares two
+    models on one figure and never varies a seed, so it needs no such summary.
+
+    One point per (variant, seed, stage), the stages being the backbone output and the two
+    branches the disentangler splits it into -- so a collapse can be attributed to the backbone
+    or to the disentangler instead of merely observed.
+
+    A representation is only useful to RQ1-RQ3 when it
+    moves with the clock AND still separates people at the same hour, so the two axes are
+    exactly those two shares of variance, and the reader wants the TOP-RIGHT corner:
+
+        y low  -> the embedding is a clock and nothing else (or is collapsed outright);
+        x low  -> the embedding ignores time of day;
+        both   -> useful.
+
+    The right panel is the same runs as a strip of diurnal swing, because that is the number
+    the per-run figures print and it is the one that varies wildly between seeds -- seeing the
+    spread is the point, so it is drawn per seed rather than averaged away.
+    """
+    import matplotlib
+    matplotlib.use("Agg")
+    import matplotlib.pyplot as plt
+
+    pts = []
+    for fp, d in iter_metrics(results_dir):
+        k = variant_key(d, fp)
+        rj = rq_path(fp.parent, "hrd_rhythm.json", create=False)
+        if not rj.exists():
+            continue
+        try:
+            circ = json.loads(rj.read_text(encoding="utf-8")).get("circadian_similarity") or {}
+        except (json.JSONDecodeError, OSError):
+            continue
+        for br, st in circ.items():
+            if br.startswith("Raw"):                 # the raw row is the input, not a result
+                continue
+            cv, pv = st.get("clock_var_frac"), st.get("participant_var_frac")
+            if cv is None or pv is None:             # written by an older run
+                continue
+            # Three stages, in pipeline order: the backbone output, then the two branches the
+            # disentangler splits it into. Keeping `backbone` here is what lets the reader see
+            # WHERE a variant loses its structure instead of only that it did.
+            stage = ("backbone" if br.startswith("Backbone") else
+                     "season" if "V^(S)" in br else "trend")
+            pts.append({"variant": f"{k.backbone}/{k.pe}", "seed": k.seed,
+                        "branch": stage,
+                        "clock": float(cv), "person": float(pv),
+                        "swing": float(st.get("diurnal_amplitude", float("nan"))),
+                        "bad": bool(st.get("degenerate"))})
+    if not pts:
+        return {}
+
+    variants = sorted({p["variant"] for p in pts})
+    cmap = plt.get_cmap("tab10")
+    col = {v: cmap(i % 10) for i, v in enumerate(variants)}
+    mark = {"backbone": "s", "trend": "^", "season": "o"}     # pipeline order
+
+    jit = np.random.default_rng(0)                    # stable jitter, not hash-based
+    fig, (ax, axb) = plt.subplots(1, 2, figsize=(14.5, 5.2),
+                                  gridspec_kw={"width_ratios": [1.15, 1.0]})
+
+    ax.axhspan(0, 0.05, color="0.90", zorder=0)
+    ax.text(0.99, 0.025, "no person information -- a clock, or collapsed", ha="right",
+            va="center", fontsize=8, color="#7a1a1a")
+    for p in pts:
+        ax.scatter(p["clock"], p["person"], s=64 if not p["bad"] else 90,
+                   marker=mark[p["branch"]], color="none" if p["bad"] else col[p["variant"]],
+                   edgecolor="#b30000" if p["bad"] else col[p["variant"]],
+                   linewidth=1.8 if p["bad"] else 0.8, alpha=0.95, zorder=3)
+    ax.set_xlim(-0.02, 1.02); ax.set_ylim(-0.02, 1.02)
+    ax.set_xlabel("variance explained by CLOCK TIME")
+    ax.set_ylabel("variance explained by PARTICIPANT")
+    ax.set_title("(a) is the representation rhythmic AND personal?", fontsize=10)
+    ax.grid(alpha=0.25)
+    hs = ([plt.Line2D([], [], ls="", marker="o", color=col[v], label=v) for v in variants]
+          + [plt.Line2D([], [], ls="", marker=m, color="0.35", label=b)
+             for b, m in mark.items()]
+          + [plt.Line2D([], [], ls="", marker="o", mfc="none", mec="#b30000", mew=1.8,
+                        color="none", label="degenerate")])
+    ax.legend(handles=hs, fontsize=7.5, loc="upper left", ncol=2, framealpha=0.9)
+
+    order = [(v, b) for v in variants for b in ("backbone", "trend", "season")
+             if any(p["variant"] == v and p["branch"] == b for p in pts)]
+    for i, (v, b) in enumerate(order):
+        sel = [p for p in pts if p["variant"] == v and p["branch"] == b]
+        for p in sel:
+            axb.scatter(i + jit.normal(0, .05), p["swing"],
+                        s=52, marker=mark[b], color="none" if p["bad"] else col[v],
+                        edgecolor="#b30000" if p["bad"] else col[v],
+                        linewidth=1.6 if p["bad"] else 0.8, zorder=3)
+        if sel:
+            m = float(np.median([p["swing"] for p in sel]))
+            axb.plot([i - .28, i + .28], [m, m], color=col[v], lw=2.2, zorder=4)
+    axb.set_xticks(range(len(order)))
+    axb.set_xticklabels([f"{v}\n{b}" for v, b in order], fontsize=7.0)
+    axb.set_ylabel("diurnal swing of cosine similarity")
+    axb.set_ylim(-0.05, 2.05)                        # the full possible range, never autoscaled
+    axb.set_title("(b) one point per seed -- how reproducible is it?", fontsize=10)
+    axb.grid(alpha=0.25, axis="y")
+
+    fig.suptitle("Circadian structure across variants and seeds  (supplementary to the "
+                 "per-run figures)", fontsize=12, fontweight="bold")
+    fig.tight_layout(rect=[0, 0, 1, 0.94])
+    fig.savefig(out_png, dpi=200, bbox_inches="tight")
+    plt.close(fig)
+    return {"n_points": len(pts), "n_degenerate": sum(p["bad"] for p in pts),
+            "variants": variants}
+
+
 def utility_across_tasks(results_dir, energy_dir):
     """RQ3 Part A as the design asks for it: one table, ladder x tasks.
 
@@ -832,10 +793,14 @@ def utility_across_tasks(results_dir, energy_dir):
     """
     from collections import defaultdict
     out = defaultdict(dict)                       # (variant, rung) -> {task: auc}
-    for fp in sorted(Path(results_dir).glob("*/*/rq3/rq3_utility.csv")):
+    for fp in sorted(Path(results_dir).glob("*/*/RQ3/rq3_utility.csv")):
         variant = fp.parent.parent.name
         with open(fp, encoding="utf-8") as f:
             for r in csv.DictReader(f):
+                # Part B rows share this file now; they are not ladder rungs, so they must not
+                # appear as one in a cross-task comparison.
+                if r.get("role", "ladder") != "ladder":
+                    continue
                 try:
                     out[(variant, r["representation"])]["depression"] = float(r["auc"])
                 except (ValueError, KeyError):
@@ -863,18 +828,171 @@ def utility_across_tasks(results_dir, energy_dir):
     return rows
 
 
+# --------------------------------------------------------------------------- #
+# Cross-variant panels. Both read the SAME tree the tables above do, through the
+# shared reader, so a figure can never disagree with the table beside it.
+# --------------------------------------------------------------------------- #
+def _seed_ci(per):
+    """(mean, lo, hi) over per-seed values; NaN-safe and never raises on n < 2."""
+    from scipy import stats
+    per = np.asarray(per, dtype=float)
+    per = per[~np.isnan(per)]
+    if per.size == 0:
+        return np.nan, np.nan, np.nan
+    if per.size < 2:
+        return float(per[0]), float(per[0]), float(per[0])
+    lo, hi = stats.t.interval(.95, per.size - 1, per.mean(), stats.sem(per))
+    return float(per.mean()), float(lo), float(hi)
+
+
+def fig_pe_dissociation(cur, out_dir, backbone="tcn"):
+    """Positional encoding: does it move prediction, or only how the space is organised?"""
+    from collections import defaultdict
+    from scipy import stats
+    import matplotlib
+    matplotlib.use("Agg")
+    import matplotlib.pyplot as plt
+    from _style import BASE, GRID, INK, INK2, MUTED, POS, SURFACE, save, strip
+
+    tr = defaultdict(lambda: {"auc": [], "dis": []})
+    for k, r in cur.items():
+        if k.backbone != backbone:
+            continue
+        tr[k.pe]["auc"].append(r["m"]["participant_level"]["auc_roc"])
+        tr[k.pe]["dis"].append(r["d"].get("DIS", float("nan")))
+    order = [p for p in sorted(tr, key=lambda p: -np.nanmean(tr[p]["dis"]))
+             if len(tr[p]["auc"]) > 1]
+    print("\n" + "=" * 78 + "\nFIG C - positional encoding: prediction vs disentanglement")
+    if len(order) < 2:
+        print(f"  fewer than 2 usable {backbone} PE variants; figure C skipped")
+        return
+    f_auc = stats.f_oneway(*[tr[p]["auc"] for p in order])
+    f_dis = stats.f_oneway(*[tr[p]["dis"] for p in order])
+    for p in order:
+        print(f"  {p:<14}AUC={np.mean(tr[p]['auc']):.4f}   DIS={np.nanmean(tr[p]['dis']):.4f}")
+    print(f"  ANOVA  AUC: F={f_auc[0]:.2f} p={f_auc[1]:.3f}    "
+          f"DIS: F={f_dis[0]:.1f} p={f_dis[1]:.1e}")
+
+    fig, axes = plt.subplots(1, 2, figsize=(10.4, 4.4))
+    for ax, (key, lab, ttl, fs) in zip(axes, [
+            ("auc", "participant-level AUC", "Prediction", f_auc),
+            ("dis", "disentanglement (DIS)", "Disentanglement", f_dis)]):
+        for i, p in enumerate(order):
+            m, lo, hi = _seed_ci(tr[p][key])
+            c = POS if key == "auc" else MUTED
+            ax.plot([lo, hi], [i, i], color=c, linewidth=2, zorder=2)
+            ax.scatter([m], [i], s=48, color=c, zorder=3, edgecolor=SURFACE, linewidth=1.6)
+        ax.set_yticks(range(len(order))), ax.set_yticklabels(order, fontsize=8.5, color=INK2)
+        ax.set_xlabel(lab, fontsize=9)
+        ax.set_title(f"{ttl}    F = {fs[0]:.2f}, p = "
+                     f"{'%.2f' % fs[1] if fs[1] > 0.01 else '%.0e' % fs[1]}",
+                     fontsize=9.5, color=INK, loc="left", pad=8)
+        ax.xaxis.grid(True, color=GRID, linewidth=0.7), ax.set_axisbelow(True)
+        strip(ax)
+    axes[0].axvline(0.5, color=BASE, linewidth=1.1)
+    axes[1].axvline(0, color=BASE, linewidth=1.1)
+    fig.suptitle(f"Positional encoding ({backbone}): prediction vs how the representation "
+                 "is organised", fontsize=12, color=INK, x=0.012, ha="left", y=0.98)
+    fig.tight_layout(rect=[0, 0, 1, 0.93])
+    save(fig, out_dir, "figC_pe_dissociation.png")
+
+
+# `better` = +1 when larger is better. Leak is the only metric where an increase is a
+# DEGRADATION, so the colour must follow this and not the raw sign.
+CLK = [("auc", "participant AUC", "prediction", +1),
+       ("DIS", "disentanglement (DIS)", "structure", +1),
+       ("rec_rhythm_branch", "rhythm capture, S branch", "structure", +1),
+       ("leak_into_rhythm", "rhythm to trend leak", "structure", -1)]
+
+
+def fig_clock_ablation(on, off, out_dir):
+    """Paired calendar-channel on/off, over the cells the two runs share."""
+    from scipy import stats
+    import matplotlib
+    matplotlib.use("Agg")
+    import matplotlib.pyplot as plt
+    from _style import BASE, GRID, INK, INK2, MUTED, NEG, POS, SURFACE, save, strip
+
+    # Pair a clock-on cell with the clock-off cell matching on everything but the run id --
+    # fold and target included, so a DS1 cell is never differenced against a DS2 one.
+    def pair(k):
+        return (k.backbone, k.pe, k.holdout, k.label, k.seed)
+
+    on = {pair(k): r for k, r in on.items()}
+    off = {pair(k): r for k, r in off.items()}
+    both = sorted(set(on) & set(off))
+    print("\n" + "=" * 78 + f"\nFIG D - removing the calendar channels (paired, {len(both)} cells)")
+    if len(both) < 2:
+        print("  fewer than 2 paired cells; figure D skipped")
+        return
+
+    def get(r, path):
+        return (r["m"]["participant_level"]["auc_roc"] if path == "auc"
+                else r["d"].get(path, float("nan")))
+
+    seeds = sorted({k[-1] for k in both})                  # seed is last in the pair key
+    D = []
+    for path, lab, kind, better in CLK:
+        diff = np.array([get(off[k], path) - get(on[k], path) for k in both], dtype=float)
+        per = np.array([np.nanmean(diff[[i for i, k in enumerate(both) if k[-1] == s]])
+                        for s in seeds])
+        m, lo, hi = _seed_ci(per)
+        keep = per[~np.isnan(per)]
+        p = stats.ttest_1samp(keep, 0.).pvalue if keep.size > 1 else np.nan
+        base = abs(np.nanmean([get(off[k], path) for k in both])) or 1e-9
+        if np.isnan(m):
+            print(f"  {lab:<26}-- absent, skipped")
+            continue
+        D.append((lab, kind, 100 * m / base, 100 * lo / base, 100 * hi / base, p, better))
+        print(f"  {lab:<26}{m:>+9.4f}  [{lo:+.4f},{hi:+.4f}]  p={p:.4f}  "
+              f"({100 * m / base:+.1f} % relative)")
+    if not D:
+        print("  no metrics present; figure D skipped")
+        return
+
+    fig, ax = plt.subplots(figsize=(9.2, 3.6))
+    D = D[::-1]
+    for i, (lab, kind, rd, rlo, rhi, p, better) in enumerate(D):
+        ax.barh(i, rd, height=0.58, color=POS if rd * better > 0 else NEG,
+                edgecolor=SURFACE, linewidth=2, alpha=1.0 if p < 0.05 else 0.35)
+        ax.plot([rlo, rhi], [i, i], color=INK, linewidth=1.3, zorder=3)
+        ax.text(rhi + 0.4 if rd > 0 else rlo - 0.4, i,
+                f"{rd:+.1f}%" + ("" if p < 0.05 else "  n.s."), va="center",
+                ha="left" if rd > 0 else "right", fontsize=8.5, color=INK2)
+    ax.axvline(0, color=BASE, linewidth=1.1)
+    ax.set_yticks(range(len(D)))
+    ax.set_yticklabels([f"{lab}   \u00b7  {kind}" + ("  (lower is better)" if b < 0 else "")
+                        for lab, kind, *_r, b in D], fontsize=8.5, color=INK2)
+    ax.set_xlabel("relative change when the calendar channels are removed (%)", fontsize=9)
+    ax.xaxis.grid(True, color=GRID, linewidth=0.7), ax.set_axisbelow(True)
+    strip(ax)
+    fig.suptitle("Effect of the calendar covariates", fontsize=12, color=INK,
+                 x=0.012, ha="left", y=0.99)
+    fig.text(0.012, 0.885, f"blue = the property improved, red = it degraded; solid = p < 0.05, "
+             f"faded = n.s.; paired over {len(seeds)} seeds", fontsize=8.5, color=MUTED, ha="left")
+    fig.tight_layout(rect=[0, 0, 1, 0.86])
+    save(fig, out_dir, "figD_clock_ablation.png")
+
+
 def main():
-    p = argparse.ArgumentParser(description="Summarise CoST PE-variant results")
+    p = argparse.ArgumentParser(description="Summarise DSSL PE-variant results")
     p.add_argument("--results-dir", default="results_hrd")
     p.add_argument("--energy-dir", default="results_hrd_energy",
                    help="Where --energy-output-dir wrote the EE probes; merged into Part A.")
     p.add_argument("--csv", default=None, help="Optional path to write the table as CSV")
+    p.add_argument("--fig-dir", default=str(Path("docs") / "figures"),
+                   help="Where the cross-variant panels are written.")
+    p.add_argument("--fig-backbone", default="tcn",
+                   help="Backbone whose PE variants the dissociation panel compares.")
+    p.add_argument("--clock-on", help="Run id WITH the calendar channels (enables the "
+                                      "clock-ablation panel).")
+    p.add_argument("--clock-off", help="Run id WITHOUT the calendar channels.")
     args = p.parse_args()
 
     rows = []
     base_samples = {}                       # model_name -> {seed -> metrics}, deduped by seed
-    # One shared reader (scripts/_results.py) derives the variant identity for BOTH this
-    # script and results_figures.py, so the two can never disagree about what a run is.
+    # One shared reader (scripts/_results.py) derives the variant identity for the tables
+    # and the panels alike, so the two can never disagree about what a run is.
     for fp, d in iter_metrics(args.results_dir):
         k = variant_key(d, fp)
         win, pid = d.get("window_level", {}), d.get("participant_level", {})
@@ -970,16 +1088,6 @@ def main():
 
     # endpoint separation on the probe's decision axis, pooled over seeds (score
     # distribution + mean ROC with a +/-1 sd band + per-variant AUC forest)
-    score_png = Path(args.results_dir) / "probe_score_report.png"
-    ps = probe_score_report(args.results_dir, score_png)
-    if ps:
-        best = max(ps, key=lambda k: ps[k][0])
-        print(f"\nBest subject-level AUC ({HEADLINE_VIEW}): {best[0]}/{best[1]} = "
-              f"{ps[best][0]:.3f} +/- {ps[best][1]:.3f} over {ps[best][2]} seeds")
-        print(f"Wrote {score_png}")
-    else:
-        print("\n[probe scores] no probe_scores.json found -- re-run the variants to "
-              "generate probe_score_report.png")
 
     # cross-variant rhythm <-> prediction link
     out_png = Path(args.results_dir) / "rhythm_vs_prediction.png"
@@ -991,6 +1099,12 @@ def main():
         print(f"Wrote {out_png}")
 
     # RQ3 Part A: the ladder against all three downstream tasks
+    circ_png = Path(args.results_dir) / "circadian_landscape.png"
+    cl = circadian_landscape(args.results_dir, circ_png)
+    if cl:
+        print(f"Wrote {circ_png}  ({cl['n_points']} branch-runs, "
+              f"{cl['n_degenerate']} degenerate)")
+
     ut = utility_across_tasks(args.results_dir, args.energy_dir)
     if ut and args.csv:
         fp = Path(args.csv).with_name("summary_utility_tasks.csv")
@@ -1007,6 +1121,16 @@ def main():
             w = csv.DictWriter(f, fieldnames=list(pe[0]))
             w.writeheader(); w.writerows(pe)
         print(f"Wrote {fp}")
+
+    # cross-variant panels, from the same tree
+    cur = load_variants(args.results_dir)
+    census(cur, args.results_dir)
+    fig_pe_dissociation(cur, args.fig_dir, args.fig_backbone)
+    if args.clock_on and args.clock_off:
+        fig_clock_ablation(load_variants(args.results_dir, [args.clock_on]),
+                           load_variants(args.results_dir, [args.clock_off]), args.fig_dir)
+    else:
+        print("\nFIG D - skipped (pass --clock-on and --clock-off to build it)")
 
     if args.csv:
         with open(args.csv, "w", newline="", encoding="utf-8") as f:
