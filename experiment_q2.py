@@ -139,6 +139,56 @@ def raw_deviation(Zw, zbar):
     return np.sqrt((np.abs(Zw - zbar) ** 2).mean(1))
 
 
+def resolve_phase_levels(levels, bin_minutes):
+    """The requested shifts, kept only where the sampling grid can actually express them.
+
+    `phase_shift` rolls by k = round(hours * 60 / bin_minutes) bins, so any level below half a
+    bin rolls by ZERO and perturbs nothing. Nothing downstream notices: the deviation score is
+    computed on an unchanged window, the ground-truth change dg is exactly 0, and a stratum
+    needs both a positive and a negative dg to contribute a pair -- so the level silently
+    contributes no evidence at all.
+
+    Run 2074344 hit exactly that. GLOBEM samples 4 segments a day, i.e. 360-minute bins, and
+    the default grid (0.5, 1, 2, 3, 4 h) rolls by (0, 0, 0, 0, 1) bins: four of five levels
+    were no-ops and the fifth moved every window identically, so n_pairs came out 0 in all 24
+    variants and RQ2 measured nothing while reporting success.
+
+    Levels that collide on the same k are also dropped -- two names for one perturbation would
+    enter the stratified estimate twice. If nothing survives, a grid of 1..4 bins replaces it,
+    which is the finest thing the data can represent.
+    """
+    seen, keep, dropped = set(), [], []
+    for lv in levels:
+        k = int(round(float(lv) * 60 / bin_minutes))
+        if k == 0 or k in seen:
+            dropped.append((float(lv), k))
+            continue
+        seen.add(k)
+        keep.append(float(lv))
+    # A single surviving level is no better than none. The stratified estimate needs strata
+    # holding BOTH a positive and a negative dg, and one uniform shift moves every window the
+    # same way -- which is the second half of what went wrong on GLOBEM: 4 h survived the
+    # filter, rolled every window by the same 1 bin, and frac_dg_positive came out 1.0. Top up
+    # from the finest shifts the grid can express until at least three distinct ones exist.
+    k_extra = 1
+    while len(keep) < 3:
+        if k_extra not in seen:
+            seen.add(k_extra)
+            keep.append(k_extra * bin_minutes / 60)
+        k_extra += 1
+        if k_extra > 12:                       # nothing sensible left to add
+            break
+    keep = sorted(set(keep))
+    if dropped:
+        print(f"[rq2] dropped unrepresentable phase levels {[d[0] for d in dropped]} h "
+              f"(they roll by {[d[1] for d in dropped]} bins at {bin_minutes} min/bin)")
+    if bin_minutes >= 120:
+        print(f"[rq2] NOTE: at {bin_minutes} min/bin the smallest expressible shift is "
+              f"{bin_minutes/60:.1f} h, a {bin_minutes/60/24:.0%} fraction of the circadian "
+              f"cycle. This perturbation is coarse by construction on this cohort.")
+    return keep
+
+
 def phase_shift(X, hours, n_sensors, bin_minutes):
     """Circular shift of the sensor channels by `hours`. Exactly a rotation of z (see
     cosinor_z). Calendar/clock channels beyond n_sensors are left alone -- shifting them would
@@ -282,7 +332,8 @@ def main():
     # --- one pass per shift level; the perturbed input is shared by every representation ----
     per_stratum = {name: {} for name in reps}
     pid_of, cells = {}, []
-    for lv in a.phase_levels:
+    levels = resolve_phase_levels(a.phase_levels, ctx.bin_minutes)
+    for lv in levels:
         Xp = phase_shift(ctx.X, lv, ctx.n_sensors, ctx.bin_minutes)
         dg = raw_deviation(cosinor_z(Xp[:, :, :ctx.n_sensors], ctx.bins_per_day), zbar) - g_clean
         keys = np.array([f"{q}|{lv}" for q in ctx.pids])
@@ -320,7 +371,7 @@ def main():
 
     ci = lambda b: [float(np.nanpercentile(b, 2.5)), float(np.nanpercentile(b, 97.5))]
     rows, res = [], {"variant": ctx.tag, "seed": ctx.seed, "ref_windows": R,
-                     "perturbation": "phase_shift_h", "levels": list(a.phase_levels),
+                     "perturbation": "phase_shift_h", "levels": list(levels),
                      "n_participants": int(len(uniq)), "n_windows": int(elig.sum()),
                      "metric": "stratified Mann-Whitney concordance C; null = 0.5",
                      "strata": "(participant, shift level)",
@@ -378,7 +429,7 @@ def main():
                  "deviation rises, rather than merely when the input changes?",
                  fontsize=11, color=INK, loc="left", pad=10)
     fig.text(0.01, 0.005,
-             f"{ctx.tag}   |   phase shift {a.phase_levels} h   |   personal reference = {R} "
+             f"{ctx.tag}   |   phase shift {levels} h   |   personal reference = {R} "
              f"preceding windows, frozen   |   {int(elig.sum())} held-out windows, "
              f"{len(uniq)} participants\npositive = the shift increased the window's raw 24-h "
              "cosinor deviation from its own baseline; negative = it decreased it   |   "

@@ -118,7 +118,13 @@ def persubject_rows(feat, pids, y, mask, circular=False):
     """
     mu, ps = per_participant_mean(feat[mask], pids[mask], circular=circular)
     sd = np.array([feat[mask & (pids == q)].std(0) for q in ps])
-    ys = np.array([int(y[mask & (pids == q)][0]) for q in ps])
+    # The participant's MAJORITY label, not their first window's. On HRD the two are the same
+    # thing -- the endpoint label is repeated on every window of a person -- but GLOBEM's
+    # weekly mode gives each window the label of the survey inside its own date span, so `[0]`
+    # picked whichever week happened to come first while the features average all of them.
+    # Run 2074344 scored the whole RQ3 ladder that way and every rung landed below chance,
+    # against 0.530 for the headline probe, which pairs each window with its own label.
+    ys = np.array([np.bincount(y[mask & (pids == q)].astype(int)).argmax() for q in ps])
     return np.hstack([mu, sd]), ys, ps
 
 
