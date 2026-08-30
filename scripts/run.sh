@@ -462,7 +462,13 @@ case " $CLOCK_FLAG $ABLATE " in *" --with-clock-features "*) CLOCK_TAG="_clock" 
 SP_TAG=""
 case " $ABLATE " in
   *" --season-pool "*)
-    _sp=$(printf '%s' " $ABLATE " | sed -n 's/.*--season-pool  *\([^ ][^ ]*\).*//p')
+    # Parameter expansion, not sed: the value is the first word after the flag. A regex
+    # with a backreference is the obvious way to write this and is how it was written
+    # first -- where the backslash was lost in transit, the replacement became an empty
+    # string, and the tag came out blank. The mispointing survived a test that passed,
+    # because the test exercised a hand-typed copy of the line rather than this file.
+    _rest="${ABLATE#*--season-pool }"
+    _sp="${_rest%% *}"
     [ -n "$_sp" ] && [ "$_sp" != "spec" ] && SP_TAG="_sp-${_sp}"
     ;;
 esac
