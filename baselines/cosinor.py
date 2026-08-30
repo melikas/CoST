@@ -41,7 +41,7 @@ for _n, _v in {"round_": np.round, "float_": np.float64, "NaN": np.nan, "NAN": n
 
 import scipy.signal as signal          # noqa: E402  (after the shim, per the note above)
 from joblib import Parallel, delayed   # noqa: E402  (ships with scikit-learn)
-from CosinorPy import cosinor          # noqa: E402  the paper's exact cosinor engine
+# CosinorPy is imported lazily, inside calculate_cosinor -- see the note there.
 
 COSINOR_PARAM_COLS = [
     "Period", "MESOR", "Amplitude", "Magnitude", "Acrophase", "Orthophase", "Bathyphase",
@@ -69,6 +69,14 @@ def periodogram(y, significance_level=0.05):
 def calculate_cosinor(y, periods, t):
     """Single-component cosinor at each period -> (len(periods), 12) in COSINOR_PARAM_COLS
     order. `t` is the CLOCK-anchored sample index, so every phase parameter is wall-clock."""
+    # Imported here, not at module scope. CosinorPy is the one dependency that is not in the
+    # Alliance wheelhouse, and importing it at module scope made it a requirement of everything
+    # that transitively reaches this file -- tasks/rhythm.py imports N_PARAMS, so a CPU job that
+    # only wanted _interdaily_stability died on ModuleNotFoundError without ever fitting a
+    # cosinor. Deferring it changes no behaviour for callers that do fit one: the NumPy-2.0
+    # shim above still runs first, and a missing CosinorPy still raises the same error, at the
+    # call instead of at the import.
+    from CosinorPy import cosinor
     time, values = pd.Series(t), pd.Series(np.asarray(y, dtype=float))
     out = np.full((len(periods), N_PARAMS), np.nan)
     for i, p in enumerate(periods):
