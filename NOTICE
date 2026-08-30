@@ -1,0 +1,68 @@
+This project incorporates code from the following open-source projects.
+Their licence terms are reproduced in third_party/ and apply to the files named
+below. Everything not named here was written for this project.
+
+================================================================================
+CoST -- Contrastive Learning of Disentangled Seasonal-Trend Representations
+        for Time Series Forecasting
+================================================================================
+Copyright (c) 2022, Salesforce.com, Inc.
+Licence: BSD 3-Clause  (third_party/LICENSE.CoST)
+Source:  https://github.com/salesforce/CoST
+Paper:   Gerald Woo, Chenghao Liu, Doyen Sahoo, Akshat Kumar, Steven Hoi.
+         ICLR 2022.  arXiv:2202.01575
+
+Derived files and components:
+  cost.py             CoST / CoSTModel, the MoCo trend branch (momentum encoder,
+                      key queue, compute_loss, _dequeue_and_enqueue), the
+                      seasonal instance-contrastive term, convert_coeff, and the
+                      encode / _eval_with_pooling inference path.
+  models/encoder.py   CoSTEncoder and BandedFourierLayer.
+  utils.py            init_dl_program, split_with_nan,
+                      centerize_vary_length_series, torch_pad_nan.
+  data_processing/    the calendar-covariate construction, which follows
+                      CoST's datautils._get_time_features field for field.
+
+All of the above are MODIFIED. The modifications are listed in README.md under
+"What is ours"; the most substantial are a frequency-domain readout of the
+seasonal branch, a unit-circle embedding of the seasonal phase inside the loss,
+a per-harmonic banding of the Fourier layer, and alternative positive-pair and
+negative-sampling schemes. None of these are present upstream.
+
+================================================================================
+TS2Vec -- Towards Universal Representation of Time Series
+================================================================================
+Copyright (c) 2022 Zhihan Yue
+Licence: MIT  (third_party/LICENSE.TS2Vec)
+Source:  https://github.com/zhihanyue/ts2vec
+Paper:   Zhihan Yue et al.  AAAI 2022.  arXiv:2106.10466
+
+Derived files and components, which reached this project through CoST:
+  models/dilated_conv.py    SamePadConv, ConvBlock, DilatedConvEncoder --
+                            the dilated-convolution backbone, unmodified except
+                            for the final projection width.
+  cost.py                   instance_contrastive_loss, the within-batch
+                            instance-discrimination term the seasonal branch
+                            uses. Modified: it is applied to the unit-circle
+                            phase embedding rather than to raw angles, and the
+                            negatives it scores against are selectable.
+
+================================================================================
+Methods used but NOT vendored as code
+================================================================================
+The implementations below were written for this project; the papers are cited
+because the mechanisms are theirs.
+
+  MoCo         momentum contrast with a key queue.
+               Kaiming He et al., CVPR 2020.  arXiv:1911.05722
+  Time2Vec     learnable-frequency time encoding, used by models/positional_-
+               encoding.py as an input feature.
+               Seyed Mehran Kazemi et al., 2019.  arXiv:1907.05321
+
+================================================================================
+Runtime dependency invoked directly
+================================================================================
+  CosinorPy    baselines/cosinor.py calls cosinor.fit_me as the reference
+               cosinor engine for the handcrafted rhythm baseline. Installed
+               from its own distribution; not vendored here.
+               https://github.com/mmoskon/CosinorPy
