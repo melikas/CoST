@@ -448,9 +448,25 @@ python train_hrd.py \
 # (train_hrd.py: dis_tag). run.sh has to append the SAME tag or the RQ scripts are pointed at a
 # directory that was never written -- which is exactly how run 1421825 pretrained 24 encoders
 # and then failed every q1/q2/q3 with FileNotFoundError on metrics.json.
+# train_hrd.py:1024 builds the name as
+#     {backbone}_{pe}{dis_tag}{seed_tag}{clock_tag}{sp_tag}
+# and EVERY tag has to be mirrored here, in that order. Only dis_tag was, so a sweep passing
+# --season-pool or --with-clock-features trained 24 encoders into "..._sp-same" and then
+# pointed all three RQ scripts at "...", a directory nothing had written. Run 2074341 lost its
+# entire RQ suite that way -- 24 tasks, three FileNotFoundErrors each, all non-fatal, so the
+# sweep reported success.
 DIS_TAG=""
 case " $ABLATE " in *" --no-disentangle "*) DIS_TAG="_plain" ;; esac
-VARIANT_DIR="$OUTPUT_DIR/$RUN_ID/${BACKBONE}_${PE}${DIS_TAG}${SEED_TAG}"
+CLOCK_TAG=""
+case " $CLOCK_FLAG $ABLATE " in *" --with-clock-features "*) CLOCK_TAG="_clock" ;; esac
+SP_TAG=""
+case " $ABLATE " in
+  *" --season-pool "*)
+    _sp=$(printf '%s' " $ABLATE " | sed -n 's/.*--season-pool  *\([^ ][^ ]*\).*//p')
+    [ -n "$_sp" ] && [ "$_sp" != "spec" ] && SP_TAG="_sp-${_sp}"
+    ;;
+esac
+VARIANT_DIR="$OUTPUT_DIR/$RUN_ID/${BACKBONE}_${PE}${DIS_TAG}${SEED_TAG}${CLOCK_TAG}${SP_TAG}"
 CACHE_DIR="${SLURM_TMPDIR:-/tmp}/hrd_cache"; mkdir -p "$CACHE_DIR"
 
 # RQ1 runs on every variant -- it IS the PE sweep. RQ2/RQ3 run on a PRE-DECLARED pair only
