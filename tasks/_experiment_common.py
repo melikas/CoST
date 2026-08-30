@@ -114,7 +114,7 @@ def load_context(variant_dir, cache_dir=None, gpu=0):
 
     # Split recovered from the run itself, never recomputed.
     test_pids = set(map(str, meta["test_pids"]))
-    test_mask = np.isin(pids, list(test_pids))
+    test_mask = np.isin(pids, list(test_pids)) & (np.asarray(y) >= 0)
     # One label per participant. Taking any window's y is right for HRD, where the endpoint
     # label is repeated on all of a person's windows -- but GLOBEM's weekly mode marks a window
     # with no survey in its span as y=-1, and the first window is often one of those, which
@@ -127,7 +127,13 @@ def load_context(variant_dir, cache_dir=None, gpu=0):
     cohort = data["labeled_pids"] if cfg["cohort"] == "labeled" else data["consistent_pids"]
     pool = sorted({str(p) for p in cohort if str(p) in pid_label} - test_pids)
     rem, val = stratified_pid_holdout(pool, pid_label, cfg["val_frac"], cfg["split_seed"])
-    train_mask, val_mask = np.isin(pids, list(rem)), np.isin(pids, list(val))
+    # Every SCORED mask excludes windows with no label, exactly as train_hrd.py does. Without
+    # it GLOBEM's weekly mode puts y=-1 windows into the probe and the supervised rung, whose
+    # roc_auc_score then sees three classes -- which is how RQ3's supervised ceiling came back
+    # as "SKIPPED: multi_class must be in ('ovo', 'ovr')" on the first GLOBEM run.
+    labelled = np.asarray(y) >= 0
+    train_mask = np.isin(pids, list(rem)) & labelled
+    val_mask = np.isin(pids, list(val)) & labelled
     if not val_mask.any():
         val_mask = train_mask
 
