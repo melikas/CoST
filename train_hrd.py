@@ -514,7 +514,9 @@ def parse_args():
                         "two measured defects: the positive pair was a near-identity transform "
                         "(top-1 1.000 at init vs chance 1/(K+1)) and both branches contrasted "
                         "the same pair (Full minus plain = +0.0007, p=0.979).")
-    p.add_argument("--positive-pair", choices=["window", "participant"], default="window",
+    p.add_argument("--positive-pair",
+                   choices=["window", "participant", "day-disjoint"],
+                   default="window",
                    help="What the contrastive positive is. 'window' (default) uses two "
                         "augmented copies of the SAME window -- measured on an untrained "
                         "encoder with a queue of real keys, top-1 retrieval is 1.000 against a "
@@ -523,7 +525,16 @@ def parse_args():
                         "draws the second view from a DIFFERENT window of the same person: the "
                         "pair then shares only that person's circadian amplitude and phase "
                         "(top-1 0.150, i.e. chance), so matching it requires encoding the "
-                        "rhythm.")
+                        "rhythm. 'day-disjoint' rebuilds the SAME window twice out of "
+                        "disjoint halves of its own days: whole days are moved on day "
+                        "boundaries, so the time of day survives and the only content "
+                        "the two views reliably share is the circadian cycle and its "
+                        "harmonics. Measured on real windows, off-harmonic agreement "
+                        "falls from 0.756 to 0.287 while the daily harmonics hold at "
+                        "0.555, so rhythm becomes the only route to a solution -- which "
+                        "is the point: 'window' shares the whole spectrum equally, so "
+                        "any feature solves it and the objective never says which to "
+                        "learn.")
     p.add_argument("--seasonal-bands", choices=["harmonics", "single"], default="harmonics",
                    help="Layout of the seasonal (SFD) Fourier layer. 'harmonics' gives each "
                         "circadian harmonic its own band; 'single' is the one full-spectrum "

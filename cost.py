@@ -27,7 +27,8 @@ class PretrainDataset(Dataset):
                  pids=None,
                  positive="window",
                  decomp=None,
-                 n_sensors=0):
+                 n_sensors=0,
+                 bins_per_day=96):
         super().__init__()
         self.data = data
         self.p = p
@@ -49,8 +50,34 @@ class PretrainDataset(Dataset):
         #                  measurement: top-1 0.150, i.e. chance. The pair shares the person's
         #                  circadian amplitude and phase and nothing else, so matching it
         #                  requires encoding the rhythm.
-        assert positive in ("window", "participant"), positive
+        # 'day-disjoint' -- the two views are the SAME window rebuilt out of DISJOINT halves of
+        #                  its own days, drawn with replacement, moved on day boundaries so the
+        #                  time of day is preserved exactly. Measured on real windows, this is
+        #                  what the three pairings leave the views sharing:
+        #
+        #                      pairing                   daily harmonics   rest of spectrum
+        #                      window (jitter+shift)          0.707             0.756
+        #                      day-disjoint alone             0.757             0.383
+        #                      day-disjoint + jitter+shift    0.555             0.287
+        #
+        #                  The problem with 'window' is not that it is hard or easy: it is that
+        #                  the two views share the WHOLE spectrum equally, so any feature
+        #                  solves the task and the objective never says which one to learn.
+        #                  Under a day-disjoint split the only content reliably shared is the
+        #                  content at multiples of the daily frequency -- the circadian cycle
+        #                  and its harmonics -- because permuting whole days leaves exactly
+        #                  those bins standing. So the rhythm becomes the only route to a
+        #                  solution, and there is room to move: a rhythm-only reader retrieves
+        #                  at 0.196 where the untrained network gets 0.019 (chance 0.001).
+        #
+        #                  It survives the thin pools a 7-day HRD window gives (halves of 3 and
+        #                  4 days): daily coherence 0.606 against 0.022 off-harmonic.
+        assert positive in ("window", "participant", "day-disjoint"), positive
         self.positive = positive
+        self.bins_per_day = int(bins_per_day)
+        if positive == "day-disjoint" and self.T // self.bins_per_day < 2:
+            raise ValueError(f"positive='day-disjoint' needs >=2 days per window, "
+                             f"got T={self.T} at {self.bins_per_day} bins/day")
         # Participant index per window, as a plain int code. Needed whenever the MoCo queue
         # has to know WHOSE key each slot holds -- see CoSTModel.queue_pid and `negatives`.
         # It is built for every run, not just positive='participant', because the negative
@@ -111,6 +138,48 @@ class PretrainDataset(Dataset):
         pr = None if self.peers is None else self.peers[i]
         return int(pr[random.randrange(len(pr))]) if pr is not None and len(pr) else i
 
+    def _day_views(self, i):
+        """Two views of window `i`, each rebuilt from one half of its own days.
+
+        The days are split into two disjoint halves, and each view draws `D` days WITH
+        REPLACEMENT from its own half, so the views share no raw day. Days move whole and on
+        day boundaries, which is what preserves the time of day -- and therefore the circadian
+        phase -- exactly.
+
+        The DC offset is applied here with certainty rather than at the usual p=0.5. Resampling
+        days preserves the window's mean level EXACTLY, and level is close to a participant
+        fingerprint: without the offset, the pair is matched on level alone and no rhythm is
+        learned. Measured -- a mean-only reader retrieves at 0.241 under a bare day-disjoint
+        split and at 0.016 once the offset is applied. That makes the offset part of the
+        pairing, not an optional augmentation, so it cannot be left to a coin flip.
+
+        Trailing clock channels are rebuilt from the same day order as the sensor channels, so
+        a view stays a consistent window rather than sensor data under someone else's calendar.
+        """
+        B = self.bins_per_day
+        D = self.T // B
+        order = torch.randperm(D)
+        x = self.data[i]
+        head = x[:D * B].reshape(D, B, -1)
+        tail = x[D * B:]                                  # bins that do not fill a whole day
+        out = []
+        for half in (order[:D // 2], order[D // 2:]):
+            idx = half[torch.randint(0, len(half), (D,))]
+            v = head[idx].reshape(D * B, -1)
+            if len(tail):
+                v = torch.cat([v, tail], dim=0)
+            if self.n_exact_tail:
+                k = v.size(-1) - self.n_exact_tail
+                v = torch.cat([self.jitter(self._offset(v[..., :k])), v[..., k:]], dim=-1)
+            else:
+                v = self.jitter(self._offset(v))
+            out.append(v)
+        return out[0], out[1]
+
+    def _offset(self, x):
+        """`shift` with no coin flip -- see _day_views for why this one is not optional."""
+        return x + (torch.randn(x.size(-1)) * self.shift_sigma)
+
     def _decomp_views(self, i):
         """Views for the SEASONAL branch: share this window's sigma, swap tau, resample noise.
 
@@ -137,7 +206,10 @@ class PretrainDataset(Dataset):
             j = int(self.peers[i][random.randrange(len(self.peers[i]))])
         # Same pair for both branches -- the historical behaviour, returned in the same
         # 4-view shape so the training loop has one code path.
-        q, k = self.transform(self.data[i]), self.transform(self.data[j])
+        if self.positive == "day-disjoint":
+            q, k = self._day_views(i)
+        else:
+            q, k = self.transform(self.data[i]), self.transform(self.data[j])
         # The QUERY's participant, `i` not `j`: the negative sampler asks "whose window is
         # being matched", and the query is what the loss scores against the queue.
         pid = int(self.pid_idx[i])
@@ -764,7 +836,8 @@ class CoST:
 
         train_dataset = PretrainDataset(torch.from_numpy(train_data).to(torch.float), jitter_sigma=self.jitter_sigma, shift_sigma=self.shift_sigma, multiplier=multiplier, n_exact_tail=self._n_exact_tail,
                                         pids=pids, positive=self.positive_pair,
-                                        decomp=decomp, n_sensors=self.n_sensors)
+                                        decomp=decomp, n_sensors=self.n_sensors,
+                                        bins_per_day=self.bins_per_day)
         if self.positive_pair == "participant" and verbose:
             print(f"[pretrain] positive pair = another window of the same participant "
                   f"({train_dataset.n_paired}/{len(train_data)} windows have a peer)")
@@ -788,8 +861,12 @@ class CoST:
                 # paired the same way; without pids it falls back to same-window pairing and
                 # would report a different, easier objective.
                 val_ds = PretrainDataset(torch.from_numpy(vd).to(torch.float), jitter_sigma=self.jitter_sigma, shift_sigma=self.shift_sigma, multiplier=1, n_exact_tail=self._n_exact_tail,
-                                         pids=vp, positive=self.positive_pair if vp is not None else "window",
-                                         decomp=vdec, n_sensors=self.n_sensors)
+                                         pids=vp,
+                                         positive=(self.positive_pair
+                                                   if vp is not None or self.positive_pair != "participant"
+                                                   else "window"),
+                                         decomp=vdec, n_sensors=self.n_sensors,
+                                         bins_per_day=self.bins_per_day)
                 val_loader = DataLoader(val_ds, batch_size=min(self.batch_size, len(val_ds)),
                                         shuffle=False, drop_last=True)
 
