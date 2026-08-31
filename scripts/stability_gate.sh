@@ -3,6 +3,10 @@
 # The day-resolved phase-concentration gate, over the 24 saved encoders of one run.
 #
 #   sbatch --array=0-23%24 scripts/stability_gate.sh results_hrd/2002135
+#   SCRIPT=rhythm_dynamics.py sbatch --array=0 scripts/stability_gate.sh results_hrd/2002135
+#
+# SCRIPT selects which CPU gate to run (default rhythm_stability.py). A gate that needs
+# no encoder needs only --array=0; one that reads every seed needs the full range.
 #
 # NO GPU and NO TRAINING. Every encoder already exists; this only reads them. That is the
 # point of running it first: it decides whether the R_k block is worth an architecture
@@ -45,4 +49,7 @@ export PYTHONUNBUFFERED=1
 export OMP_NUM_THREADS="${SLURM_CPUS_PER_TASK:-12}"
 CACHE_DIR="${SLURM_TMPDIR:-/tmp}/hrd_cache"; mkdir -p "$CACHE_DIR"
 
-python rhythm_stability.py --variant-dir "$VARIANT_DIR" --cache-dir "$CACHE_DIR"
+PY_SCRIPT="${SCRIPT:-rhythm_stability.py}"
+[ -f "$PY_SCRIPT" ] || { echo "[gate] no such script: $PY_SCRIPT"; exit 1; }
+echo "[gate] running $PY_SCRIPT"
+python "$PY_SCRIPT" --variant-dir "$VARIANT_DIR" --cache-dir "$CACHE_DIR"
