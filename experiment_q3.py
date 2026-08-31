@@ -27,6 +27,7 @@ import numpy as np
 from sklearn.metrics import roc_auc_score
 
 from baselines.cosinor import paper_cosinor_features
+from structured_rhythm import structured_features
 from baselines.plain_ssl import encode_plain, plain_ssl_encoder
 from baselines.supervised import supervised_baseline_row
 from tasks._eval_protocols import (fast_auc, fit_persubject_probe,
@@ -156,6 +157,16 @@ def main():
                 pids=ctx.pids, cache_path=d / "cosinor_cache_all.npz")
         except Exception as e:
             print(f"[rq3] Cosinor (paper) rung SKIPPED: {type(e).__name__}: {e}")
+    # Cosinor's own estimator -- least squares on the signal -- extended with the three
+    # constructs cosinor structurally cannot express: waveform harmonics, per-day dispersion,
+    # and the acrophase difference between channels. See structured_rhythm.py for why each is
+    # there and what it is answering to. Guarded exactly like the cosinor rung: this rung
+    # failing must not throw away the rest of the ladder.
+    try:
+        ladder["Structured rhythm"] = structured_features(ctx.X, ctx.bins_per_day,
+                                                          ctx.n_sensors)
+    except Exception as e:
+        print(f"[rq3] Structured rhythm rung SKIPPED: {type(e).__name__}: {e}")
     ladder["Random-init"] = encode(random_init_model(ctx), ctx.X, ctx.cfg)
     if wants_plain_ssl(ctx) and not a.no_plain_ssl:
         # Same SSL, same data, disentangler OFF -- the control that isolates what the

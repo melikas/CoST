@@ -4,9 +4,14 @@
 #
 #   sbatch --array=0-23%24 scripts/stability_gate.sh results_hrd/2002135
 #   SCRIPT=rhythm_dynamics.py sbatch --array=0 scripts/stability_gate.sh results_hrd/2002135
+#   SCRIPT=experiment_q3.py EXTRA='--no-supervised --no-plain-ssl' \
+#     sbatch --gres=gpu:a100_3g.20gb:1 --time=3:00:00 --array=0-23%12 \
+#     scripts/stability_gate.sh results_hrd/2002135
 #
 # SCRIPT selects which CPU gate to run (default rhythm_stability.py). A gate that needs
 # no encoder needs only --array=0; one that reads every seed needs the full range.
+# EXTRA passes flags through to it. A gate needing a GPU asks for one on the sbatch
+# command line -- SLURM reads #SBATCH before this script runs, so it cannot be set here.
 #
 # NO GPU and NO TRAINING. Every encoder already exists; this only reads them. That is the
 # point of running it first: it decides whether the R_k block is worth an architecture
@@ -45,6 +50,25 @@ source "$SLURM_TMPDIR/env/bin/activate"
 pip install --no-index --upgrade pip
 pip install --no-index torch numpy pandas scikit-learn einops matplotlib
 
+# CosinorPy only when the gate actually needs it -- the RQ2/RQ3 scripts carry the cosinor
+# baseline, which is the arm this whole design is being measured against, and losing it
+# silently would make the comparison meaningless. It is not in the Alliance wheelhouse and
+# compute nodes have no internet, hence the local wheelhouse first. Mirrors scripts/run.sh.
+case "${SCRIPT:-}" in
+  experiment_q*.py)
+    pip install --no-index seaborn matplotlib pandas \
+      || echo "  [WARN] no seaborn -> CosinorPy import will fail"
+    pip install --no-index --find-links "$PROJECT/wheels" CosinorPy 2>/dev/null \
+      || pip install CosinorPy \
+      || echo "  [WARN] CosinorPy install failed"
+    python -c "from CosinorPy import cosinor" 2>/dev/null \
+      && echo "[gate] CosinorPy OK" \
+      || echo "[gate] [WARN] CosinorPy MISSING -- the cosinor rung will be skipped, which is "\
+              "the comparison this run exists to make"
+    ;;
+esac
+
+export MPLBACKEND=Agg
 export PYTHONUNBUFFERED=1
 export OMP_NUM_THREADS="${SLURM_CPUS_PER_TASK:-12}"
 CACHE_DIR="${SLURM_TMPDIR:-/tmp}/hrd_cache"; mkdir -p "$CACHE_DIR"
@@ -52,4 +76,5 @@ CACHE_DIR="${SLURM_TMPDIR:-/tmp}/hrd_cache"; mkdir -p "$CACHE_DIR"
 PY_SCRIPT="${SCRIPT:-rhythm_stability.py}"
 [ -f "$PY_SCRIPT" ] || { echo "[gate] no such script: $PY_SCRIPT"; exit 1; }
 echo "[gate] running $PY_SCRIPT"
-python "$PY_SCRIPT" --variant-dir "$VARIANT_DIR" --cache-dir "$CACHE_DIR"
+# shellcheck disable=SC2086  -- EXTRA is a caller-supplied argument list, word splitting wanted
+python "$PY_SCRIPT" --variant-dir "$VARIANT_DIR" --cache-dir "$CACHE_DIR" ${EXTRA:-}

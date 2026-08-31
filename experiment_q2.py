@@ -48,6 +48,8 @@ import numpy as np
 import pandas as pd
 from scipy.stats import rankdata
 
+from structured_rhythm import structured_features
+
 from tasks._experiment_common import (encode, load_context, out_dir, random_init_model,
                                       save, write_csv)
 
@@ -312,7 +314,13 @@ def main():
             "Handcrafted": lambda A: np.concatenate(
                 [A[:, :, :ctx.n_sensors].mean(1), A[:, :, :ctx.n_sensors].std(1)], axis=1),
             "Raw (hourly) [ceiling]": raw_rep,
-            "Random-init": lambda A: encode(rand, A, ctx.cfg)}
+            "Random-init": lambda A: encode(rand, A, ctx.cfg),
+            # Cosinor's estimator plus the three things cosinor cannot express -- waveform
+            # harmonics, per-day phase/amplitude dispersion, and the channel-to-channel
+            # acrophase difference. RQ2's perturbation IS a phase shift, so this is the arm
+            # where the per-day block should matter most. Not a ceiling: it is fitted from
+            # the same window every other arm sees, with no access to the perturbation.
+            "Structured": lambda A: structured_features(A, ctx.bins_per_day, ctx.n_sensors)}
     # amp/phase exist only under season_pool='spec', where the seasonal readout really is
     # [amplitude | phase]. Under the other poolings, halving the block yields two arbitrary
     # slices that only LOOK like amplitude and phase.
