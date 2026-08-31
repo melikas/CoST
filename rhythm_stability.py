@@ -54,17 +54,12 @@ import json
 from pathlib import Path
 
 import numpy as np
-import torch
-from sklearn.linear_model import RidgeCV
-from sklearn.metrics import roc_auc_score
-from sklearn.model_selection import GroupKFold
-from sklearn.pipeline import make_pipeline
-from sklearn.preprocessing import StandardScaler
 
-from model_build import encode_repr
-from tasks._eval_protocols import fit_persubject_probe, persubject_rows
-from tasks._experiment_common import load_context, out_dir, random_init_model, save
-from tasks.rhythm import _interdaily_stability
+from tasks._stats import paired
+
+# torch, scikit-learn and the task package are imported inside the functions that
+# need them. --aggregate reads nothing but the per-seed JSON already on disk, and
+# making it import torch to run a t-test meant it could not run on a login node.
 
 ALPHAS = (0.01, 0.1, 1, 10, 100, 1000, 10000, 100000)
 
@@ -80,6 +75,7 @@ def daily_phase_concentration(model, X, bins_per_day, batch=128, harmonics=(1, 2
     Days whose amplitude is numerically zero contribute no direction and are dropped from that
     dimension's mean rather than being given an arbitrary one.
     """
+    import torch
     org = model.net.training
     model.net.eval()
     out = []
@@ -108,6 +104,10 @@ def daily_phase_concentration(model, X, bins_per_day, batch=128, harmonics=(1, 2
 
 def oof_r2(F, Y, groups, n_splits=5):
     """Out-of-fold R^2 per column, participant-grouped, penalty chosen inside the fold."""
+    from sklearn.linear_model import RidgeCV
+    from sklearn.model_selection import GroupKFold
+    from sklearn.pipeline import make_pipeline
+    from sklearn.preprocessing import StandardScaler
     pred = np.full_like(Y, np.nan, dtype=float)
     cv = GroupKFold(n_splits=int(min(n_splits, len(np.unique(groups)))))
     for tr, te in cv.split(F, Y[:, 0], groups):
@@ -123,6 +123,8 @@ def oof_r2(F, Y, groups, n_splits=5):
 
 def probe_auc(feat, ctx):
     """Participant AUC on the run's own held-out participants, with the canonical probe."""
+    from sklearn.metrics import roc_auc_score
+    from tasks._eval_protocols import fit_persubject_probe, persubject_rows
     clf = fit_persubject_probe(feat, ctx.pids, ctx.y, ctx.train_mask, ctx.val_mask, ctx.seed)
     Xs, ys, _ = persubject_rows(feat, ctx.pids, ctx.y, ctx.test_mask)
     return float(roc_auc_score(ys, clf.predict_proba(Xs)[:, 1])) if len(set(ys)) > 1 else np.nan
@@ -139,8 +141,6 @@ def aggregate(run_dir):
     1/(n_splits-1), so passing n_splits = 1 + n_train/n_test makes the two expressions equal.
     Both are participant counts, read from the runs themselves rather than assumed.
     """
-    from experiment_readout import paired
-
     rows, ntest, ntrain = [], [], []
     for f in sorted(Path(run_dir).glob("*_seed*/RQ1/rhythm_stability.json")):
         rows.append(json.loads(f.read_text(encoding="utf-8")))
@@ -210,6 +210,12 @@ def main():
         return
     if not a.variant_dir:
         ap.error("one of --variant-dir or --aggregate is required")
+
+    import torch
+    from model_build import encode_repr
+    from tasks._experiment_common import (load_context, out_dir,
+                                        random_init_model, save)
+    from tasks.rhythm import _interdaily_stability
 
     ctx = load_context(a.variant_dir, a.cache_dir, gpu=-1)
     ctrl = random_init_model(ctx)
