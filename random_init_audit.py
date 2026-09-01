@@ -91,11 +91,16 @@ def audit(ctx, n_perm=20):
     print(f"[audit] {ctx.tag} seed={ctx.seed} | train {len(tr)} val {len(va)} test {len(te)} "
           f"participants | train-test overlap {len(tr & te)}, val-test {len(va & te)}")
 
+    # The trained arm is optional. run.sh deletes every encoder but one unless
+    # KEEP_ENC_ALL=1, and none of the three explanations under test needs it: Random-init
+    # is CONSTRUCTED from the config rather than loaded, and the two projection arms use no
+    # network at all. DSSL's AUC for the same seed is already in rq3_utility.csv.
     with torch.no_grad():
-        V = encode(ctx.model, ctx.X, ctx.cfg)
         ctrl = random_init_model(ctx)
         R = encode(ctrl, ctx.X, ctx.cfg)
-    width = V.shape[1]
+        V = encode(ctx.model, ctx.X, ctx.cfg) if getattr(ctx, 'trained', True) else None
+    width = R.shape[1]
+    res['trained_encoder_available'] = bool(V is not None)
 
     # Two further random draws of the SAME architecture. If the headline number rides on one
     # lucky initialisation these will not reproduce it.
@@ -115,7 +120,6 @@ def audit(ctx, n_perm=20):
     res["readout_width"] = int(width)
 
     arms = {
-        "DSSL": V,
         "Random-init": R,
         "Random-init seed+1": alt[0],
         "Random-init seed+2": alt[1],
@@ -123,6 +127,11 @@ def audit(ctx, n_perm=20):
         "Banded random projection": raw_projection(ctx.X, ctx.n_sensors, width, ctx.seed,
                                                    bands=bands),
     }
+    if V is not None:
+        arms = {"DSSL": V, **arms}
+    else:
+        print("[audit] no encoder.pt -- the DSSL arm is skipped; every other arm is "
+              "unaffected because none of them loads trained weights")
     print(f"[audit] readout width {width} | bands {res['bands']}")
     for name, feat in arms.items():
         res[f"auc/{name}"] = _probe_auc(feat, ctx)
@@ -200,7 +209,7 @@ def main():
         ap.error("one of --variant-dir or --aggregate is required")
 
     from tasks._experiment_common import load_context, out_dir, save
-    ctx = load_context(a.variant_dir, a.cache_dir, a.gpu)
+    ctx = load_context(a.variant_dir, a.cache_dir, a.gpu, require_encoder=False)
     res = audit(ctx, a.n_perm)
     res["n_train_participants"] = int(len(np.unique(ctx.pids[ctx.train_mask])))
     save(out_dir(ctx, "rq3"), "random_init_audit", res)

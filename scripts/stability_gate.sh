@@ -35,8 +35,16 @@ RUN_DIR="${1:?usage: sbatch scripts/stability_gate.sh <results_hrd/RUNID>}"
 # The variant directories of this run, sorted, one per array task. Read from disk rather
 # than from a hard-coded seed list: a task that picks a directory nothing wrote is exactly
 # the failure mode run 2074341 hit, and there is no reason to reproduce it here.
-mapfile -t DIRS < <(find "$RUN_DIR" -mindepth 1 -maxdepth 1 -type d -name '*_seed*' \
-                    -exec test -f '{}/encoder.pt' \; -print | sort)
+# NEED_ENC=0 for a gate that reads no trained weights. run.sh keeps only one encoder per
+# sweep unless KEEP_ENC_ALL=1, so filtering on encoder.pt silently reduced a 24-task array
+# to one -- which is how job 2188351 came back with a single seed.
+if [ "${NEED_ENC:-1}" = "1" ]; then
+  mapfile -t DIRS < <(find "$RUN_DIR" -mindepth 1 -maxdepth 1 -type d -name '*_seed*' \
+                      -exec test -f '{}/encoder.pt' \; -print | sort)
+else
+  mapfile -t DIRS < <(find "$RUN_DIR" -mindepth 1 -maxdepth 1 -type d -name '*_seed*' \
+                      -exec test -f '{}/metrics.json' \; -print | sort)
+fi
 ID="${SLURM_ARRAY_TASK_ID:-0}"
 if [ "$ID" -ge "${#DIRS[@]}" ]; then
   echo "[gate] task $ID >= ${#DIRS[@]} encoders in $RUN_DIR -- nothing to do"; exit 0

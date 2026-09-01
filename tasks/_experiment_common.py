@@ -98,8 +98,15 @@ def _dataset(cfg, cache_dir):
 
 
 
-def load_context(variant_dir, cache_dir=None, gpu=0):
-    """Everything the experiment scripts need, with the trained encoder frozen in eval mode."""
+def load_context(variant_dir, cache_dir=None, gpu=0, require_encoder=True):
+    """Everything the experiment scripts need, with the trained encoder frozen in eval mode.
+
+    `require_encoder=False` returns the same context with encoder.pt left unloaded, for the
+    questions that need only the data, the split and the architecture -- a run.sh sweep
+    deletes every encoder except one unless KEEP_ENC_ALL=1, and re-training 24 seeds just to
+    ask what a RANDOM encoder does would be absurd. `ctx.trained` says which one you have;
+    a caller that reads ctx.model without checking it would silently score noise.
+    """
     variant_dir = Path(variant_dir)
     meta = json.loads((rq_path(variant_dir, "metrics.json")).read_text(encoding="utf-8"))
     cfg = meta["config"]
@@ -109,7 +116,10 @@ def load_context(variant_dir, cache_dir=None, gpu=0):
     device = torch.device(f"cuda:{gpu}" if gpu >= 0 and torch.cuda.is_available() else "cpu")
 
     model = build_model(cfg, X, data["n_sensors"], device)
-    model.load(rq_path(variant_dir, "encoder.pt"))
+    enc = rq_path(variant_dir, "encoder.pt")
+    trained = enc.exists()
+    if require_encoder or trained:
+        model.load(enc)
     model.net.eval()
 
     # Split recovered from the run itself, never recomputed.
@@ -156,6 +166,7 @@ def load_context(variant_dir, cache_dir=None, gpu=0):
         # (train_hrd.py:759), so the plain-SSL twin sees identical data.
         pretrain_mask=~test_mask,
         last_mask=last, seed=cfg["model_seed"], tag=f"{cfg['backbone']}/{cfg['pe']}",
+        trained=trained,
         _n_sensors_data=data["n_sensors"])
 
 
