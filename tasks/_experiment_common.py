@@ -184,10 +184,18 @@ def random_init_model(ctx):
     default would give some archived runs a control of a different architecture. "Same
     architecture, weights never trained" has to be true by construction, not by luck.
     """
-    sfd = getattr(ctx.model.net, "sfd", None)
     cfg = dict(ctx.cfg)
+    sfd = getattr(getattr(ctx.model, "net", None), "sfd", None)
     if sfd is not None:
         cfg["seasonal_bands"] = "single" if len(sfd) == 1 else "harmonics"
+    elif "seasonal_bands" not in cfg:
+        # No trained encoder to copy the layout from, and the config predates the key --
+        # so there is nothing that KNOWS the layout, and guessing it would rebuild a
+        # control of a different architecture, which is the one thing this function
+        # exists to prevent.
+        raise ValueError("random_init_model: no encoder to copy the seasonal layout from "
+                         "and no seasonal_bands in the config -- the control cannot be "
+                         "guaranteed architecture-matched")
     return _random_init_model(cfg, ctx.X, ctx.n_sensors, ctx.device, ctx.seed)
 
 

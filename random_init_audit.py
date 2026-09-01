@@ -105,7 +105,7 @@ def audit(ctx, n_perm=20):
     # Two further random draws of the SAME architecture. If the headline number rides on one
     # lucky initialisation these will not reproduce it.
     cfg = dict(ctx.cfg)
-    sfd = getattr(ctx.model.net, "sfd", None)
+    sfd = getattr(getattr(ctx.model, "net", None), "sfd", None)
     if sfd is not None:
         cfg["seasonal_bands"] = "single" if len(sfd) == 1 else "harmonics"
     alt = []
@@ -114,8 +114,12 @@ def audit(ctx, n_perm=20):
             alt.append(encode(build_random(cfg, ctx.X, ctx.n_sensors, ctx.device, s),
                               ctx.X, ctx.cfg))
 
-    bands = (ctx.model.net.seasonal_bands if hasattr(ctx.model.net, "seasonal_bands")
-             else seasonal_band_edges(ctx.seq_len, ctx.bins_per_day))
+    layer_bands = getattr(getattr(ctx.model, "net", None), "seasonal_bands", None)
+    if layer_bands is None:
+        layer_bands = (seasonal_band_edges(ctx.seq_len, ctx.bins_per_day)
+                       if cfg.get("seasonal_bands") == "harmonics"
+                       else [(0, (ctx.seq_len // 2) + 1)])
+    bands = layer_bands
     res["bands"] = [list(map(int, b)) for b in bands]
     res["readout_width"] = int(width)
 
@@ -132,7 +136,11 @@ def audit(ctx, n_perm=20):
     else:
         print("[audit] no encoder.pt -- the DSSL arm is skipped; every other arm is "
               "unaffected because none of them loads trained weights")
-    print(f"[audit] readout width {width} | bands {res['bands']}")
+    full = len(bands) == 1 and bands[0][1] - bands[0][0] >= ctx.seq_len // 2
+    res["banded_arm_is_a_contrast"] = not full
+    print(f"[audit] readout width {width} | bands {res['bands']}"
+          + ("  -- single full-spectrum band, so the banded arm is NOT a contrast here"
+             if full else ""))
     for name, feat in arms.items():
         res[f"auc/{name}"] = _probe_auc(feat, ctx)
         print(f"  {name:28s} AUC {res[f'auc/{name}']:.4f}")
@@ -143,12 +151,13 @@ def audit(ctx, n_perm=20):
     # returns chance; anything well above it means information about the held-out participants
     # is reaching the probe through a route other than their features.
     rng = np.random.default_rng(ctx.seed + 7919)
-    pid_list = np.unique(ctx.pids)
-    lab = {p: int(ctx.y[ctx.pids == p][0]) for p in pid_list}
+    y = np.asarray(ctx.y)
+    labelled = sorted({p for p in np.unique(ctx.pids) if (y[ctx.pids == p] >= 0).any()})
+    lab = [int(y[(ctx.pids == p) & (y >= 0)][0]) for p in labelled]
     perms = []
     for _ in range(int(n_perm)):
-        shuffled = dict(zip(pid_list, rng.permutation([lab[p] for p in pid_list])))
-        yp = np.array([shuffled[p] for p in ctx.pids])
+        shuffled = dict(zip(labelled, rng.permutation(lab)))
+        yp = np.where(y >= 0, np.array([shuffled.get(p, -1) for p in ctx.pids]), -1)
         perms.append(_probe_auc(R, ctx, y=yp))
     res["auc/Random-init permuted labels"] = float(np.nanmean(perms))
     res["auc/Random-init permuted labels max"] = float(np.nanmax(perms))
@@ -158,13 +167,9 @@ def audit(ctx, n_perm=20):
     return res
 
 
-def aggregate(run_dir):
+def summarise(rows):
     """Pool the per-seed audits and test each explanation against Random-init."""
     from tasks._stats import paired
-    rows = [json.loads(f.read_text(encoding="utf-8"))
-            for f in sorted(Path(run_dir).glob("*_seed*/RQ3/random_init_audit.json"))]
-    if not rows:
-        raise SystemExit(f"no random_init_audit.json under {run_dir}")
     ntest = [r["n_test_participants"] for r in rows]
     ntr = [r.get("n_train_participants", 0) for r in rows]
     n_splits = 3.17 if not any(ntr) else 1.0 + float(np.mean(ntr)) / float(np.mean(ntest))
@@ -185,8 +190,17 @@ def aggregate(run_dir):
         r = paired(col(k), base, n_splits)
         print(f"  {k[:32]:32s} - Random-init  {r['diff']:+.4f}  p={r['p']:.4f}  "
               f"wins {r['wins']}/{r['n']}")
-    out = {"n_seeds": len(rows), "mean": {k: float(np.nanmean(col(k))) for k in keys},
-           "overlaps": bad}
+    return {"n_seeds": len(rows), "mean": {k: float(np.nanmean(col(k))) for k in keys},
+            "overlaps": bad}
+
+
+def aggregate(run_dir):
+    """The cluster path: read the per-seed JSON each task wrote, then summarise."""
+    rows = [json.loads(f.read_text(encoding="utf-8"))
+            for f in sorted(Path(run_dir).glob("*_seed*/RQ3/random_init_audit.json"))]
+    if not rows:
+        raise SystemExit(f"no random_init_audit.json under {run_dir}")
+    out = summarise(rows)
     (Path(run_dir) / "random_init_audit_summary.json").write_text(
         json.dumps(out, indent=2, default=float), encoding="utf-8")
     print(f"[saved] {Path(run_dir) / 'random_init_audit_summary.json'}")
@@ -198,12 +212,30 @@ def main():
                                  formatter_class=argparse.RawDescriptionHelpFormatter)
     ap.add_argument("--variant-dir")
     ap.add_argument("--aggregate", metavar="RUN_DIR")
+    ap.add_argument("--npz", metavar="DUMP",
+                    help="run every arm from a dump_context.py file instead of the "
+                         "cluster: no CSV, no GPU, no trained weights. The DSSL arm is "
+                         "absent, and Random-init is CONSTRUCTED from the config, so the "
+                         "three explanations under test are all still separable.")
+    ap.add_argument("--out", default=None,
+                    help="where to write the per-seed results in --npz mode")
     ap.add_argument("--cache-dir", default=None)
     ap.add_argument("--gpu", type=int, default=0)
     ap.add_argument("--n-perm", type=int, default=20)
     a = ap.parse_args()
     if a.aggregate:
         aggregate(a.aggregate)
+        return
+    if a.npz:
+        from local_context import local_context, seeds
+        rows = []
+        for sd in seeds(a.npz):
+            rows.append(audit(local_context(a.npz, sd), a.n_perm))
+            print("")
+        out = Path(a.out or (Path(a.npz).with_suffix("").name + "_audit.json"))
+        out.write_text(json.dumps(rows, indent=2, default=float), encoding="utf-8")
+        print(f"[saved] {out}  ({len(rows)} seeds)")
+        summarise(rows)
         return
     if not a.variant_dir:
         ap.error("one of --variant-dir or --aggregate is required")
