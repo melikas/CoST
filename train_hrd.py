@@ -514,6 +514,24 @@ def parse_args():
                         "two measured defects: the positive pair was a near-identity transform "
                         "(top-1 1.000 at init vs chance 1/(K+1)) and both branches contrasted "
                         "the same pair (Full minus plain = +0.0007, p=0.979).")
+    p.add_argument("--drop-channels", nargs="*", default=None, metavar="NAME",
+                   help="Sensor channels to remove after the windows are built. Measured on "
+                        "HRD over 24 seeds, through an identical random projection and probe: "
+                        "dropping Steps raises the achievable AUC from 0.6884 to 0.7123, and "
+                        "with hourly bins to 0.7137. The channel is not merely uninformative "
+                        "for this endpoint, it is in the way. Applied AFTER windowing so the "
+                        "missingness filters and z-scoring still see it and the surviving "
+                        "windows stay the ones every other run scored.")
+    p.add_argument("--smooth-bins", type=int, default=0, metavar="W",
+                   help="Widest box filter the smoothing augmentation may draw, in time bins; "
+                        "0 (default) disables it. In a contrastive objective the augmentation "
+                        "IS the definition of noise, so each candidate has a ceiling -- the "
+                        "predictive content of what survives it. Measured on HRD: sub-hour "
+                        "smoothing 0.6926, jitter 0.6884, per-channel offset 0.6835, gain "
+                        "0.6492, day permutation 0.6303, time roll 0.6273, low-pass to "
+                        "tau+sigma 0.6228. Sub-hour smoothing is the only family that both "
+                        "defines a real invariance and raises the ceiling above the raw "
+                        "window, so at 15 min bins W=4 declares sub-hour detail to be noise.")
     p.add_argument("--positive-pair",
                    choices=["window", "participant", "day-disjoint"],
                    default="window",
@@ -737,6 +755,9 @@ def main():
           # Keep the parsed CSV only when the energy probe will re-read it below.
           cache_raw=args.energy_probe,
       )
+    if args.drop_channels:
+        from data_processing.data_preprocessing import drop_sensor_channels
+        data = drop_sensor_channels(data, args.drop_channels)
     X, y, pids = data["X"], data["y"], data["pids"]
     # cohort for the split: 'consistent' = only baseline==endpoint (clean label); 'labeled' =
     # every participant with an endpoint label (more samples; status-changers add label noise).
@@ -822,6 +843,7 @@ def main():
         negatives=args.negatives,
         n_negatives=args.n_negatives,
         positive_pair=args.positive_pair,
+        smooth_bins=args.smooth_bins,
         decomp_aug=args.decomp_aug,
         n_sensors=data["n_sensors"],
         mask_mode=args.mask_mode,

@@ -59,6 +59,9 @@ def build_model(cfg, X, n_sensors, device, **override):
         # rebuild those models against 32 sampled negatives instead of all 4096.
         n_negatives=cfg.get("n_negatives", 0),
         positive_pair=cfg.get("positive_pair", "window"),
+        # 0 = no smoothing augmentation, matching cost.py's own default, so every config
+        # written before this key existed rebuilds exactly the model it was.
+        smooth_bins=cfg.get("smooth_bins", 0),
         mask_mode=cfg["mask_mode"], mask_prob=cfg["mask_keep_prob"],
         phase_mode=cfg["phase_encoding"], device=device, lr=cfg["lr"],
         batch_size=cfg["batch_size"])

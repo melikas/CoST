@@ -18,7 +18,8 @@ from types import SimpleNamespace
 import numpy as np
 import torch
 
-from data_processing.data_preprocessing import prepare_hrd_dataset
+from data_processing.data_preprocessing import (drop_sensor_channels,
+                                                prepare_hrd_dataset)
 from models.positional_encoding import CALENDAR_PES
 # `encode` is re-exported: experiment_q1/q2/q3 import it from here so every RQ script encodes
 # through the one builder without each reaching into model_build separately.
@@ -47,14 +48,19 @@ _DATA_KEYS = ("dataset", "sensor_csv", "window_hours", "bin_minutes", "label_col
               # GLOBEM-only, and they MUST be in the key: two GLOBEM runs differing only in
               # window_days or the labelling mode would otherwise hash to the same cache entry
               # and the second would silently be handed the first one's windows.
-              "window_days", "stride_days", "globem_label", "globem_anchor_weekday")
+              "window_days", "stride_days", "globem_label", "globem_anchor_weekday",
+              # Dropping a channel changes X, so two runs differing only in it must not
+              # share a cache entry.
+              "drop_channels")
 # Bumped whenever prepare_hrd_dataset gains a KEY, not just when a config value changes.
 # None of _DATA_KEYS moves when a new field is added, so without this a pickle written by
 # the previous schema is a cache HIT and the new field silently arrives as None.
 #   2 -> added "ee_win" (window-matched emotional energy) for RQ2 layer 3.
 #   3 -> _dataset dispatches on cfg["dataset"], and the GLOBEM window arguments joined
 #        _DATA_KEYS. Any cache written before this cannot know which dataset it holds.
-_SCHEMA_VERSION = 3
+#   4 -> drop_channels. A cache written before it holds every channel, and a run that
+#        asks for a drop would silently be handed them.
+_SCHEMA_VERSION = 4
 
 
 def _dataset(cfg, cache_dir):
@@ -91,6 +97,10 @@ def _dataset(cfg, cache_dir):
             max_window_missing=cfg["max_window_missing"], z_score=not cfg["no_zscore"],
             clock_features=cfg["with_clock_features"],
             calendar_index=cfg["pe"] in CALENDAR_PES)
+    if cfg.get("drop_channels"):
+        # The same removal train_hrd applied, from the same config, so an experiment
+        # script never analyses a channel the encoder was never shown.
+        data = drop_sensor_channels(data, cfg["drop_channels"])
     if fp is not None:
         fp.write_bytes(pickle.dumps(data, protocol=4))
     return data

@@ -28,7 +28,8 @@ class PretrainDataset(Dataset):
                  positive="window",
                  decomp=None,
                  n_sensors=0,
-                 bins_per_day=96):
+                 bins_per_day=96,
+                 smooth_bins=0):
         super().__init__()
         self.data = data
         self.p = p
@@ -75,6 +76,9 @@ class PretrainDataset(Dataset):
         assert positive in ("window", "participant", "day-disjoint"), positive
         self.positive = positive
         self.bins_per_day = int(bins_per_day)
+        # Widest box filter the smoothing augmentation may draw. 0 disables it, which is the
+        # default, so a run that does not ask for it is bit-identical to before.
+        self.smooth_bins = int(smooth_bins)
         if positive == "day-disjoint" and self.T // self.bins_per_day < 2:
             raise ValueError(f"positive='day-disjoint' needs >=2 days per window, "
                              f"got T={self.T} at {self.bins_per_day} bins/day")
@@ -231,8 +235,45 @@ class PretrainDataset(Dataset):
         # guards against contrastive collapse.
         if self.n_exact_tail:
             k = x.size(-1) - self.n_exact_tail
-            return torch.cat([self.jitter(self.shift(x[..., :k])), x[..., k:]], dim=-1)
-        return self.jitter(self.shift(x))
+            return torch.cat([self.jitter(self.shift(self.smooth(x[..., :k]))),
+                              x[..., k:]], dim=-1)
+        return self.jitter(self.shift(self.smooth(x)))
+
+    def smooth(self, x):
+        """A circular box filter of a random sub-hour width -- what declares sub-hour detail
+        to be noise.
+
+        In a contrastive objective the augmentation IS the definition of noise: whatever it
+        destroys, the representation is trained to ignore. So each candidate carries a ceiling
+        -- the predictive content of what survives it -- and those were measured on HRD over
+        24 seeds, every one through an identical random projection and probe:
+
+            sub-hour smoothing   0.6926     the only one ABOVE the raw window's 0.6884
+            jitter               0.6884     removes nothing, so it defines no task at all
+            per-channel offset   0.6835
+            per-channel gain     0.6492
+            day permutation      0.6303
+            time roll            0.6273
+            low-pass to tau+sig  0.6228     the decomposition itself, the costliest of all
+
+        Only this one both defines a real invariance and raises the ceiling. Sub-hour variation
+        is therefore noise by the operational definition, and everything coarser is signal.
+
+        The filter is circular, so the window keeps its length and every rhythm keeps its phase
+        exactly -- a same-length pad is what stops this from becoming a time-crop, whose
+        ceiling is 0.6444.
+
+        Widths are ODD only. An even box filter has no centre bin, so its pad is asymmetric
+        and it moves every phase by half a bin -- measured at 0.0327 rad on the 24 h component
+        at 96 bins/day, which is exactly half of 2*pi/96. That would make this a time shift
+        wearing a smoother's clothes, and the ceiling for time shifts is 0.6273.
+        """
+        if self.smooth_bins < 3 or random.random() > self.p:
+            return x
+        w = random.randrange(3, (int(self.smooth_bins) // 2) * 2 + 2, 2)
+        xt = x.transpose(0, 1).unsqueeze(0)                       # (1, C, T)
+        xp = F.pad(xt, ((w - 1) // 2, (w - 1) // 2), mode="circular")
+        return F.avg_pool1d(xp, kernel_size=w, stride=1).squeeze(0).transpose(0, 1)
 
     def jitter(self, x):
         if random.random() > self.p:
@@ -646,6 +687,7 @@ class CoST:
                  disentangle: bool = True,
                  jitter_sigma: float = 0.1,
                  shift_sigma: float = 0.5,
+                 smooth_bins: int = 0,
                  moco_k: int = 4096,
                  trend_pool: str = "random",
                  positive_pair: str = "window",
@@ -684,6 +726,9 @@ class CoST:
         # leaves it at 0.931. Setting this to 0 removes the augmentation and asks whether the
         # level-invariance it imposes is what costs MESOR recovery against random-init.
         self.shift_sigma = shift_sigma
+        # Widest sub-hour box filter the smoothing augmentation may draw; 0 disables it. See
+        # PretrainDataset.smooth for the ceiling each augmentation family imposes.
+        self.smooth_bins = int(smooth_bins)
         self.moco_k = moco_k
         self.trend_pool = trend_pool
         self.mask_mode = mask_mode
@@ -837,7 +882,8 @@ class CoST:
         train_dataset = PretrainDataset(torch.from_numpy(train_data).to(torch.float), jitter_sigma=self.jitter_sigma, shift_sigma=self.shift_sigma, multiplier=multiplier, n_exact_tail=self._n_exact_tail,
                                         pids=pids, positive=self.positive_pair,
                                         decomp=decomp, n_sensors=self.n_sensors,
-                                        bins_per_day=self.bins_per_day)
+                                        bins_per_day=self.bins_per_day,
+                                        smooth_bins=self.smooth_bins)
         if self.positive_pair == "participant" and verbose:
             print(f"[pretrain] positive pair = another window of the same participant "
                   f"({train_dataset.n_paired}/{len(train_data)} windows have a peer)")
@@ -866,7 +912,8 @@ class CoST:
                                                    if vp is not None or self.positive_pair != "participant"
                                                    else "window"),
                                          decomp=vdec, n_sensors=self.n_sensors,
-                                         bins_per_day=self.bins_per_day)
+                                         bins_per_day=self.bins_per_day,
+                                         smooth_bins=self.smooth_bins)
                 val_loader = DataLoader(val_ds, batch_size=min(self.batch_size, len(val_ds)),
                                         shuffle=False, drop_last=True)
 
