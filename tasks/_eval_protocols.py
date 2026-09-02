@@ -374,3 +374,38 @@ def operating_point_report(y_true, y_prob, thresholds, prevalences):
                               for p in prevalences}
         out[name] = m
     return out
+
+
+def window_rows(feat, pids, y, mask):
+    """One row per WINDOW, not per participant -- the GLOBEM benchmark's prediction unit.
+
+    Their task is "given a label and the 28 days before it, classify that label", roughly 10
+    labels per person. Collapsing a participant's windows into one row with `persubject_rows`
+    answers a different question and produces a number that cannot be set beside theirs: a
+    fold holds 136-217 participants but 1287-2025 labelled windows.
+
+    Unlabelled windows are dropped here rather than by the caller. GLOBEM marks a window whose
+    span contains no survey as y = -1, and those are pretraining-only by design.
+    """
+    m = np.asarray(mask) & (np.asarray(y) >= 0)
+    return feat[m], np.asarray(y)[m].astype(int), np.asarray(pids)[m]
+
+
+def fit_window_probe(feat, pids, y, train_mask, val_mask, seed,
+                     c_grid=PROBE_C_GRID, n_pca=0):
+    """The same probe and the same penalty selection as `fit_persubject_probe`, per window.
+
+    The validation split stays participant-disjoint from training, so choosing the penalty on
+    it cannot leak a test participant -- only the UNIT changes, never the split.
+    """
+    Xtr, ytr, _ = window_rows(feat, pids, y, train_mask)
+    fit = lambda c: make_probe("supervised", c, seed,
+                               clamp_pca(n_pca, len(Xtr), Xtr.shape[1])).fit(Xtr, ytr)
+    val = None if val_mask is None else (np.asarray(val_mask) & ~np.asarray(train_mask))
+    if val is None or not val.any():
+        return fit(c_grid[len(c_grid) // 2])
+    Xva, yva, _ = window_rows(feat, pids, y, val)
+    if len(set(yva)) < 2:
+        return fit(c_grid[len(c_grid) // 2])
+    return fit(max(c_grid,
+                   key=lambda c: roc_auc_score(yva, fit(c).predict_proba(Xva)[:, 1])))

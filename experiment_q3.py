@@ -31,7 +31,8 @@ from structured_rhythm import structured_features
 from baselines.plain_ssl import encode_plain, plain_ssl_encoder
 from baselines.supervised import supervised_baseline_row
 from tasks._eval_protocols import (fast_auc, fit_persubject_probe,
-                                   participant_bootstrap_auc, persubject_rows)
+                                   fit_window_probe, participant_bootstrap_auc,
+                                   persubject_rows, window_rows)
 from tasks._experiment_common import (encode, load_context, out_dir, random_init_model,
                                       save, wants_plain_ssl, write_csv)
 from tasks.decomposition import harmonic_reference
@@ -59,12 +60,14 @@ def cstar(pts, kind, full):
 
 
 def fit_probe(feat, ctx, a):
-    """The canonical participant-level probe -- the same one the Separability table uses."""
-    return fit_persubject_probe(feat, ctx.pids, ctx.y, ctx.train_mask, ctx.val_mask,
-                                ctx.seed, c_grid=a.probe_c)
+    """The canonical probe. Same penalty selection either way; only the unit changes."""
+    f = (fit_window_probe if getattr(a, "unit", "participant") == "window"
+         else fit_persubject_probe)
+    return f(feat, ctx.pids, ctx.y, ctx.train_mask, ctx.val_mask, ctx.seed,
+             c_grid=a.probe_c)
 
 
-def score(clf, feat, ctx, mask=None):
+def score(clf, feat, ctx, mask=None, unit="participant"):
     """Participant-level AUROC on a held-out cohort. Rows are already participants.
 
     `mask` defaults to the test split; pass the validation split to get the predictions
@@ -76,7 +79,8 @@ def score(clf, feat, ctx, mask=None):
     being compared against.
     """
     m = ctx.test_mask if mask is None else mask
-    Xte, yte, _ = persubject_rows(feat, ctx.pids, ctx.y, m)
+    rows = window_rows if unit == "window" else persubject_rows
+    Xte, yte, _ = rows(feat, ctx.pids, ctx.y, m)
     prob = clf.predict_proba(Xte)[:, 1]
     return (float(roc_auc_score(yte, prob)) if len(set(yte)) > 1 else np.nan), prob, yte
 
@@ -123,6 +127,14 @@ def main():
     p.add_argument("--gpu", type=int, default=0)
     p.add_argument("--probe-c", type=float, nargs="+", default=[0.01, 0.1, 1.0, 10.0],
                    help="Grid for the logistic C; selected on the validation split, not pinned")
+    p.add_argument("--unit", choices=["participant", "window"], default="participant",
+                   help="What one prediction is. The default collapses a participant's "
+                        "windows into one [mean | std] row. 'window' is the GLOBEM "
+                        "benchmark's unit -- one prediction per labelled window, roughly "
+                        "ten per person -- and it is what makes a balanced accuracy "
+                        "comparable to their published 0.547. A LODO fold holds 136-217 "
+                        "participants but 1287-2025 labelled windows, so the two units are "
+                        "not one number measured twice; they are different tasks.")
     p.add_argument("--n-boot", type=int, default=2000)
     p.add_argument("--no-plain-ssl", action="store_true",
                    help="Drop the non-disentangled SSL rung. It is the ONLY baseline that "
@@ -222,8 +234,8 @@ def main():
     add("ladder", "Majority", 0.5)
     for name, feat in ladder.items():
         clf = fit_probe(feat, ctx, a)
-        auc, pp, pl = score(clf, feat, ctx)
-        _, vp, vl = score(clf, feat, ctx, ctx.val_mask)
+        auc, pp, pl = score(clf, feat, ctx, unit=a.unit)
+        _, vp, vl = score(clf, feat, ctx, ctx.val_mask, unit=a.unit)
         probs[name] = (pp, pl)
         add("ladder", name, auc, pp, pl, vp, vl)
 
