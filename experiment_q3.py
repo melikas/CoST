@@ -143,6 +143,12 @@ def main():
                    help="Drop the 'Cosinor (paper)' rung. Needs CosinorPy and fits every "
                         "(window, channel, period) on TRAIN+VAL+TEST -- ~3x the rows q1 fits, "
                         "since the probe is trained here, not only scored.")
+    p.add_argument("--no-finetune", action="store_true",
+                   help="Drop the two fine-tuning rungs. They are the only rungs that "
+                        "train a network starting FROM the SSL weights, which is the "
+                        "comparison the SSL literature makes and the one this project "
+                        "has never run: every other arm freezes the encoder and reads it "
+                        "with a linear probe.")
     p.add_argument("--no-supervised", action="store_true",
                    help="Drop the end-to-end supervised CEILING. It is the only rung that "
                         "trains a network on the labels (~1 short supervised fit per run).")
@@ -259,6 +265,28 @@ def main():
             add("ladder", sup_name, auc_s, np.asarray(pp_s), np.asarray(pl_s))
         except Exception as e:
             print(f"[rq3] {sup_name} rung SKIPPED: {type(e).__name__}: {e}")
+
+    # The comparison the SSL literature actually makes, and the one rung this project has
+    # never had: the SAME network, the SAME labels, the SAME epochs as the supervised row --
+    # only the starting weights differ. "Supervised (end-to-end)" is that net from RANDOM
+    # weights, so the pair isolates what pretraining buys, and nothing else. Every other arm
+    # here is a frozen encoder read by a linear probe, which is precisely the setting where
+    # 1760 random features behave like a kernel machine and beat a learned representation.
+    for tag, frozen in (("SSL -> fine-tuned", False), ("SSL -> frozen + head", True)):
+        if a.no_supervised or a.no_finetune:
+            break
+        try:
+            _row, pp_f, pl_f = supervised_baseline_row(
+                ctx.X, ctx.y, ctx.pids, ctx.train_mask, ctx.val_mask, ctx.test_mask,
+                ctx.cfg["backbone"], ctx.cfg["pe"], tag,
+                int(ctx.X.shape[-1]) - int(ctx.n_sensors), ctx.cfg["hidden_dims"],
+                ctx.cfg["depth"], ctx.cfg["repr_dims"], device=ctx.device, seed=ctx.seed,
+                batch_size=ctx.cfg["batch_size"], return_scores=True,
+                init_encoder=ctx.model.net, freeze_backbone=frozen)
+            probs[tag] = (np.asarray(pp_f), np.asarray(pl_f))
+            add("ladder", tag, float(_row["Subj AUC"]), np.asarray(pp_f), np.asarray(pl_f))
+        except Exception as e:
+            print(f"[rq3] {tag} rung SKIPPED: {type(e).__name__}: {e}")
 
     res["utility"] = {r[1]: {"auc": r[2], "ci": r[3:]} for r in rows}
     res["majority_rate"] = maj

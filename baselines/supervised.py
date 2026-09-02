@@ -97,10 +97,53 @@ class _SupervisedNet(nn.Module):
         return self.head(pooled).squeeze(-1)           # (B,) logits
 
 
+def init_from_encoder(net, encoder):
+    """Copy an SSL-pretrained CoSTEncoder's stem and backbone into a supervised net.
+
+    Every arm this project has measured is a FROZEN encoder read by a linear probe, and the
+    supervised rung trains the same backbone from RANDOM weights. The comparison the SSL
+    literature actually makes -- pretrain, then fine-tune end to end -- has never been run
+    here, and it is the setting where a learned representation is least at a disadvantage: a
+    linear probe on frozen features is exactly where 1760 random features behave like a kernel
+    machine and win.
+
+    CoSTEncoder and _SupervisedNet share `input_fc`, `time_fc` and the backbone module, so the
+    transfer is a parameter copy rather than a reimplementation. Only tensors whose shapes
+    match are copied, and the count is returned so a silent no-op cannot be mistaken for a
+    transfer -- a mismatched hidden_dims or depth would otherwise leave the net randomly
+    initialised while the run reported fine-tuning.
+    """
+    src = dict(encoder.named_parameters())
+    src.update(dict(encoder.named_buffers()))
+    tgts = [(n_, t) for n_, t in
+            list(net.named_parameters()) + list(net.named_buffers())
+            if not n_.startswith("head.")]      # the classifier has no counterpart upstream
+    n, missed = 0, []
+    with torch.no_grad():
+        for name, tgt in tgts:
+            key = name.replace("backbone.", "feature_extractor.", 1)   # named so upstream
+            if key in src and src[key].shape == tgt.shape:
+                tgt.copy_(src[key].to(tgt.device))
+                n += 1
+            else:
+                missed.append(name)
+    # EVERY tensor outside the head, not merely one. A partial transfer leaves most of the
+    # network randomly initialised while the run reports a fine-tune, and partial matches do
+    # happen by coincidence: with hidden_dims deliberately mismatched at 999 against 16, the
+    # last convolution still projects to output_dims in both nets and matched on its own.
+    if missed:
+        raise ValueError(
+            f"init_from_encoder transferred {n} of {len(tgts)} tensors; "
+            f"{len(missed)} did not match, first: {missed[:3]}. The encoder and the supervised "
+            f"net must share hidden_dims, depth, output_dims and backbone, or this trains from "
+            f"largely random weights while reporting a fine-tune")
+    return n
+
 def supervised_baseline_row(X, y, pids, train_mask, val_mask, test_mask, backbone, pe, name,
                             n_time_features, hidden_dims, depth, output_dims, device="cuda",
                             max_epochs=60, patience=12, lr=1e-3, batch_size=64, seed=42,
-                            return_scores=False, return_window_scores=False):
+                            return_scores=False, return_window_scores=False,
+                            init_encoder=None, freeze_backbone=False):
     """Train the supervised backbone end-to-end and return a separability-table row dict
     (same keys as `separability_table`). Best epoch chosen by participant-level validation
     AUC (early stopping); F1/Acc use a val-tuned threshold; AUC is threshold-free."""
@@ -109,13 +152,28 @@ def supervised_baseline_row(X, y, pids, train_mask, val_mask, test_mask, backbon
     Xt = torch.from_numpy(X); yt = torch.from_numpy(y.astype(np.float32))
     net = _SupervisedNet(X.shape[-1], n_time_features, backbone, pe,
                          hidden_dims, depth, output_dims).to(device)
+    if init_encoder is not None:
+        n_init = init_from_encoder(net, init_encoder)
+        if freeze_backbone:
+            # Linear probing through the same training loop: only the head learns. Useful as
+            # the middle rung between a frozen readout and a full fine-tune, and it isolates
+            # whether any gain comes from the pretrained features or from the extra epochs.
+            for p_ in list(net.input_fc.parameters()) + list(net.backbone.parameters()):
+                p_.requires_grad_(False)
+            if net.time_fc is not None:
+                for p_ in net.time_fc.parameters():
+                    p_.requires_grad_(False)
+        print(f"[supervised] {name}: initialised {n_init} tensors from the SSL encoder"
+              + (", backbone frozen" if freeze_backbone else ", fine-tuning end to end"))
     # Measured AFTER the net is resident, so the budget reflects what is actually left.
     _budget = _attn_budget(device)
 
     ytr = y[train_mask]
     n_pos = max(1, int((ytr == 1).sum())); n_neg = max(1, int((ytr == 0).sum()))
     crit = nn.BCEWithLogitsLoss(pos_weight=torch.tensor([n_neg / n_pos], device=device))
-    opt = torch.optim.Adam(net.parameters(), lr=lr)
+    # Only trainable tensors: Adam keeps state for every parameter it is handed, and a frozen
+    # one would still receive weight decay and momentum updates in optimisers that have them.
+    opt = torch.optim.Adam([p_ for p_ in net.parameters() if p_.requires_grad], lr=lr)
     tr_idx = np.where(train_mask)[0]
     loader = DataLoader(TensorDataset(Xt[tr_idx], yt[tr_idx]),
                         batch_size=batch_size, shuffle=True, drop_last=False)
