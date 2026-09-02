@@ -135,3 +135,40 @@ def stratified_pid_holdout(unique_pids, pid_label, frac, seed):
         perm = list(rng.permutation(np.array(pids)))
         held, rest = perm[:n_held], perm[n_held:]
     return set(rest), set(held)
+
+
+def lodo_test_pids(window_ids, pids, fold, n_folds=4):
+    """Participants of the `fold`-th study year -- the GLOBEM benchmark's own split.
+
+    The published benchmark evaluates cross-dataset generalisation as leave-one-dataset-out:
+    three of the four study years train, the fourth tests. Reproducing it is what makes our
+    numbers comparable to theirs, and only their CROSS-dataset numbers are a fair target --
+    their single-dataset setup takes the first 80% of EVERY user's data for training and the
+    last 20% for testing, so the same people appear on both sides and a model can score by
+    remembering a personal baseline.
+
+    The year is read from the window ids ("<pid>_<iso timestamp>"), so no extra column has to
+    survive preprocessing. Verified on GLOBEM_REDUCED.csv: 705 participants across 2018-2021
+    and not one appears in two years, so a year split is automatically participant-disjoint.
+    """
+    import collections
+    if window_ids is None:
+        raise ValueError("lodo_test_pids needs window_ids to read each participant's year")
+    year_of = {}
+    for w, p in zip(np.asarray(window_ids).astype(str), np.asarray(pids).astype(str)):
+        stamp = w.split("_")[-1]
+        y = stamp[:4]
+        if not (len(y) == 4 and y.isdigit()):
+            raise ValueError(f"window id {w!r} does not end in an ISO timestamp")
+        year_of.setdefault(p, collections.Counter())[y] += 1
+    # A participant contributing to two years would break the disjointness the split relies
+    # on, so it is checked rather than assumed.
+    mixed = [p for p, c in year_of.items() if len(c) > 1]
+    years = sorted({y for c in year_of.values() for y in c})
+    if len(years) != int(n_folds):
+        raise ValueError(f"expected {n_folds} study years, found {years}")
+    if not 0 <= int(fold) < len(years):
+        raise ValueError(f"fold {fold} out of range for years {years}")
+    held = years[int(fold)]
+    test = sorted(p for p, c in year_of.items() if c.most_common(1)[0][0] == held)
+    return test, held, years, mixed

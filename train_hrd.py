@@ -523,6 +523,20 @@ def parse_args():
                         "two measured defects: the positive pair was a near-identity transform "
                         "(top-1 1.000 at init vs chance 1/(K+1)) and both branches contrasted "
                         "the same pair (Full minus plain = +0.0007, p=0.979).")
+    p.add_argument("--globem-split", choices=["random", "lodo"], default="random",
+                   help="How GLOBEM holds out participants. 'random' (default) is this "
+                        "project's own class-balanced holdout. 'lodo' is the published "
+                        "benchmark's leave-one-dataset-out protocol: three of the four study "
+                        "years train and the fourth tests, which is what makes our numbers "
+                        "comparable to theirs. Only their CROSS-dataset results are a fair "
+                        "target -- their single-dataset setup trains on the first 80%% of "
+                        "EVERY user's data and tests on the last 20%%, so the same people are "
+                        "on both sides and a personal baseline scores. Their reported "
+                        "cross-dataset best is 0.547 balanced accuracy (Reorder, "
+                        "leave-one-dataset-out) and 0.536 for the best depression-specific "
+                        "algorithm (Chikersal et al.), against a 0.500 majority baseline.")
+    p.add_argument("--lodo-fold", type=int, default=0, metavar="K",
+                   help="Which study year is held out under --globem-split lodo (0-3).")
     p.add_argument("--drop-channels", nargs="*", default=None, metavar="NAME",
                    help="Sensor channels to remove after the windows are built. Measured on "
                         "HRD over 24 seeds, through an identical random projection and probe: "
@@ -794,9 +808,26 @@ def main():
     # 2. leakage-safe split ----------------------------------------------
     # Class-balanced test set: exactly args.test_per_class depressed + the same number
     # non-depressed, held out from BOTH pretrain and fine-tune (pretrain = all non-test).
-    rest_cons, test_pids = balanced_pid_holdout(
-        cohort_pids, pid_label, args.test_per_class, split_seed
-    )
+    if args.dataset == "globem" and args.globem_split == "lodo":
+        # The published benchmark's own protocol: three study years train, the fourth
+        # tests. Only their CROSS-dataset numbers are a fair target -- their
+        # single-dataset setup puts the first 80% of every user's data in training and
+        # the last 20% in test, so the same people are on both sides.
+        from utils import lodo_test_pids
+        test_pids, held, years, mixed = lodo_test_pids(
+            data.get("window_ids"), pids, args.lodo_fold)
+        if mixed:
+            raise RuntimeError(f"{len(mixed)} participants span more than one study "
+                               f"year, so a year split is not participant-disjoint")
+        test_pids = [p for p in test_pids if p in pid_label]
+        rest_cons = [p for p in cohort_pids if p not in set(test_pids)]
+        print(f"[split] LODO fold {args.lodo_fold}: holding out {held} "
+               f"({len(test_pids)} labelled participants), training on "
+               f"{[y for y in years if y != held]}")
+    else:
+        rest_cons, test_pids = balanced_pid_holdout(
+            cohort_pids, pid_label, args.test_per_class, split_seed
+        )
     if not test_pids:
         raise RuntimeError(f"Test holdout is empty; check --test-per-class and the '{args.cohort}' cohort.")
     # Windows carrying no label at all (y < 0) exist only in GLOBEM's weekly mode, where a

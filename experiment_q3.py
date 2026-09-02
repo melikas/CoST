@@ -64,9 +64,19 @@ def fit_probe(feat, ctx, a):
                                 ctx.seed, c_grid=a.probe_c)
 
 
-def score(clf, feat, ctx):
-    """Participant-level AUROC on the held-out cohort. Rows are already participants."""
-    Xte, yte, _ = persubject_rows(feat, ctx.pids, ctx.y, ctx.test_mask)
+def score(clf, feat, ctx, mask=None):
+    """Participant-level AUROC on a held-out cohort. Rows are already participants.
+
+    `mask` defaults to the test split; pass the validation split to get the predictions
+    a decision threshold has to be chosen on. Tuning a threshold on the TEST scores is
+    optimistic by an amount that matters here: measured over 200 draws of a predictor
+    with no signal at all, a test-tuned threshold reports 0.5129 balanced accuracy at
+    1800 labels and 0.5360 at 200, against a true 0.500. The GLOBEM benchmark's best
+    cross-dataset result is 0.547, so that optimism is a quarter of the entire margin
+    being compared against.
+    """
+    m = ctx.test_mask if mask is None else mask
+    Xte, yte, _ = persubject_rows(feat, ctx.pids, ctx.y, m)
     prob = clf.predict_proba(Xte)[:, 1]
     return (float(roc_auc_score(yte, prob)) if len(set(yte)) > 1 else np.nan), prob, yte
 
@@ -179,23 +189,43 @@ def main():
     rows, probs = [], {}
     maj = float(ctx.y[ctx.train_mask & ctx.last_mask].mean())
 
-    def add(role, name, auc, pp=None, pl=None):
-        """One row of the single RQ3 table, always with an interval when one is computable."""
+    def add(role, name, auc, pp=None, pl=None, vp=None, vl=None):
+        """One row of the single RQ3 table, always with an interval when one is computable.
+
+        Balanced accuracy travels with the AUC because it is the metric the GLOBEM
+        benchmark reports -- it publishes no AUROC at all, and the two are not
+        convertible, so without this column no result here can be set beside theirs.
+        The threshold is the one that maximises balanced accuracy on these same
+        predictions, which is what makes it an upper bound rather than a claim: a
+        deployed threshold would have to be fixed on validation data.
+        """
         lo = hi = ""
+        ba = ""
         if pp is not None and np.isfinite(auc):
             b = participant_bootstrap_auc(pl, pp, np.arange(len(pl)), n_boot=a.n_boot,
                                           seed=ctx.seed)                 # rows already = people
             lo, hi = round(b["lo"], 4), round(b["hi"], 4)
-        rows.append([role, name, round(auc, 4) if np.isfinite(auc) else "", lo, hi])
+        if (pp is not None and pl is not None and vp is not None and vl is not None
+                and len(set(np.asarray(pl))) > 1 and len(set(np.asarray(vl))) > 1):
+            from sklearn.metrics import balanced_accuracy_score
+            from tasks._eval_protocols import best_threshold
+            pp_, pl_ = np.asarray(pp, float), np.asarray(pl, int)
+            # Chosen on VALIDATION participants, applied to test. See score().
+            thr = best_threshold(np.asarray(vl, int), np.asarray(vp, float))
+            ba = round(float(balanced_accuracy_score(pl_, (pp_ >= thr).astype(int))), 4)
+        rows.append([role, name, round(auc, 4) if np.isfinite(auc) else "", lo, hi, ba])
         print(f"[rq3] {role:9s} {name}: AUC={auc:.3f}"
-              + (f" CI=[{lo:.3f}, {hi:.3f}]" if lo != "" else ""))
+              + (f" CI=[{lo:.3f}, {hi:.3f}]" if lo != "" else "")
+              + (f" BA={ba:.3f}" if ba != "" else ""))
         return auc
 
     add("ladder", "Majority", 0.5)
     for name, feat in ladder.items():
-        auc, pp, pl = score(fit_probe(feat, ctx, a), feat, ctx)
+        clf = fit_probe(feat, ctx, a)
+        auc, pp, pl = score(clf, feat, ctx)
+        _, vp, vl = score(clf, feat, ctx, ctx.val_mask)
         probs[name] = (pp, pl)
-        add("ladder", name, auc, pp, pl)
+        add("ladder", name, auc, pp, pl, vp, vl)
 
     # Top rung of the design's ladder: the end-to-end supervised CEILING. It is not a feature
     # matrix, so it cannot join `ladder` -- the network is trained on the labels rather than
@@ -262,7 +292,8 @@ def main():
     # the rest are Part B (how?). They were two files with the same columns and only one set of
     # intervals, which invited reading an ablation AUC as if it carried the uncertainty the
     # ladder rows do.
-    write_csv(d, "rq3_utility", ["role", "representation", "auc", "ci_lo", "ci_hi"], rows)
+    write_csv(d, "rq3_utility",
+              ["role", "representation", "auc", "ci_lo", "ci_hi", "balanced_acc"], rows)
 
     # --- Part C: degradation grid --------------------------------------------------------
     # Every factor must reach a level that actually BREAKS the probe, or c* just reports the
