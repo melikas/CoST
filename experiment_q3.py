@@ -64,7 +64,7 @@ def fit_probe(feat, ctx, a):
     f = (fit_window_probe if getattr(a, "unit", "participant") == "window"
          else fit_persubject_probe)
     return f(feat, ctx.pids, ctx.y, ctx.train_mask, ctx.val_mask, ctx.seed,
-             c_grid=a.probe_c)
+             c_grid=a.probe_c, families=tuple(a.probe_family))
 
 
 def score(clf, feat, ctx, mask=None, unit="participant"):
@@ -127,6 +127,15 @@ def main():
     p.add_argument("--gpu", type=int, default=0)
     p.add_argument("--probe-c", type=float, nargs="+", default=[0.01, 0.1, 1.0, 10.0],
                    help="Grid for the logistic C; selected on the validation split, not pinned")
+    p.add_argument("--probe-family", nargs="+", default=["supervised"],
+                   choices=["supervised", "forest"],
+                   help="Probe families to choose between on the validation split, "
+                        "applied identically to every arm. Default is the logistic "
+                        "probe alone, which reproduces every existing result. Adding "
+                        "'forest' was measured to matter: on the GLOBEM benchmark's "
+                        "own protocol the raw window scores 0.5279 through a logistic "
+                        "probe and 0.5507 through a forest, against a published best "
+                        "of 0.547 and a majority of 0.500.")
     p.add_argument("--unit", choices=["participant", "window"], default="participant",
                    help="What one prediction is. The default collapses a participant's "
                         "windows into one [mean | std] row. 'window' is the GLOBEM "
