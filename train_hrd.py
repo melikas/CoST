@@ -469,13 +469,22 @@ def parse_args():
                         "before the linear probe: 'mean' (default) / 'max' summarise the WHOLE "
                         "window; 'last' = final timestep only (original CoST forecasting "
                         "readout); 'meanmax' = mean+max concatenated.")
-    p.add_argument("--season-pool", choices=["spec", "spec_amp", "spec_phase", "same"],
+    p.add_argument("--season-pool",
+                   choices=["spec", "spec_band", "spec_amp", "spec_phase", "same"],
                    default="spec",
                    help="Readout of the SEASONAL half only. Default 'spec' reads amplitude "
                         "AND phase at the chronobiological harmonics (circaseptan, circadian, "
                         "12/8/6h). 'same' = use --pool for it too, which is the ABLATION: the "
                         "seasonal branch is an irFFT, so time-averaging it returns exactly the "
-                        "f=0 (DC/MESOR) coefficient and every rhythm integrates to zero.")
+                        "f=0 (DC/MESOR) coefficient and every rhythm integrates to zero. "
+                        "'spec_band' keeps every bin down to a two-hour period instead of "
+                        "five lines: measured on HRD over 24 seeds by applying each "
+                        "restriction to the RAW signal, the five-harmonic truncation costs "
+                        "0.0502 AUC against the full window while bins 1..T/8 cost 0.0005. "
+                        "Keeping the whole spectrum is worse than both (-0.0712), so there "
+                        "is an optimum rather than a monotone gain. Pair it with "
+                        "--seasonal-bands single: the harmonic layout stops at bin 31 and "
+                        "the readout would be asking for bins the layer never writes.")
     p.add_argument("--kernels", type=int, nargs="+", default=None,
                    help="AR-expert kernel sizes (default: CoST powers-of-2 from window length)")
     p.add_argument("--alpha", type=float, default=0.0005,

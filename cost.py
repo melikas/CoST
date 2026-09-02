@@ -1098,15 +1098,63 @@ class CoST:
         chronobiological harmonics only: 1 cycle per window (circaseptan), 1 cycle per day
         (circadian) and its 2nd-4th harmonics (12/8/6 h at a 7-day window). That keeps the
         readout compact -- |f|*d rather than the full (T/2+1)*d spectrum -- and interpretable.
+
+        'spec_band' keeps every bin down to a two-hour period instead of five lines. Reading
+        five harmonics is compact but it is not free, and the cost was measured on HRD over 24
+        seeds by applying each restriction to the RAW signal and probing through an identical
+        random projection:
+
+            the full window                     0.7123
+            amp+phase, bins 1..T/8              0.7118   -0.0005, 13/24
+            amp+phase, bins 1..4D               0.6838   -0.0285,  9/24
+            amp+phase at five harmonics         0.6622   -0.0502,  6/24
+            amp+phase, every bin                0.6411   -0.0712,  4/24
+
+        So the five-line truncation throws away 0.05 of achievable AUC, and everything down to
+        a two-hour period recovers it. Keeping the WHOLE spectrum is worse than both: bins
+        above that only add dimensions the penalised probe has to pay for, so there is an
+        optimum rather than a monotone gain.
+
+        'spec_band' needs a Fourier layer that actually produces those bins. The harmonic band
+        layout stops at 4D (bin 31 at a 7-day window), well short of T/8 = 84, so pair it with
+        --seasonal-bands single or the readout will be asking for frequencies the layer never
+        writes.
         """
         T, eps = z.size(1), 1e-6
         D = max(1, T // int(self.bins_per_day))          # days spanned by the window
-        f = [i for i in (1, D, 2 * D, 3 * D, 4 * D) if 0 < i <= T // 2]
+        if mode == "spec_band":
+            f = list(range(1, max(2, T // 8)))
+        else:
+            f = [i for i in (1, D, 2 * D, 3 * D, 4 * D) if 0 < i <= T // 2]
         Z = fft.rfft(F.normalize(z.float(), dim=-1), dim=1)[:, f]        # (b, |f|, d) complex
         amp = torch.sqrt((Z.real + eps).pow(2) + (Z.imag + eps).pow(2))
         pha = torch.atan2(Z.imag, Z.real + eps)
-        parts = {"spec_amp": (amp,), "spec_phase": (pha,), "spec": (amp, pha)}[mode]
-        return torch.cat([p.reshape(p.size(0), -1) for p in parts], dim=-1)
+        parts = {"spec_amp": (amp,), "spec_phase": (pha,),
+                 "spec": (amp, pha), "spec_band": (amp, pha)}[mode]
+        out = torch.cat([p.reshape(p.size(0), -1) for p in parts], dim=-1)
+        if mode != "spec_band":
+            return out
+        # Compressed to exactly the width 'spec' produces. The band has 83 bins at a 7-day
+        # window against five, so on a 160-dim latent it would hand the probe 26,560 columns --
+        # 53,440 after the per-participant mean and sd, for 78 training participants. The
+        # ceiling that motivated this mode was measured on a random projection to 1760 dims,
+        # so it is a claim about information, not about that width being usable.
+        #
+        # The matrix is fixed and seeded from nothing but the shape, so the trained encoder,
+        # its random-init control and every ablation share one readout. A per-model matrix
+        # would make the readout part of what is being compared.
+        want = len(parts) * len([i for i in (1, D, 2 * D, 3 * D, 4 * D) if 0 < i <= T // 2]) \
+            * z.size(-1)
+        key = (out.size(-1), want)
+        if getattr(self, "_band_proj_key", None) != key:
+            g = torch.Generator().manual_seed(20260901)
+            # 1/sqrt(OUT), not 1/sqrt(in): E||Wx||^2 = out * var * ||x||^2, so only the output
+            # width makes the embedding norm-preserving. Scaling by the input width shrinks
+            # every distance by sqrt(out/in) -- 0.247 here -- which a penalised probe would
+            # then have to undo through its C grid.
+            self._band_proj = torch.randn(out.size(-1), want, generator=g) / math.sqrt(want)
+            self._band_proj_key = key
+        return out @ self._band_proj.to(out.device, out.dtype)
 
     def _eval_with_pooling(self, x, mask=None, slicing=None, encoding_window=None, pool="mean",
                            season_pool=None):
