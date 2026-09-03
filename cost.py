@@ -688,6 +688,7 @@ class CoST:
                  jitter_sigma: float = 0.1,
                  shift_sigma: float = 0.5,
                  smooth_bins: int = 0,
+                 phase_readout: str = "angle",
                  moco_k: int = 4096,
                  trend_pool: str = "random",
                  positive_pair: str = "window",
@@ -729,6 +730,11 @@ class CoST:
         # Widest sub-hour box filter the smoothing augmentation may draw; 0 disables it. See
         # PretrainDataset.smooth for the ceiling each augmentation family imposes.
         self.smooth_bins = int(smooth_bins)
+        # How the seasonal readout emits phase. "angle" is the raw atan2 output and is
+        # kept only so archived configs -- which have no such key and fall back to it --
+        # rebuild the model they actually ran. New runs default to "circular".
+        assert phase_readout in ("angle", "circular"), phase_readout
+        self.phase_readout = phase_readout
         self.moco_k = moco_k
         self.trend_pool = trend_pool
         self.mask_mode = mask_mode
@@ -1128,9 +1134,23 @@ class CoST:
             f = [i for i in (1, D, 2 * D, 3 * D, 4 * D) if 0 < i <= T // 2]
         Z = fft.rfft(F.normalize(z.float(), dim=-1), dim=1)[:, f]        # (b, |f|, d) complex
         amp = torch.sqrt((Z.real + eps).pow(2) + (Z.imag + eps).pow(2))
-        pha = torch.atan2(Z.imag, Z.real + eps)
-        parts = {"spec_amp": (amp,), "spec_phase": (pha,),
-                 "spec": (amp, pha), "spec_band": (amp, pha)}[mode]
+        ang = torch.atan2(Z.imag, Z.real + eps)
+        # Phase is an angle on a circle, and every consumer downstream treats readout
+        # columns as ordinary numbers: persubject_rows takes a participant arithmetic
+        # mean and standard deviation over their windows, RQ2 takes a Euclidean
+        # distance, the probes fit a linear model. On raw angles all four are wrong
+        # across the branch cut -- 23.5 h and 0.5 h are one hour apart and average to
+        # 12.0, the opposite time of day -- and a depression-related phase delay is
+        # exactly the thing that pushes estimates over midnight.
+        #
+        # Emitting (cos, sin) makes all of them correct by construction: the pair
+        # lives in R^2, its arithmetic mean is the resultant vector whose direction is
+        # the circular mean, and the Euclidean distance between two pairs is a
+        # monotone function of the angle between them.
+        pha = ((torch.cos(ang), torch.sin(ang)) if self.phase_readout == "circular"
+               else (ang,))
+        parts = {"spec_amp": (amp,), "spec_phase": pha,
+                 "spec": (amp,) + pha, "spec_band": (amp,) + pha}[mode]
         out = torch.cat([p.reshape(p.size(0), -1) for p in parts], dim=-1)
         if mode != "spec_band":
             return out
@@ -1143,8 +1163,11 @@ class CoST:
         # The matrix is fixed and seeded from nothing but the shape, so the trained encoder,
         # its random-init control and every ablation share one readout. A per-model matrix
         # would make the readout part of what is being compared.
-        want = len(parts) * len([i for i in (1, D, 2 * D, 3 * D, 4 * D) if 0 < i <= T // 2]) \
-            * z.size(-1)
+        # `len(parts)` rather than a literal 2, so the target width follows the phase layout:
+        # 'circular' emits (amp, cos, sin) where 'angle' emits (amp, phase).
+        want = (len(parts)
+                * len([i for i in (1, D, 2 * D, 3 * D, 4 * D) if 0 < i <= T // 2])
+                * z.size(-1))
         key = (out.size(-1), want)
         if getattr(self, "_band_proj_key", None) != key:
             g = torch.Generator().manual_seed(20260901)

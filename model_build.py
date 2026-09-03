@@ -62,6 +62,10 @@ def build_model(cfg, X, n_sensors, device, **override):
         # 0 = no smoothing augmentation, matching cost.py's own default, so every config
         # written before this key existed rebuilds exactly the model it was.
         smooth_bins=cfg.get("smooth_bins", 0),
+        # "angle" is the fallback ON PURPOSE: a config written before this key existed
+        # ran the raw-atan2 readout, and rebuilding it any other way would reproduce a
+        # different model than the one whose numbers are archived beside it.
+        phase_readout=cfg.get("phase_readout", "angle"),
         mask_mode=cfg["mask_mode"], mask_prob=cfg["mask_keep_prob"],
         phase_mode=cfg["phase_encoding"], device=device, lr=cfg["lr"],
         batch_size=cfg["batch_size"])

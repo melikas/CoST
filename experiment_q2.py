@@ -283,12 +283,19 @@ def main():
     rand = random_init_model(ctx)
     dT = ctx.model.net.component_dims          # cost.py concatenates [trend | seasonal]
 
+    # The seasonal block is [amp | phase] under phase_readout='angle' and [amp | cos | sin]
+    # under 'circular', so the split is into halves or thirds depending on the run. Hard-coding
+    # //2 sliced through the middle of a three-part block on any circular run, handing "amp"
+    # part of the cosines and calling the rest "phase".
+    n_blocks = 3 if getattr(ctx.model, "phase_readout", "angle") == "circular" else 2
+
     def cost_part(which):
         def f(A):
             V = encode(ctx.model, A, ctx.cfg)
             S = V[:, dT:]
-            h = S.shape[1] // 2
-            return {"trend": V[:, :dT], "season": S, "amp": S[:, :h], "phase": S[:, h:]}[which]
+            b = S.shape[1] // n_blocks
+            return {"trend": V[:, :dT], "season": S,
+                    "amp": S[:, :b], "phase": S[:, b:]}[which]
         return f
 
     def cosinor_rep(A):

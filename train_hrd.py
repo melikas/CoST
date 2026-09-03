@@ -576,6 +576,20 @@ def parse_args():
                         "is the point: 'window' shares the whole spectrum equally, so "
                         "any feature solves it and the objective never says which to "
                         "learn.")
+    p.add_argument("--phase-readout", choices=["circular", "angle"], default="circular",
+                   help="How the seasonal readout emits phase. Phase is an angle on the "
+                        "24 h circle, and every consumer treats readout columns as ordinary "
+                        "numbers: the per-participant mean and sd, RQ2's Euclidean deviation "
+                        "score, the linear probes. On raw angles all of them fail across the "
+                        "branch cut -- 23.5 h and 0.5 h are one hour apart and average to "
+                        "12.0, the opposite time of day -- which is precisely where a "
+                        "hypothesised phase delay would put the estimates. 'circular' emits "
+                        "(cos, sin) instead, making all of them correct by construction. "
+                        "'angle' is the old raw-atan2 behaviour, kept because configs "
+                        "written before this flag existed fall back to it and so rebuild the "
+                        "model they actually ran. Measured on HRD over 24 seeds the two "
+                        "encodings differ by -0.0093 AUC at p=0.90: this is a correctness "
+                        "fix, not a performance one.")
     p.add_argument("--seasonal-bands", choices=["harmonics", "single"], default="harmonics",
                    help="Layout of the seasonal (SFD) Fourier layer. 'harmonics' gives each "
                         "circadian harmonic its own band; 'single' is the one full-spectrum "
@@ -884,6 +898,7 @@ def main():
         n_negatives=args.n_negatives,
         positive_pair=args.positive_pair,
         smooth_bins=args.smooth_bins,
+        phase_readout=args.phase_readout,
         decomp_aug=args.decomp_aug,
         n_sensors=data["n_sensors"],
         mask_mode=args.mask_mode,
