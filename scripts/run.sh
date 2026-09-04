@@ -180,6 +180,13 @@ if [ -z "${SLURM_JOB_ID:-}" ]; then
 fi
 
 echo "=== CoST/HRD | job $SLURM_JOB_ID | array ${SLURM_ARRAY_JOB_ID:-n/a}/${SLURM_ARRAY_TASK_ID:-n/a} | $(hostname) | $(date) ==="
+# The configuration, at the START. It was echoed only on the last line of the task,
+# so checking what a running array had actually been given meant waiting out the
+# 2.5 h it takes to finish -- by which point cancelling a misconfigured 96-task sweep
+# is no longer cheap. A run that cannot be audited while there is still time to stop
+# it is only nominally recorded.
+echo "[run] ABLATE='${ABLATE:-}'"
+echo "[run] KEEP_ENC_ALL=${KEEP_ENC_ALL:-0}  DATASET=${DATASET:-hrd}  OUTPUT_DIR=${OUTPUT_DIR:-results_hrd}"
 
 # ============================================================================
 # OUT-OF-RANGE EXIT -- deliberately the FIRST thing after the banner.
