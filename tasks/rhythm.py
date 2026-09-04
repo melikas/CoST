@@ -1535,7 +1535,7 @@ def _circ_corr(a, b):
     return float(np.sum(sa * sb) / den) if den > 0 else float("nan")
 
 
-def _oof_ridge_selected(F, Y, groups, cv, alphas, seed):
+def _oof_ridge_selected(F, Y, groups, cv, alphas, seed, pre=None):
     """Out-of-fold ridge predictions with the penalty selected INSIDE each fold.
 
     E1.3 used to pin ``Ridge(alpha=10.0)`` while E1.2 swept the CoST grid and chose lambda* on
@@ -1575,6 +1575,18 @@ def _oof_ridge_selected(F, Y, groups, cv, alphas, seed):
     # random quarter, so this probe is reproducible across seeds by construction.
     for tr, te in cv.split(F, Y[:, 0], groups):
         gtr = groups[tr]
+        if pre is None:
+            F_tr, F_te = F[tr], F[te]
+        else:
+            # Fitted on the fold's TRAINING participants only. The raw-PCA reference used to be
+            # projected once over every window, so its components were estimated with the
+            # held-out participants in view. It is unsupervised, so no label leaks -- but it is
+            # still transduction, and it favours the very baseline `gain_over_raw` is measured
+            # against. Measured on HRD: recovering the circadian amplitude and acrophase from a
+            # 64-component PCA gives R2 0.7159 when the PCA sees every window and 0.6867 when
+            # it is refitted per fold, so the reported gain over raw was understated by ~0.03.
+            t = pre()
+            F_tr, F_te = t.fit_transform(F[tr]), t.transform(F[te])
         n_inner = int(min(4, len(np.unique(gtr))))
         if len(alphas) > 1 and n_inner >= 2:
             # lambda* is chosen on an inner GroupKFold and the criterion is SUMMED over its
@@ -1596,22 +1608,22 @@ def _oof_ridge_selected(F, Y, groups, cv, alphas, seed):
             # is applied identically to the encoder, the raw-PCA reference and the random-init
             # control, so no rung gains an advantage from the change.
             err = np.zeros(len(alphas))
-            for f_i, s_i in GroupKFold(n_splits=n_inner).split(F[tr], Y[tr][:, 0], gtr):
-                inner = _ridge_fit(F[tr][f_i], Y[tr][f_i])
+            for f_i, s_i in GroupKFold(n_splits=n_inner).split(F_tr, Y[tr][:, 0], gtr):
+                inner = _ridge_fit(F_tr[f_i], Y[tr][f_i])
                 for j, a in enumerate(alphas):
-                    r = inner(a, F[tr][s_i]) - Y[tr][s_i]
+                    r = inner(a, F_tr[s_i]) - Y[tr][s_i]
                     err[j] += float(np.sqrt((r ** 2).mean()) + np.abs(r).mean())
             a_star = float(alphas[int(np.argmin(err))])
         elif len(alphas) > 1:
             # Fewer than two participants to split on: no honest selection is possible.
             degenerate = True
-            inner = _ridge_fit(F[tr], Y[tr])
+            inner = _ridge_fit(F_tr, Y[tr])
             err = [float(np.sqrt((r ** 2).mean()) + np.abs(r).mean())
-                   for r in (inner(a, F[tr]) - Y[tr] for a in alphas)]
+                   for r in (inner(a, F_tr) - Y[tr] for a in alphas)]
             a_star = float(alphas[int(np.argmin(err))])
         else:
             a_star = float(alphas[0])
-        pred[te] = _ridge_fit(F[tr], Y[tr])(a_star, F[te])       # refit on the FULL train fold
+        pred[te] = _ridge_fit(F_tr, Y[tr])(a_star, F_te)         # refit on the FULL train fold
         chosen.append(a_star)
     if degenerate:
         print("[rhythm] WARNING: too few participants to hold a selection set out inside a "
@@ -1665,24 +1677,37 @@ def rhythm_axis_probe(emb, Xs, mask, pids, bin_minutes, variant_dir, seed, cf,
         for E1.2; extend the grid on that side before reading the number."""
         return bool(len(alphas) > 1 and set(lam) & {float(alphas[0]), float(alphas[-1])})
 
-    def oof(F, target, ok):
+    def oof(F, target, ok, pre=None):
         """Nested-CV prediction over the FINITE rows only.
 
         Restricting to `ok` is not cosmetic: a marker is NaN for a window whose cosinor fit did
         not converge, and the previous version masked only when SCORING while still handing
         those NaNs to the fit. The fold count follows the participants that survive the mask.
+
+        `pre` is a transformer FACTORY, refitted inside each fold on that fold's training
+        participants. The raw-PCA reference uses it so its components never see the held-out
+        participants; the latent spaces pass None because they are already fixed.
         """
         g = pm[ok]
         cv = GroupKFold(n_splits=int(min(n_splits, len(np.unique(g)))))
-        return _oof_ridge_selected(F[ok], target[ok], g, cv, alphas, seed)
+        return _oof_ridge_selected(F[ok], target[ok], g, cv, alphas, seed, pre=pre)
 
     # The reference level. "R2 > 0" on its own says nothing here: these markers are computed
     # FROM the raw window, so the raw window predicts them trivially. What licenses a claim
     # about the ENCODER is the gain over the same probe run on a PCA of the raw window at the
     # latent's own width -- reported as `gain_over_raw` on every latent row.
     flat = Xm.reshape(len(Xm), -1)
-    spaces = {"": emb, " | raw PCA": PCA(n_components=min(emb.shape[1], *flat.shape),
-                                         random_state=seed).fit_transform(flat)}
+    # The raw reference carries its PCA as a factory rather than a pre-projected matrix, so the
+    # components are estimated inside each fold on that fold's training participants. Fitting
+    # once over every window leaks no LABEL -- PCA is unsupervised -- but it lets the held-out
+    # participants shape the basis, and it does so for the one arm the encoder is measured
+    # against. `n_components` still follows the latent's own width, so the comparison stays
+    # width-matched, and it is capped by the fold's row count because a fold has fewer rows
+    # than the full set.
+    n_pca = int(min(emb.shape[1], *flat.shape))
+    spaces = {"": (emb, None),
+              " | raw PCA": (flat, lambda: PCA(n_components=min(n_pca, flat.shape[1]),
+                                               random_state=seed))}
 
     out = {}
     targets = [(f"{m} [{nm}]", kind, v[:, c])
@@ -1701,10 +1726,10 @@ def rhythm_axis_probe(emb, Xs, mask, pids, bin_minutes, variant_dir, seed, cf,
             continue                                           # constant angle
         common = {"n_windows": int(ok.sum()), "channel": name[name.index("[") + 1:-1],
                   "n_participants": int(len(np.unique(pm[ok])))}
-        for tag, F in spaces.items():
+        for tag, (F, pre) in spaces.items():
             key = name + tag
             if kind == "linear":
-                pred, lam = oof(F, t[:, None], ok)
+                pred, lam = oof(F, t[:, None], ok, pre=pre)
                 pred = pred[:, 0]
                 # R2 is reported alongside Pearson r on purpose. Out-of-fold R2 goes NEGATIVE
                 # whenever the fit is worse than the global mean, which is easy to hit with
@@ -1718,7 +1743,7 @@ def rhythm_axis_probe(emb, Xs, mask, pids, bin_minutes, variant_dir, seed, cf,
             else:
                 # sin and cos are two outputs of ONE circular model, so they share a single
                 # lambda* on the joint criterion instead of drifting to two unrelated penalties.
-                P, lam = oof(F, np.c_[np.sin(t), np.cos(t)], ok)
+                P, lam = oof(F, np.c_[np.sin(t), np.cos(t)], ok, pre=pre)
                 pred = np.arctan2(P[:, 0], P[:, 1])
                 err = np.angle(np.exp(1j * (pred - t[ok])))    # wrapped to (-pi, pi]
                 out[key] = {"metric": "circular r", "value": _circ_corr(t[ok], pred),
