@@ -201,7 +201,7 @@ class CoSTEncoder(nn.Module):
                  mask_mode='none', backbone='tcn', pe='sinusoidal',
                  n_time_features=0, time2vec_dim=65, disentangle=True,
                  bins_per_day=96, mask_prob=0.5, seasonal_bands='harmonics',
-                 noise_branch=False, noise_depth=None):
+                 noise_branch=False, noise_depth=None, trend_causal=True):
         super().__init__()
 
         component_dims = output_dims // 2
@@ -324,6 +324,23 @@ class CoSTEncoder(nn.Module):
         # Trend (TFD) and Seasonal (SFD) disentangling heads exist ONLY when
         # disentangling. In plain mode the backbone output is the representation.
         if self.disentangle:
+            # `trend_causal` selects WHERE the padded convolution is read, not what it
+            # computes: the weights and the padding are identical either way.
+            #
+            #   True  (default, upstream CoST) -- keep the leading T outputs, so step t sees
+            #         only t' <= t. Inherited from CoST, which is a FORECASTING method.
+            #   False -- keep the CENTRED T outputs, so step t sees k/2 on each side.
+            #
+            # The causal read buys nothing here and costs context. It cannot make the
+            # representation causal, because the backbone underneath it is SamePadConv with
+            # padding = receptive_field // 2 -- centred, and hundreds of steps wide at depth
+            # 10 -- so the representation at t already depends on the future before the trend
+            # head sees it. And forecasting does not need it either: a forecast at time t is
+            # made by encoding a window that ENDS at t, which contains no future data
+            # whatever the padding does. What the causal read does do is starve the start of
+            # the window: at kernel 256 the first steps have almost no context on either
+            # side.
+            self.trend_causal = bool(trend_causal)
             self.tfd = nn.ModuleList(
                 [nn.Conv1d(output_dims, component_dims, k, padding=k-1) for k in kernels]
             )
@@ -450,8 +467,10 @@ class CoSTEncoder(nn.Module):
         trend = []
         for idx, mod in enumerate(self.tfd):
             out = mod(x)  # b d t
-            if self.kernels[idx] != 1:
-                out = out[..., :-(self.kernels[idx] - 1)]
+            k = self.kernels[idx]
+            if k != 1:
+                lo = 0 if self.trend_causal else (k - 1) // 2
+                out = out[..., lo:lo + x.size(-1)]
             trend.append(out.transpose(1, 2))  # b t d
         trend = reduce(
             rearrange(trend, 'list b t d -> list b t d'),

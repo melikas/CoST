@@ -1,0 +1,170 @@
+[
+ {
+  "seed": 101,
+  "no pairing (upper bound)": 0.6697530864197531,
+  "window pair": 0.6790123456790124,
+  "day-disjoint pair": 0.6697530864197531,
+  "participant pair": 0.595679012345679
+ },
+ {
+  "seed": 13,
+  "no pairing (upper bound)": 0.6080246913580247,
+  "window pair": 0.617283950617284,
+  "day-disjoint pair": 0.5401234567901234,
+  "participant pair": 0.6388888888888888
+ },
+ {
+  "seed": 17,
+  "no pairing (upper bound)": 0.7160493827160493,
+  "window pair": 0.7037037037037037,
+  "day-disjoint pair": 0.5648148148148149,
+  "participant pair": 0.7222222222222222
+ },
+ {
+  "seed": 22,
+  "no pairing (upper bound)": 0.7253086419753086,
+  "window pair": 0.7376543209876544,
+  "day-disjoint pair": 0.6574074074074074,
+  "participant pair": 0.6975308641975309
+ },
+ {
+  "seed": 23,
+  "no pairing (upper bound)": 0.691358024691358,
+  "window pair": 0.6975308641975309,
+  "day-disjoint pair": 0.6574074074074074,
+  "participant pair": 0.6358024691358024
+ },
+ {
+  "seed": 29,
+  "no pairing (upper bound)": 0.6604938271604939,
+  "window pair": 0.6759259259259259,
+  "day-disjoint pair": 0.5833333333333333,
+  "participant pair": 0.5864197530864197
+ },
+ {
+  "seed": 31,
+  "no pairing (upper bound)": 0.808641975308642,
+  "window pair": 0.8055555555555556,
+  "day-disjoint pair": 0.7469135802469136,
+  "participant pair": 0.8055555555555556
+ },
+ {
+  "seed": 37,
+  "no pairing (upper bound)": 0.6018518518518519,
+  "window pair": 0.6141975308641976,
+  "day-disjoint pair": 0.462962962962963,
+  "participant pair": 0.6759259259259258
+ },
+ {
+  "seed": 41,
+  "no pairing (upper bound)": 0.6697530864197531,
+  "window pair": 0.6697530864197532,
+  "day-disjoint pair": 0.5895061728395061,
+  "participant pair": 0.6358024691358024
+ },
+ {
+  "seed": 42,
+  "no pairing (upper bound)": 0.6820987654320988,
+  "window pair": 0.6851851851851851,
+  "day-disjoint pair": 0.6512345679012346,
+  "participant pair": 0.7746913580246914
+ },
+ {
+  "seed": 45,
+  "no pairing (upper bound)": 0.8117283950617283,
+  "window pair": 0.8148148148148149,
+  "day-disjoint pair": 0.7469135802469136,
+  "participant pair": 0.7685185185185185
+ },
+ {
+  "seed": 53,
+  "no pairing (upper bound)": 0.7253086419753085,
+  "window pair": 0.7345679012345678,
+  "day-disjoint pair": 0.75,
+  "participant pair": 0.7345679012345679
+ },
+ {
+  "seed": 59,
+  "no pairing (upper bound)": 0.7067901234567902,
+  "window pair": 0.7098765432098766,
+  "day-disjoint pair": 0.595679012345679,
+  "participant pair": 0.5493827160493827
+ },
+ {
+  "seed": 61,
+  "no pairing (upper bound)": 0.7098765432098766,
+  "window pair": 0.7222222222222222,
+  "day-disjoint pair": 0.6666666666666667,
+  "participant pair": 0.6574074074074074
+ },
+ {
+  "seed": 67,
+  "no pairing (upper bound)": 0.7283950617283951,
+  "window pair": 0.7098765432098766,
+  "day-disjoint pair": 0.75,
+  "participant pair": 0.6975308641975309
+ },
+ {
+  "seed": 7,
+  "no pairing (upper bound)": 0.6604938271604939,
+  "window pair": 0.6635802469135802,
+  "day-disjoint pair": 0.7067901234567902,
+  "participant pair": 0.49691358024691357
+ },
+ {
+  "seed": 71,
+  "no pairing (upper bound)": 0.8209876543209876,
+  "window pair": 0.8209876543209877,
+  "day-disjoint pair": 0.6882716049382716,
+  "participant pair": 0.6728395061728395
+ },
+ {
+  "seed": 73,
+  "no pairing (upper bound)": 0.7191358024691358,
+  "window pair": 0.7376543209876544,
+  "day-disjoint pair": 0.787037037037037,
+  "participant pair": 0.8024691358024691
+ },
+ {
+  "seed": 79,
+  "no pairing (upper bound)": 0.8425925925925926,
+  "window pair": 0.8425925925925926,
+  "day-disjoint pair": 0.6512345679012346,
+  "participant pair": 0.7098765432098766
+ },
+ {
+  "seed": 82,
+  "no pairing (upper bound)": 0.787037037037037,
+  "window pair": 0.7839506172839505,
+  "day-disjoint pair": 0.7376543209876543,
+  "participant pair": 0.7808641975308642
+ },
+ {
+  "seed": 83,
+  "no pairing (upper bound)": 0.6790123456790124,
+  "window pair": 0.6759259259259259,
+  "day-disjoint pair": 0.6265432098765432,
+  "participant pair": 0.5493827160493827
+ },
+ {
+  "seed": 89,
+  "no pairing (upper bound)": 0.7037037037037037,
+  "window pair": 0.6851851851851851,
+  "day-disjoint pair": 0.595679012345679,
+  "participant pair": 0.6265432098765432
+ },
+ {
+  "seed": 91,
+  "no pairing (upper bound)": 0.6975308641975309,
+  "window pair": 0.7160493827160495,
+  "day-disjoint pair": 0.6450617283950617,
+  "participant pair": 0.6080246913580246
+ },
+ {
+  "seed": 97,
+  "no pairing (upper bound)": 0.6697530864197531,
+  "window pair": 0.6604938271604938,
+  "day-disjoint pair": 0.7067901234567902,
+  "participant pair": 0.5555555555555556
+ }
+]
