@@ -12,17 +12,31 @@ import numpy as np
 
 pat = sys.argv[1] if len(sys.argv) > 1 else "results_globem/*/*/RQ3/rq3_utility.csv"
 files = sorted(glob.glob(pat))
-acc, folds = defaultdict(list), defaultdict(set)
+acc, folds, stale = defaultdict(list), defaultdict(set), defaultdict(int)
+used = []
 for f in files:
     run = f.split("/")[1]
-    for r in csv.DictReader(open(f)):
+    d = csv.DictReader(open(f))
+    # A file written before the balanced-accuracy column existed cannot be set beside one
+    # written after it. Raising on the missing key was the lucky outcome; the failure mode
+    # to avoid is averaging an older run in silently, which is how the previous table came
+    # to describe a run nobody had launched. Name them and drop them.
+    if "balanced_acc" not in (d.fieldnames or []):
+        stale[run] += 1
+        continue
+    used.append(f)
+    for r in d:
         if r["role"] != "ladder" or not r["auc"]:
             continue
         acc[r["representation"]].append((float(r["auc"]),
                                          float(r["balanced_acc"] or "nan")))
         folds[r["representation"]].add(run)
 
-print(f"{len(files)} variant dirs, {len(set(f.split('/')[1] for f in files))} runs\n")
+for run, n in sorted(stale.items()):
+    print(f"  SKIPPED {n:3d} variant dirs in {run}: no balanced_acc column (older run)")
+print(f"{len(used)} variant dirs,"
+      f" {len(set(f.split(chr(47))[1] for f in used))} runs")
+print()
 print(f"  {'arm':32s} {'bal acc':>8s} {'AUROC':>8s} {'n':>5s} {'folds':>6s}")
 for name in sorted(acc, key=lambda n: -np.nanmean([b for _, b in acc[n]])):
     v = np.array(acc[name], float)
