@@ -143,6 +143,7 @@ def supervised_baseline_row(X, y, pids, train_mask, val_mask, test_mask, backbon
                             n_time_features, hidden_dims, depth, output_dims, device="cuda",
                             max_epochs=60, patience=12, lr=1e-3, batch_size=64, seed=42,
                             return_scores=False, return_window_scores=False,
+                            return_unit_scores=None,
                             init_encoder=None, freeze_backbone=False):
     """Train the supervised backbone end-to-end and return a separability-table row dict
     (same keys as `separability_table`). Best epoch chosen by participant-level validation
@@ -269,6 +270,20 @@ def supervised_baseline_row(X, y, pids, train_mask, val_mask, test_mask, backbon
             torch.cuda.empty_cache()
         return value
 
+    # The caller states the UNIT it is scoring at and gets test and validation predictions
+    # at that unit, in one call. RQ3 needs both: the test vectors must be the same length as
+    # every other rung's or the paired bootstrap indexes across arms of different lengths
+    # (it did -- a window-unit draw of 1294 into a 194-participant array), and the validation
+    # vectors are what the balanced-accuracy threshold is chosen on. Choosing it on test is
+    # the one thing this rung must not do; see experiment_q3.score.
+    if return_unit_scores in ("participant", "window"):
+        if return_unit_scores == "window":
+            sp, sl = tprob, yte
+            up, ul = predict(thr_mask), y[thr_mask]
+        else:
+            sp, sl, up, ul = pp, pl, vp, vl
+        return _release((row, np.asarray(sp), np.asarray(sl),
+                         np.asarray(up), np.asarray(ul)))
     if return_scores:
         return _release((row, pp, pl))
     # WINDOW-level scores, for a downstream whose unit is the window rather than the

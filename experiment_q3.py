@@ -80,9 +80,15 @@ def score(clf, feat, ctx, mask=None, unit="participant"):
     """
     m = ctx.test_mask if mask is None else mask
     rows = window_rows if unit == "window" else persubject_rows
-    Xte, yte, _ = rows(feat, ctx.pids, ctx.y, m)
+    Xte, yte, rpids = rows(feat, ctx.pids, ctx.y, m)
     prob = clf.predict_proba(Xte)[:, 1]
-    return (float(roc_auc_score(yte, prob)) if len(set(yte)) > 1 else np.nan), prob, yte
+    # `rpids` travels with the scores because the interval around them is a CLUSTER
+    # bootstrap over people. At unit="participant" one row IS one person and the two are
+    # the same; at unit="window" one person owns ~10 correlated rows, and resampling rows
+    # independently would report an interval far too narrow for the claim being made --
+    # see participant_bootstrap_auc, which exists for exactly this.
+    return ((float(roc_auc_score(yte, prob)) if len(set(yte)) > 1 else np.nan),
+            prob, yte, rpids)
 
 
 def degrade(X, kind, level, n_sensors, sig, bpd, bin_minutes, rng):
@@ -216,7 +222,7 @@ def main():
     rows, probs = [], {}
     maj = float(ctx.y[ctx.train_mask & ctx.last_mask].mean())
 
-    def add(role, name, auc, pp=None, pl=None, vp=None, vl=None):
+    def add(role, name, auc, pp=None, pl=None, vp=None, vl=None, groups=None):
         """One row of the single RQ3 table, always with an interval when one is computable.
 
         Balanced accuracy travels with the AUC because it is the metric the GLOBEM
@@ -229,8 +235,8 @@ def main():
         lo = hi = ""
         ba = ""
         if pp is not None and np.isfinite(auc):
-            b = participant_bootstrap_auc(pl, pp, np.arange(len(pl)), n_boot=a.n_boot,
-                                          seed=ctx.seed)                 # rows already = people
+            g = np.arange(len(pl)) if groups is None else np.asarray(groups)
+            b = participant_bootstrap_auc(pl, pp, g, n_boot=a.n_boot, seed=ctx.seed)
             lo, hi = round(b["lo"], 4), round(b["hi"], 4)
         if (pp is not None and pl is not None and vp is not None and vl is not None
                 and len(set(np.asarray(pl))) > 1 and len(set(np.asarray(vl))) > 1):
@@ -249,10 +255,10 @@ def main():
     add("ladder", "Majority", 0.5)
     for name, feat in ladder.items():
         clf = fit_probe(feat, ctx, a)
-        auc, pp, pl = score(clf, feat, ctx, unit=a.unit)
-        _, vp, vl = score(clf, feat, ctx, ctx.val_mask, unit=a.unit)
+        auc, pp, pl, gp = score(clf, feat, ctx, unit=a.unit)
+        _, vp, vl, _ = score(clf, feat, ctx, ctx.val_mask, unit=a.unit)
         probs[name] = (pp, pl)
-        add("ladder", name, auc, pp, pl, vp, vl)
+        add("ladder", name, auc, pp, pl, vp, vl, groups=gp)
 
     # Top rung of the design's ladder: the end-to-end supervised CEILING. It is not a feature
     # matrix, so it cannot join `ladder` -- the network is trained on the labels rather than
@@ -260,18 +266,24 @@ def main():
     # same order (participant_aggregate and per_subject both sort by np.unique(pids[test])), so
     # its Delta against CoST is paired exactly like every other rung. The gap between CoST and
     # this row is what freezing the encoder costs, which is the first thing a reader asks.
+    # Row order of the supervised rungs is fixed by supervised_baseline_row: at the window
+    # unit it is `pids[test_mask]`, and at the participant unit `participant_aggregate`
+    # orders by `np.unique(pids[test_mask])`. Naming them here is what makes the cluster
+    # bootstrap -- and the pairing against every other rung -- exact rather than assumed.
+    sup_groups = (ctx.pids[ctx.test_mask] if a.unit == "window"
+                  else np.unique(ctx.pids[ctx.test_mask]))
     sup_name = "Supervised (end-to-end)"
     if not a.no_supervised:
         try:
-            _row, pp_s, pl_s = supervised_baseline_row(
+            _row, pp_s, pl_s, vp_s, vl_s = supervised_baseline_row(
                 ctx.X, ctx.y, ctx.pids, ctx.train_mask, ctx.val_mask, ctx.test_mask,
                 ctx.cfg["backbone"], ctx.cfg["pe"], sup_name,
                 int(ctx.X.shape[-1]) - int(ctx.n_sensors), ctx.cfg["hidden_dims"],
                 ctx.cfg["depth"], ctx.cfg["repr_dims"], device=ctx.device, seed=ctx.seed,
-                batch_size=ctx.cfg["batch_size"], return_scores=True)
-            auc_s = float(_row["Subj AUC"])
-            probs[sup_name] = (np.asarray(pp_s), np.asarray(pl_s))
-            add("ladder", sup_name, auc_s, np.asarray(pp_s), np.asarray(pl_s))
+                batch_size=ctx.cfg["batch_size"], return_unit_scores=a.unit)
+            auc_s = float(_row["Win AUC" if a.unit == "window" else "Subj AUC"])
+            probs[sup_name] = (pp_s, pl_s)
+            add("ladder", sup_name, auc_s, pp_s, pl_s, vp_s, vl_s, groups=sup_groups)
         except Exception as e:
             print(f"[rq3] {sup_name} rung SKIPPED: {type(e).__name__}: {e}")
 
@@ -285,15 +297,16 @@ def main():
         if a.no_supervised or a.no_finetune:
             break
         try:
-            _row, pp_f, pl_f = supervised_baseline_row(
+            _row, pp_f, pl_f, vp_f, vl_f = supervised_baseline_row(
                 ctx.X, ctx.y, ctx.pids, ctx.train_mask, ctx.val_mask, ctx.test_mask,
                 ctx.cfg["backbone"], ctx.cfg["pe"], tag,
                 int(ctx.X.shape[-1]) - int(ctx.n_sensors), ctx.cfg["hidden_dims"],
                 ctx.cfg["depth"], ctx.cfg["repr_dims"], device=ctx.device, seed=ctx.seed,
-                batch_size=ctx.cfg["batch_size"], return_scores=True,
+                batch_size=ctx.cfg["batch_size"], return_unit_scores=a.unit,
                 init_encoder=ctx.model.net, freeze_backbone=frozen)
-            probs[tag] = (np.asarray(pp_f), np.asarray(pl_f))
-            add("ladder", tag, float(_row["Subj AUC"]), np.asarray(pp_f), np.asarray(pl_f))
+            probs[tag] = (pp_f, pl_f)
+            add("ladder", tag, float(_row["Win AUC" if a.unit == "window" else "Subj AUC"]),
+                pp_f, pl_f, vp_f, vl_f, groups=sup_groups)
         except Exception as e:
             print(f"[rq3] {tag} rung SKIPPED: {type(e).__name__}: {e}")
 
@@ -306,6 +319,15 @@ def main():
     # vs plain SSL is the headline contrast: it is the only rung differing ONLY by the split.
     for name in [n for n in probs if n != "DSSL (frozen)"]:
         pp_b, _ = probs[name]
+        # Paired means row-aligned: both arms scored on the same held-out rows in the same
+        # order. If an arm ever reports at a different unit than DSSL, the draw `ix` is
+        # meaningless against it -- say so and drop the contrast rather than index out of
+        # bounds and lose every other result the run has already computed.
+        if len(pp_b) != len(pl_c):
+            print(f"[rq3] delta vs {name} SKIPPED: {len(pp_b)} rows vs {len(pl_c)}"
+                  f" -- arms are not scored at the same unit")
+            res["delta_auc"][name] = {"delta": None, "ci": None}
+            continue
         boot = []
         for _ in range(a.n_boot):
             ix = rng.integers(0, len(pl_c), len(pl_c))
@@ -324,16 +346,19 @@ def main():
     n_ladder = len(rows)
     for half, dslice in (("V^T (trend) only", slice(None, dT)),
                          ("V^S (seasonal) only", slice(dT, None))):
-        add("branch", half, *score(fit_probe(V[:, dslice], ctx, a), V[:, dslice], ctx))
+        bauc, bpp, bpl, bgp = score(fit_probe(V[:, dslice], ctx, a), V[:, dslice], ctx,
+                                    unit=a.unit)
+        add("branch", half, bauc, bpp, bpl, groups=bgp)
     add("branch", "full", *((res["utility"]["DSSL (frozen)"]["auc"],) + probs["DSSL (frozen)"]))
     clf = fit_probe(V, ctx, a)                    # probe trained on the intact input, reused
     for c, cname in enumerate(ctx.sensor_cols):
         Xz = ctx.X.copy(); Xz[:, :, c] = 0.0
-        add("channel", f"drop {cname}", *score(clf, encode(ctx.model, Xz, ctx.cfg), ctx))
+        cauc, cpp, cpl, cgp = score(clf, encode(ctx.model, Xz, ctx.cfg), ctx, unit=a.unit)
+        add("channel", f"drop {cname}", cauc, cpp, cpl, groups=cgp)
     Xnc = degrade(ctx.X, "no_circadian", 0, ctx.n_sensors, sig, ctx.bins_per_day,
                   ctx.bin_minutes, rng)
-    add("timescale", "input minus circadian",
-        *score(clf, encode(ctx.model, Xnc, ctx.cfg), ctx))
+    tauc, tpp, tpl, tgp = score(clf, encode(ctx.model, Xnc, ctx.cfg), ctx, unit=a.unit)
+    add("timescale", "input minus circadian", tauc, tpp, tpl, groups=tgp)
     res["ablation"] = [{"level": r[0], "setting": r[1], "auc": r[2], "ci": r[3:]}
                        for r in rows[n_ladder:]]
 
@@ -374,7 +399,8 @@ def main():
             Xd = degrade(ctx.X, kind, lv, ctx.n_sensors, sig, ctx.bins_per_day,
                          ctx.bin_minutes,
                          np.random.default_rng([ctx.seed, ki, int(lv * 1000)]))
-            auc, P[(kind, lv)], _ = score(clf, encode(ctx.model, Xd, ctx.cfg), ctx)
+            auc, P[(kind, lv)], _, _ = score(clf, encode(ctx.model, Xd, ctx.cfg), ctx,
+                                             unit=a.unit)
             curves.setdefault(kind, []).append((lv, auc))
 
     # Participant bootstrap of the whole grid. ONE draw is shared by the intact reference and
