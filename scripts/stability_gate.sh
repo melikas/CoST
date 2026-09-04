@@ -3,7 +3,7 @@
 # The day-resolved phase-concentration gate, over the 24 saved encoders of one run.
 #
 #   sbatch --array=0-23%24 scripts/stability_gate.sh results_hrd/2002135
-#   SCRIPT=rhythm_dynamics.py sbatch --array=0 scripts/stability_gate.sh results_hrd/2002135
+#   SCRIPT=readout_interaction.py sbatch --array=0 scripts/stability_gate.sh results_hrd/2002135
 #   SCRIPT=experiment_q3.py EXTRA='--no-supervised --no-plain-ssl' \
 #     sbatch --gres=gpu:a100_3g.20gb:1 --time=3:00:00 --array=0-23%12 \
 #     scripts/stability_gate.sh results_hrd/2002135

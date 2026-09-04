@@ -46,3 +46,9 @@ __pycache__/
 /*.npz
 _randinit_cache/
 audit_fast_*.json
+architecture_loss.json
+readout_sweep.json
+noise_branch_ceiling.json
+dispersion_ceiling.json
+kfold_eval.json
+kfold_null.json

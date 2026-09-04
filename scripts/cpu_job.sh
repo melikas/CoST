@@ -8,7 +8,7 @@
 # job 2394399. This exists so a script that is not the stability gate can still get that
 # environment without a second copy of it drifting away from the first.
 #
-#   sbatch scripts/cpu_job.sh missingness_ceiling.py --npz hrd_2224103.npz
+#   sbatch scripts/cpu_job.sh kfold_eval.py --npz hrd_2224103.npz
 #   sbatch --mem=96G --time=4:00:00 scripts/cpu_job.sh some_other.py --flag
 # =====================================================================
 #SBATCH --account=def-plago
