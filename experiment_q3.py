@@ -68,6 +68,9 @@ def fit_probe(feat, ctx, a):
              c_grid=a.probe_c, families=tuple(a.probe_family))
 
 
+SKIP_WIDTH = 512
+
+
 def combined_rungs(ladder, V, skip):
     """The concatenated arms, plus the control that makes them readable.
 
@@ -262,8 +265,12 @@ def main():
     # The Random-init combination is the CONTROL, and the reason to trust or discard the
     # other two: without it a winning combined rung says nothing about whether the learned
     # half contributed, since rhythm+skip alone might carry all of it.
+    # 512, not the readout's own width. Matching V was symmetry and nothing else; the
+    # width was swept on HRD over 24 seeds and it is flat where it matters -- 0.6865 at 16,
+    # 0.7122 at 256, 0.7198 at 512, 0.7123 at 1760 -- so 512 is the best measured value AND
+    # a third of the columns, which is what the forest probe's cost scales with.
     ladder.update(combined_rungs(
-        ladder, V, raw_projection(ctx.X, ctx.n_sensors, int(V.shape[1]), ctx.seed)))
+        ladder, V, raw_projection(ctx.X, ctx.n_sensors, SKIP_WIDTH, ctx.seed)))
 
     rows, probs = [], {}
     maj = float(ctx.y[ctx.train_mask & ctx.last_mask].mean())
