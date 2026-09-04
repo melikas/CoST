@@ -85,7 +85,12 @@ def measure(model, X, pids, n_neg, mode, positive, batch_size, warm_batches,
 def main():
     ap = argparse.ArgumentParser(description=__doc__,
                                  formatter_class=argparse.RawDescriptionHelpFormatter)
-    ap.add_argument("--variant-dir", required=True,
+    ap.add_argument("--npz", default=None,
+                    help="Run from a dump_context npz instead of a variant directory, so the "
+                         "gate can be answered on a laptop while the sweep it is meant to "
+                         "gate is still queued -- which is the only time the answer is worth "
+                         "anything.")
+    ap.add_argument("--variant-dir",
                     help="any completed variant -- only its config and dataset are used; the "
                          "encoder is re-initialised at random")
     ap.add_argument("--cache-dir", default=None)
@@ -104,7 +109,14 @@ def main():
     ap.add_argument("--measure-batches", type=int, default=40)
     a = ap.parse_args()
 
-    ctx = load_context(a.variant_dir, a.cache_dir, gpu=-1)
+    if a.npz:
+        from local_context import local_context
+        import numpy as _np
+        ctx = local_context(a.npz, [int(x) for x in _np.load(a.npz, allow_pickle=True)["seeds"]][0])
+    elif a.variant_dir:
+        ctx = load_context(a.variant_dir, a.cache_dir, gpu=-1)
+    else:
+        ap.error("one of --npz or --variant-dir is required")
     # The sweep pretrains on every non-test window; measuring on anything else would describe
     # a task the sweep never sees.
     Xp, pp = ctx.X[ctx.pretrain_mask], ctx.pids[ctx.pretrain_mask]
