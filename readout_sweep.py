@@ -37,8 +37,53 @@ SEGS = [1, 2, 4, 7, 14, 28]
 WIDTH = 1760            # the raw-projection reference, at the production readout's width
 
 
+def readout_parts(model, X, season_pool="spec", batch=64, segs=SEGS):
+    """Every candidate readout of one encoder, from ONE forward pass.
+
+    Returns {"trend seg S", "season seg S", "season spec"} -> (n, d). The trend and seasonal
+    halves are kept APART because the shipped readout does not treat them alike: it mean-pools
+    the trend and reads the seasonal branch spectrally, and cost.py notes that time-domain
+    pooling on that branch provably discards the rhythm. Pooling both is a readout nobody
+    runs, and an early version of this file called that the production reference and
+    understated it by 0.018.
+
+    The forward pass is the expensive part and the readouts are not, so they are all
+    accumulated per batch and the (n, T, d) feature tensor is never materialised.
+    """
+    import torch
+    model.net.eval()
+    X = np.asarray(X, dtype=np.float32)
+
+    def cut(z):
+        T, d = z.shape[1], z.shape[2]
+        return {k: z[:, :k * (T // k)].reshape(z.shape[0], k, T // k, d)
+                .mean(dim=2).reshape(z.shape[0], -1).numpy() for k in segs}
+
+    acc = {"t": [], "s": [], "spec": []}
+    with torch.no_grad():
+        for i in range(0, len(X), batch):
+            out_t, out_s = model.net(torch.from_numpy(X[i:i + batch]))
+            acc["t"].append(cut(out_t))
+            acc["s"].append(cut(out_s))
+            acc["spec"].append(model._seasonal_spectral(out_s, season_pool).numpy())
+    cat = lambda k, j: np.concatenate([b[j] for b in acc[k]]).astype(np.float32)
+    parts = {f"trend seg {j:2d}": cat("t", j) for j in segs}
+    parts.update({f"season seg {j:2d}": cat("s", j) for j in segs})
+    parts["season spec"] = np.concatenate(acc["spec"]).astype(np.float32)
+    return parts
+
+
+def production_readout(parts):
+    """The readout that actually ships: trend mean-pooled, seasonal read spectrally.
+
+    Asserted elsewhere to reproduce model_build.encode_repr exactly (max abs diff 0.0), which
+    is what makes it usable as the reference row rather than an approximation of one.
+    """
+    return np.concatenate([parts["trend seg  1"], parts["season spec"]], axis=1)
+
+
 def segment_readouts(npz, seed, cache_dir, batch=64, threads=None):
-    """{name: (n, d)} for every segment count, from one pass over the encoder."""
+    """`readout_parts` for one RANDOM-INIT draw over an npz dump, cached on disk."""
     import torch
     from local_context import local_context
     from model_build import random_init_model
@@ -51,32 +96,7 @@ def segment_readouts(npz, seed, cache_dir, batch=64, threads=None):
     torch.set_num_threads(threads or os.cpu_count() or 4)
     t0 = time.time()
     m = random_init_model(ctx.cfg, ctx.X, ctx.n_sensors, "cpu", seed)
-    m.net.eval()
-    def segs(z):
-        """z (b, T, d) -> {S: (b, S*d)}, the mean within each of S equal time segments."""
-        T, d = z.shape[1], z.shape[2]
-        return {s: z[:, :s * (T // s)].reshape(z.shape[0], s, T // s, d)
-                .mean(dim=2).reshape(z.shape[0], -1).numpy() for s in SEGS}
-
-    # The trend and seasonal halves are kept APART, because the production readout does not
-    # treat them alike: it mean-pools the trend (160 dims) and reads the seasonal branch
-    # spectrally (1600), and cost.py's own note says time-domain pooling on that branch
-    # provably discards the rhythm. Pooling both -- what the first version of this script
-    # did -- is therefore a readout nobody runs, and calling it the production reference
-    # understated that reference by 0.018.
-    acc = {"t": [], "s": [], "spec": []}
-    X = np.asarray(ctx.X, dtype=np.float32)
-    sp = ctx.cfg.get("season_pool") or "spec"
-    with torch.no_grad():
-        for i in range(0, len(X), batch):
-            out_t, out_s = m.net(torch.from_numpy(X[i:i + batch]))
-            acc["t"].append(segs(out_t))
-            acc["s"].append(segs(out_s))
-            acc["spec"].append(m._seasonal_spectral(out_s, sp).numpy())
-    cat = lambda k, s: np.concatenate([b[s] for b in acc[k]]).astype(np.float32)
-    feats = {f"trend seg {s:2d}": cat("t", s) for s in SEGS}
-    feats.update({f"season seg {s:2d}": cat("s", s) for s in SEGS})
-    feats["season spec"] = np.concatenate(acc["spec"]).astype(np.float32)
+    feats = readout_parts(m, ctx.X, ctx.cfg.get("season_pool") or "spec", batch)
     f.parent.mkdir(parents=True, exist_ok=True)
     np.savez_compressed(f, **feats)
     print(f"  encoded seed {seed} in {(time.time() - t0) / 60:.1f} min "

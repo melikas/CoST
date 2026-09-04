@@ -49,6 +49,10 @@ _OWNER = [
     ("hrd_rhythm.", "RQ3"),
     ("cosinor_cache_all.npz", "RQ3"),
     ("paper_cosinor", "RQ3"),          # the paper-cosinor view is a separability rung
+    # Does the trained encoder gain more from opening the readout than its untrained
+    # control does? It is scored as a utility ladder at the benchmark window unit, so
+    # it sits with RQ3 rather than with the RQ1 recovery diagnostics.
+    ("readout_interaction", "RQ3"),
     # ---- descriptive, owned by no RQ -----------------------------------------------
     ("hrd_tsne", "RQ0_descriptive"),
     ("hrd_umap", "RQ0_descriptive"),
