@@ -45,3 +45,4 @@ __pycache__/
 # instead of under results_hrd/.
 /*.npz
 _randinit_cache/
+audit_fast_*.json

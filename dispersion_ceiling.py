@@ -35,7 +35,7 @@ import json
 import numpy as np
 
 from local_context import local_context
-from tasks.decompose import decompose
+from tasks.signal_decomposition import decompose
 from random_init_audit import _probe_auc, raw_projection
 
 

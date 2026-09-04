@@ -1,0 +1,11 @@
+[
+ {
+  "repeat": 0,
+  "Raw skip only": 0.7345192307692309,
+  "Handcrafted (mean/std)": 0.4753846153846154,
+  "Structured rhythm": 0.6452884615384614,
+  "Random-init": 0.6867307692307693,
+  "rhythm + raw skip": 0.7340384615384615,
+  "Random-init + rhythm + raw skip": 0.7067307692307693
+ }
+]

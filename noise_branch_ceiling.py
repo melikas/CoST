@@ -30,7 +30,7 @@ import json
 
 import numpy as np
 
-from tasks.decompose import decompose
+from tasks.signal_decomposition import decompose
 
 
 def invariant(X, cfg, n_sensors, draws=32, seed=0):

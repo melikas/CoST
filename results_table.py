@@ -25,6 +25,15 @@ ROWS = [
      "AUROC", 0.4967, "chance 0.500", "", "0/24", 0.0015, "no leak",
      "session, random_init_audit.py", "python random_init_audit.py --aggregate <run>"),
 
+    # === the single number that explains the rest ========================================
+    ("pretext difficulty", "HRD", "random-init encoder, shipped global queue", "",
+     "MoCo top-1 retrieval at initialisation", "top-1", 1.000, "chance 1/(1+K)", "", "", "",
+     "the pretext task is ALREADY SOLVED before training; the loss starts at zero, so "
+     "there is nothing for pretraining to learn -- this is why the frozen DSSL "
+     "representation has never separated from its own random-init control",
+     "pretext_difficulty.py",
+     "python pretext_difficulty.py --variant-dir results_hrd/<run>/tcn_none_seed42"),
+
     # === RQ1: does pretraining build rhythm structure? ====================================
     ("RQ1 structure", "HRD", "24 seeds", 24, "trend stability tau, random-init",
      "tau", 0.6830, "", "", "", "", "", "session, rhythm_stability.py", ""),

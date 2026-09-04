@@ -176,7 +176,7 @@ class TransformerFeatureExtractor(nn.Module):
 def _residual_projection(length, bins_per_day, poly_degree=3, harmonics=4):
     """I - D (D'D)^-1 D' for D = [polynomial in t | daily harmonics], as a (T, T) matrix.
 
-    Applying this is identical to taking the least-squares residual tasks.decompose
+    Applying this is identical to taking the least-squares residual tasks.signal_decomposition
     returns, and a test asserts that against it. A moving-average trend would need padding
     a 7-day window cannot justify -- on a planted rhythm-plus-drift signal circular padding
     left 14% of the rhythm in the residual, edge replication 7%, odd reflection 5% -- while
@@ -313,7 +313,7 @@ class CoSTEncoder(nn.Module):
             # The residual is a FIXED linear operator, so it is a buffer and not a data
             # pipeline change: R = I - D (D'D)^-1 D' projects a window onto the orthogonal
             # complement of [polynomial in t | daily harmonics], which is exactly what
-            # tasks.decompose computes by least squares. Keeping it here means the branch
+            # tasks.signal_decomposition computes by least squares. Keeping it here means the branch
             # sees the residual OF THE AUGMENTED VIEW, which is what it must contrast, and
             # that no caller's tuple arity changes.
             self.register_buffer("noise_proj",
