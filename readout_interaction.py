@@ -52,12 +52,23 @@ def arms(parts):
     return out
 
 
-def window_auc(feat, ctx):
-    """AUROC at the WINDOW unit -- the unit the GLOBEM ladder is scored at, so these numbers
-    sit beside that table rather than beside a differently-defined one."""
+def window_auc(feat, ctx, families=("supervised", "forest")):
+    """AUROC at the WINDOW unit, through the SAME probe the ladder uses.
+
+    Both halves of that sentence are load-bearing, and the second one was wrong first. This
+    file defaulted to `fit_window_probe`'s own default, which is logistic only, while the
+    RQ3 ladder is run with --probe-family supervised forest -- the family chosen on
+    validation. The two disagree about the readout, and not slightly: seg2 came out +0.018
+    to +0.028 in all four folds under a logistic probe and -0.009 under the ladder's, which
+    is how this file came to recommend a readout that made the ladder worse.
+
+    The probe that decides is the one whose numbers are reported, so that is the default
+    here now. An instrument advising a protocol has to measure under that protocol.
+    """
     from sklearn.metrics import roc_auc_score
     from tasks._eval_protocols import fit_window_probe, window_rows
-    clf = fit_window_probe(feat, ctx.pids, ctx.y, ctx.train_mask, ctx.val_mask, ctx.seed)
+    clf = fit_window_probe(feat, ctx.pids, ctx.y, ctx.train_mask, ctx.val_mask, ctx.seed,
+                           families=tuple(families))
     Xte, yte, _ = window_rows(feat, ctx.pids, ctx.y, ctx.test_mask)
     if len(set(yte)) < 2:
         return float("nan")
@@ -134,6 +145,10 @@ def main():
     ap.add_argument("--variant-dir")
     ap.add_argument("--aggregate", metavar="RUN_DIR")
     ap.add_argument("--cache-dir", default=None)
+    ap.add_argument("--probe-family", nargs="+", default=["supervised", "forest"],
+                    help="Probe families the validation split chooses between. Must match "
+                         "what the RQ3 ladder is run with, or this measures a different "
+                         "protocol than the one it advises (default: %(default)s).")
     ap.add_argument("--widths", metavar="VARIANT_DIR",
                     help="print each readout's width from a four-window forward pass and "
                          "stop. Cheap enough to answer 'is that gain just dimensions?' "
@@ -163,7 +178,8 @@ def main():
                          "contrast between a trained encoder and its untrained control, and "
                          "without the first it would silently compare two random ones")
     sp = ctx.cfg.get("season_pool") or "spec"
-    res = {"variant": ctx.tag, "seed": ctx.seed}
+    res = {"variant": ctx.tag, "seed": ctx.seed,
+           "probe_family": list(a.probe_family)}
     for tag, model in (("DSSL", ctx.model), ("Random-init", random_init_model(ctx))):
         parts = readout_parts(model, ctx.X, sp)
         res[tag] = {}
@@ -174,7 +190,7 @@ def main():
         # anyway because it never wrote the numbers down.
         res["dims"] = {k: int(v.shape[1]) for k, v in built.items()}
         for name, F in built.items():
-            res[tag][name] = window_auc(F, ctx)
+            res[tag][name] = window_auc(F, ctx, families=a.probe_family)
         print(f"  {tag}: " + "  ".join(f"{k}={v:.3f}" for k, v in res[tag].items()),
               flush=True)
     save(out_dir(ctx, NAME), NAME, res)

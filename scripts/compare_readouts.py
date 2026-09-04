@@ -24,6 +24,14 @@ from tasks.sign_test import sign_summary
 METRICS = ("balanced_acc", "auc")
 
 
+def _mean(v):
+    """nanmean that says 'nothing here' instead of warning about it. Majority carries no
+    balanced accuracy -- it is not a fitted probe -- so its row is all-NaN by construction."""
+    v = np.asarray(v, dtype=float)
+    v = v[~np.isnan(v)]
+    return float(v.mean()) if len(v) else float("nan")
+
+
 def read(pattern, base):
     """{arm: {variant dir: {metric: value}}} for one CSV basename."""
     out = defaultdict(dict)
@@ -57,15 +65,14 @@ def main():
     print()
     print(f"  {'arm':34s} {'bal acc':>28s} {'AUROC':>28s}")
     print(f"  {'':34s} {'after   delta  wins     p':>28s} {'after   delta  wins     p':>28s}")
-    for n in sorted(arms, key=lambda n: -np.nanmean([v["balanced_acc"]
-                                                     for v in B[n].values()])):
+    for n in sorted(arms, key=lambda n: -_mean([v["balanced_acc"] for v in B[n].values()])):
         shared = sorted(set(A[n]) & set(B[n]))
         cells = []
         for m in METRICS:
             d = np.array([B[n][v][m] - A[n][v][m] for v in shared], float)
-            after = np.nanmean([B[n][v][m] for v in shared])
+            after = _mean([B[n][v][m] for v in shared])
             k, cmp_n, p = sign_summary(d)
-            cells.append(f"{after:.4f} {np.nanmean(d):+.4f} {k:3d}/{cmp_n:<3d} {p:.4f}")
+            cells.append(f"{after:.4f} {_mean(d):+.4f} {k:3d}/{cmp_n:<3d} {p:.4f}")
         print(f"  {n:34s} {cells[0]:>28s} {cells[1]:>28s}")
     missing = [n for n in B if n not in A] + [n for n in A if n not in B]
     if missing:
