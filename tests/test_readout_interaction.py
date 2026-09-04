@@ -66,3 +66,45 @@ def test_verdict_builds_when_the_gap_opens_with_resolution(tmp_path):
 def test_aggregate_refuses_an_empty_run(tmp_path):
     with pytest.raises(SystemExit):
         aggregate(tmp_path)
+
+
+def test_vs_production_table_is_paired_not_averaged(tmp_path, capsys):
+    """A readout that beats PRODUCTION in every variant must read 24/24, and one that beats
+    it only on average -- big wins on a few, losses on the rest -- must not."""
+    names = ["PRODUCTION", "both seg  4", "both seg 28"]
+    rng = np.random.default_rng(2)
+    n = 24
+    for i in range(n):
+        d = tmp_path / f"tcn_none_seed{i}" / "RQ3"
+        d.mkdir(parents=True)
+        prod = 0.52 + rng.normal(0, 0.01)
+        arm = {"PRODUCTION": prod,
+               # consistently better by a hair
+               "both seg  4": prod + 0.004,
+               # better on average, worse in most variants: two big wins carry it
+               "both seg 28": prod + (0.20 if i < 2 else -0.005)}
+        (d / "readout_interaction.json").write_text(json.dumps({
+            "variant": "tcn/none", "seed": i, "DSSL": arm, "Random-init": dict(arm)}))
+    aggregate(tmp_path)
+    # the SECOND table -- the first one contrasts the two arms, not the two readouts
+    out = capsys.readouterr().out.split("paired per variant")[1]
+    line4 = next(l for l in out.splitlines() if l.strip().startswith("both seg  4"))
+    line28 = next(l for l in out.splitlines() if l.strip().startswith("both seg 28"))
+    assert f"{n}/{n}" in line4, line4
+    assert f" 2/{n}" in line28, line28
+    assert "+0.0040" in line4
+
+
+def test_an_arm_identical_to_production_reads_as_no_evidence(tmp_path, capsys):
+    """`trend seg 1 + spec` IS the production readout, so it ties in every variant. Counting
+    ties as losses made that the most significant row in the table."""
+    for i in range(24):
+        d = tmp_path / f"tcn_none_seed{i}" / "RQ3"
+        d.mkdir(parents=True)
+        arm = {"PRODUCTION": 0.52 + i * 1e-4, "trend seg  1 + spec": 0.52 + i * 1e-4}
+        (d / "readout_interaction.json").write_text(json.dumps({
+            "variant": "tcn/none", "seed": i, "DSSL": arm, "Random-init": dict(arm)}))
+    aggregate(tmp_path)
+    out = capsys.readouterr().out.split("paired per variant")[1]
+    line = next(l for l in out.splitlines() if l.strip().startswith("trend seg  1 + spec"))
+    assert "1.0000" in line and "0/0" in line, line

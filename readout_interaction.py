@@ -31,10 +31,11 @@ in nothing else, since random_init_model mirrors the layout of the encoder it co
 import argparse
 import glob
 import json
-from math import comb
 from pathlib import Path
 
 import numpy as np
+
+from tasks.sign_test import sign_p, sign_summary
 
 NAME = "readout_interaction"
 
@@ -63,22 +64,18 @@ def window_auc(feat, ctx):
     return float(roc_auc_score(yte, clf.predict_proba(Xte)[:, 1]))
 
 
-def sign_p(d):
-    n, k = len(d), int((np.asarray(d) > 0).sum())
-    return min(1.0, 2 * sum(comb(n, i) for i in range(min(k, n - k) + 1)) / 2 ** n)
-
-
 def aggregate(run_dir):
     files = sorted(glob.glob(str(Path(run_dir) / "*" / "**" / f"{NAME}.json"), recursive=True))
     rows = [json.loads(Path(f).read_text()) for f in files]
     if not rows:
         raise SystemExit(f"no {NAME}.json under {run_dir}")
     names = [k for k in rows[0]["DSSL"]]
+    dims = rows[0].get("dims", {})
     print()
     print(f"  {len(rows)} variants, window-unit AUROC, the run's own probe and splits")
     print()
-    print(f"  {'readout':22s} {'DSSL':>8s} {'Rand-init':>10s} {'diff':>9s} {'wins':>8s}"
-          f" {'p':>8s}")
+    print(f"  {'readout':22s} {'dim':>6s} {'DSSL':>8s} {'Rand-init':>10s} {'diff':>9s}"
+          f" {'wins':>8s} {'p':>8s}")
     base = None
     for n in names:
         a = np.array([r["DSSL"][n] for r in rows], float)
@@ -87,12 +84,32 @@ def aggregate(run_dir):
         ok = ~np.isnan(d)
         if base is None:
             base = d[ok].mean()
-        print(f"  {n:22s} {np.nanmean(a):8.4f} {np.nanmean(b):10.4f} {d[ok].mean():+9.4f}"
-              f" {int((d[ok] > 0).sum()):4d}/{int(ok.sum())} {sign_p(d[ok]):8.4f}")
+        k, m, pv = sign_summary(d)
+        print(f"  {n:22s} {dims.get(n, 0):6d} {np.nanmean(a):8.4f} {np.nanmean(b):10.4f}"
+              f" {d[ok].mean():+9.4f} {k:4d}/{m} {pv:8.4f}")
     print()
     print("  The column that matters is `diff`. If it GROWS as the readout opens, the")
     print("  objective organised something across time that the mean pool was discarding.")
     print(f"  At the shipped readout it is {base:+.4f}.")
+
+    # A SECOND question, which the diff column cannot answer: is any readout better than the
+    # shipped one in absolute terms, for both arms alike? Reading that off the means is the
+    # mistake this file already warns about, so it is paired per variant here.
+    print()
+    print("  and separately -- each readout against the shipped one, paired per variant")
+    print()
+    print(f"  {'readout':22s} {'DSSL':>18s} {'Random-init':>18s}")
+    print(f"  {'':22s} {'delta  wins    p':>18s} {'delta  wins    p':>18s}")
+    for n in names:
+        if n == "PRODUCTION":
+            continue
+        cells = []
+        for arm in ("DSSL", "Random-init"):
+            d = np.array([r[arm][n] - r[arm]["PRODUCTION"] for r in rows], float)
+            d = d[~np.isnan(d)]
+            k, m, pv = sign_summary(d)
+            cells.append(f"{d.mean():+.4f} {k:3d}/{m} {pv:.4f}")
+        print(f"  {n:22s} {cells[0]:>18s} {cells[1]:>18s}")
     out = {"n_variants": len(rows),
            "diff": {n: float(np.nanmean([r["DSSL"][n] - r["Random-init"][n] for r in rows]))
                     for n in names}}
@@ -117,9 +134,22 @@ def main():
     ap.add_argument("--variant-dir")
     ap.add_argument("--aggregate", metavar="RUN_DIR")
     ap.add_argument("--cache-dir", default=None)
+    ap.add_argument("--widths", metavar="VARIANT_DIR",
+                    help="print each readout's width from a four-window forward pass and "
+                         "stop. Cheap enough to answer 'is that gain just dimensions?' "
+                         "without re-running the sweep.")
     a = ap.parse_args()
     if a.aggregate:
         aggregate(a.aggregate)
+        return
+    if a.widths:
+        from readout_sweep import readout_parts
+        from tasks._experiment_common import load_context, random_init_model
+        ctx = load_context(a.widths, a.cache_dir, gpu=-1)
+        m = ctx.model if getattr(ctx, "trained", True) else random_init_model(ctx)
+        parts = readout_parts(m, ctx.X[:4], ctx.cfg.get("season_pool") or "spec", batch=4)
+        for k, v in arms(parts).items():
+            print(f"  {k:22s} {v.shape[1]:6d}")
         return
     if not a.variant_dir:
         ap.error("one of --variant-dir or --aggregate is required")
@@ -137,7 +167,13 @@ def main():
     for tag, model in (("DSSL", ctx.model), ("Random-init", random_init_model(ctx))):
         parts = readout_parts(model, ctx.X, sp)
         res[tag] = {}
-        for name, F in arms(parts).items():
+        built = arms(parts)
+        # Widths belong in the record. A sweep of the raw projection over 16..1760 dims
+        # spans 0.6865 to 0.7198 on HRD, so two readouts of different width are not
+        # comparable on score alone, and an earlier version of this file compared them
+        # anyway because it never wrote the numbers down.
+        res["dims"] = {k: int(v.shape[1]) for k, v in built.items()}
+        for name, F in built.items():
             res[tag][name] = window_auc(F, ctx)
         print(f"  {tag}: " + "  ".join(f"{k}={v:.3f}" for k, v in res[tag].items()),
               flush=True)

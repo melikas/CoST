@@ -6,9 +6,13 @@ over a different set of people than the arm beside it, and the two cannot be com
 import csv
 import glob
 import sys
+from pathlib import Path
 from collections import defaultdict
 
 import numpy as np
+
+sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
+from tasks.sign_test import sign_summary
 
 pat = sys.argv[1] if len(sys.argv) > 1 else "results_globem/*/*/RQ3/rq3_utility.csv"
 files = sorted(glob.glob(pat))
@@ -60,16 +64,6 @@ print("""
 
 
 
-def sign_p(d):
-    """Two-sided sign test. With 96 paired variant dirs a 0.001 gap is not a result until
-    something says how often it holds, and the mean alone never will."""
-    from math import comb
-    n = len(d)
-    k = int((d > 0).sum())
-    tail = sum(comb(n, i) for i in range(min(k, n - k) + 1))
-    return min(1.0, 2 * tail / 2 ** n)
-
-
 CONTRASTS = [
     # the only one that says whether the LEARNED half contributes: the two arms differ in
     # the V block and in nothing else
@@ -92,5 +86,5 @@ for a_name, b_name in CONTRASTS:
         continue
     d = np.array([pair[a_name][f] - pair[b_name][f] for f in shared], float)
     d = d[~np.isnan(d)]
-    print(f"  {a_name + ' - ' + b_name:58s} {d.mean():+8.4f}"
-          f" {int((d > 0).sum()):4d}/{len(d)} {sign_p(d):8.4f}")
+    k, m, pv = sign_summary(d)
+    print(f"  {a_name + ' - ' + b_name:58s} {d.mean():+8.4f} {k:4d}/{m} {pv:8.4f}")
