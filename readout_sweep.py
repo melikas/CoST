@@ -34,22 +34,7 @@ from pathlib import Path
 import numpy as np
 
 SEGS = [1, 2, 4, 7, 14, 28]
-WIDTH = 320             # the common width EVERY arm is projected to
-
-
-def _project(F, seed, width=WIDTH):
-    """Every arm through the same Gaussian map to the same width -- including the ones
-    already narrower than it, which get a random rotation rather than being left alone.
-
-    The first version of this projected only the arms wider than the target and left the
-    rest untouched, which put two different treatments in one table: seg 1/2/4 kept their
-    exact features while seg 7/14/28 were projected, and the arms compared across that line.
-    Width itself is not what moves these numbers -- a sweep of the raw projection over
-    16..1760 dims spans 0.6865 to 0.7198 with no trend -- but the treatment has to be the
-    same for every row or the column is not a comparison."""
-    rng = np.random.default_rng(seed)
-    W = rng.normal(0, 1.0 / np.sqrt(width), (F.shape[1], width))
-    return (F @ W).astype(np.float32)
+WIDTH = 1760            # the raw-projection reference, at the production readout's width
 
 
 def segment_readouts(npz, seed, cache_dir, batch=64, threads=None):
@@ -115,7 +100,7 @@ def main():
     from random_init_audit import _probe_auc, raw_projection
 
     seeds = [int(s) for s in np.load(a.npz, allow_pickle=True)["seeds"]]
-    rows = []
+    rows, dims = [], {}
     for es in seeds[:a.encoder_seeds]:
         parts, ctx0 = segment_readouts(a.npz, es, a.cache_dir, threads=a.threads)
         # Two families. A varies the time resolution of BOTH halves; B is the minimal
@@ -129,8 +114,16 @@ def main():
                 [parts[f"trend {k}"], parts[f"season {k}"]], axis=1)
             feats[f"B trend {k} + spec"] = np.concatenate(
                 [parts[f"trend {k}"], parts["season spec"]], axis=1)
-        feats = {k: _project(v, es) for k, v in feats.items()}
+        # NOT forced to a common width. Doing that looked like the fair move and is not:
+        # taking the 1760-dim production readout down to 320 costs it 0.066 (0.6779 ->
+        # 0.6118), so the projection is a treatment of its own rather than a neutral
+        # rescaling, and every row would be scored through a step no candidate design has.
+        # Each readout is measured at the width it would ship at, printed beside it. Width
+        # alone does not drive these numbers: a sweep of the raw projection over 16..1760
+        # dims spans 0.6865 to 0.7198 with no trend in between.
+        dims.update({k: v.shape[1] for k, v in feats.items()})
         feats["raw projection"] = raw_projection(ctx0.X, ctx0.n_sensors, WIDTH, es)
+        dims["raw projection"] = WIDTH
         for ss in seeds:
             ctx = local_context(a.npz, ss)
             r = {"encoder_seed": es, "split_seed": ss}
@@ -144,15 +137,22 @@ def main():
                           for k in ("PRODUCTION (trend mean + season spec)",
                                     "raw projection")), flush=True)
 
+    report(rows, dims)
+
+
+def report(rows, dims):
+    ref = "PRODUCTION (trend mean + season spec)"
     names = [k for k in rows[0] if not k.endswith("_seed")]
-    print(f"\n  {len(rows)} measurements, HRD, same probe and splits."
-          f"  'seg 1' IS the production readout.\n")
-    print(f"  {'readout':20s} {'AUC':>7s} {'vs seg 1':>10s} {'wins':>8s}")
-    base = np.array([r["seg  1"] for r in rows], float)
+    base = np.array([r[ref] for r in rows], float)
+    print()
+    print(f"  {len(rows)} measurements, HRD, same probe and splits,"
+          f" each readout at the width it would ship at")
+    print()
+    print(f"  {'readout':34s} {'dim':>6s} {'AUC':>8s} {'vs production':>14s} {'wins':>8s}")
     for n in names:
         v = np.array([r[n] for r in rows], float)
-        print(f"  {n:34s} {np.nanmean(v):7.4f} {np.nanmean(v - base):+14.4f} "
-              f"{int(np.nansum(v - base > 0)):4d}/{len(rows)}")
+        print(f"  {n:34s} {dims.get(n, 0):6d} {np.nanmean(v):8.4f}"
+              f" {np.nanmean(v - base):+14.4f} {int(np.nansum(v - base > 0)):4d}/{len(rows)}")
 
 
 if __name__ == "__main__":
