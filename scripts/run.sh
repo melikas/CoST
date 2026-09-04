@@ -472,7 +472,17 @@ case " $ABLATE " in
     [ -n "$_sp" ] && [ "$_sp" != "spec" ] && SP_TAG="_sp-${_sp}"
     ;;
 esac
-VARIANT_DIR="$OUTPUT_DIR/$RUN_ID/${BACKBONE}_${PE}${DIS_TAG}${SEED_TAG}${CLOCK_TAG}${SP_TAG}"
+# V^N, mirrored from train_hrd.py's nw_tag. Two sweeps differing only in this weight would
+# otherwise write into one variant directory and overwrite each other.
+NW_TAG=""
+case " $ABLATE " in
+  *" --noise-weight "*)
+    _rest="${ABLATE#*--noise-weight }"
+    _nw="${_rest%% *}"
+    [ -n "$_nw" ] && [ "$_nw" != "0" ] && [ "$_nw" != "0.0" ] && NW_TAG="_nw${_nw}"
+    ;;
+esac
+VARIANT_DIR="$OUTPUT_DIR/$RUN_ID/${BACKBONE}_${PE}${DIS_TAG}${SEED_TAG}${CLOCK_TAG}${SP_TAG}${NW_TAG}"
 CACHE_DIR="${SLURM_TMPDIR:-/tmp}/hrd_cache"; mkdir -p "$CACHE_DIR"
 
 # RQ1 runs on every variant -- it IS the PE sweep. RQ2/RQ3 run on a PRE-DECLARED pair only

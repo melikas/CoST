@@ -772,6 +772,16 @@ class CoST:
         self._n_exact_tail = 2 if pe in CALENDAR_PES else 0
         self.bins_per_day = int(bins_per_day)   # used by the seasonal spectral readout
 
+        # GradNorm balances exactly two losses: _gradnorm_step unpacks
+        # `L_t, L_s = cost(..., return_parts=True)`, so a third term would be built, read at
+        # inference, and never trained -- silently, and the run would report a V^N model
+        # whose branch had never seen a gradient. Balancing three losses is a design change
+        # that has not been validated, so this refuses the combination instead of guessing.
+        if noise_weight and loss_balance == "gradnorm":
+            raise ValueError(
+                "noise_weight>0 with loss_balance='gradnorm' would train V^T and V^S only "
+                "and leave V^N untrained while still reading it. Use --loss-balance fixed.")
+
         if kernels is None:
             kernels = []
 

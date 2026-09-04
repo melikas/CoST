@@ -1143,12 +1143,17 @@ def main():
     # Tag only non-default seasonal readouts, so the 'same' (MESOR-only) ablation cannot
     # overwrite the default 'spec' run of the same variant.
     sp_tag = "" if args.season_pool == "spec" else f"_sp-{args.season_pool}"
+    # V^N. Without a tag, two sweeps differing only in this weight write into the same
+    # variant directory and silently overwrite each other -- the same class of failure as
+    # the missing sp_tag, which cost run 2074341 its entire RQ suite. scripts/run.sh
+    # mirrors this, and a shell test asserts the two agree.
+    nw_tag = "" if not args.noise_weight else f"_nw{args.noise_weight:g}"
     # Crossed runs need distinct folders, but the common case (one seed for both) must keep
     # producing the historical `_seed<n>` name so archived result paths stay valid.
     seed_tag = (f"_seed{model_seed}" if split_seed == model_seed
                 else f"_seed{model_seed}_split{split_seed}")
     variant_dir = (out_dir / run_id /
-                   f"{args.backbone}_{args.pe}{dis_tag}{seed_tag}{clock_tag}{sp_tag}")
+                   f"{args.backbone}_{args.pe}{dis_tag}{seed_tag}{clock_tag}{sp_tag}{nw_tag}")
     variant_dir.mkdir(parents=True, exist_ok=True)
     result = {
         "backbone": args.backbone,
@@ -1275,7 +1280,7 @@ def main():
             # reports no error. Making the directory name unique means the two trees can be
             # merged, moved or mis-copied without any file ever colliding.
             e_out = (Path(args.energy_output_dir) / run_id /
-                     f"{args.backbone}_{args.pe}{dis_tag}{seed_tag}{clock_tag}{sp_tag}_energy")
+                     f"{args.backbone}_{args.pe}{dis_tag}{seed_tag}{clock_tag}{sp_tag}{nw_tag}_energy")
             mode_desc = ("**Mode B (sliding), encoder REUSED from the depression run**: one "
                          "trailing 7-day window per labelled day ([D-6, D] -> EE(D)); test = the "
                          "participants already held out of pretraining, so leakage-free.")

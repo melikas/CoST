@@ -86,3 +86,53 @@ def test_a_random_init_control_gets_the_same_architecture():
     c = random_init_model(dict(CFG, noise_weight=0.1, noise_depth=3, model_seed=0),
                           X, 3, "cpu", 0)
     assert c.net.noise_branch is True
+
+
+def _tiny_fit(noise_weight, iters=6):
+    """Actually train, briefly, and report how far each branch's weights moved."""
+    import copy
+    m = model(noise_weight=noise_weight, noise_depth=2, batch_size=8, max_train_length=192)
+    before = copy.deepcopy(m.net.state_dict())
+    rng = np.random.default_rng(0)
+    t = np.arange(192)
+    # a rhythm the trend/seasonal branches can hold, plus a residual only V^N can
+    X = (np.sin(2 * np.pi * t / 96)[None, :, None]
+         + rng.normal(0, 0.4, (24, 192, 3))).astype(np.float32)
+    np.random.seed(0)
+    torch.manual_seed(0)
+    m.fit(X, n_iters=iters, verbose=False)
+    after = m.net.state_dict()
+    moved = lambda pre: max(
+        (float((after[k] - before[k]).abs().max()) for k in after if k.startswith(pre)),
+        default=0.0)
+    return moved("noise_"), moved("feature_extractor."), m
+
+
+def test_training_actually_reaches_the_noise_branch():
+    """The failure this guards against is silent: a branch that is built and read at
+    inference but never receives a gradient would still produce a full table of numbers."""
+    n_moved, backbone_moved, _ = _tiny_fit(0.3)
+    assert backbone_moved > 0, "nothing trained at all"
+    assert n_moved > 1e-6, "V^N was built and read but never trained"
+
+
+def test_the_branch_is_untouched_when_its_weight_is_zero():
+    m = model(noise_weight=0.0, noise_branch=True, noise_depth=2,
+              batch_size=8, max_train_length=192)
+    import copy
+    before = copy.deepcopy(m.net.state_dict())
+    rng = np.random.default_rng(0)
+    X = rng.normal(0, 1, (24, 192, 3)).astype(np.float32)
+    np.random.seed(0); torch.manual_seed(0)
+    m.fit(X, n_iters=4, verbose=False)
+    after = m.net.state_dict()
+    moved = max((float((after[k] - before[k]).abs().max())
+                 for k in after if k.startswith("noise_")), default=0.0)
+    assert moved == 0.0, "a zero weight still moved the branch"
+
+
+def test_gradnorm_with_a_noise_weight_is_refused_not_silently_dropped():
+    """_gradnorm_step unpacks two losses, so a third would be built, read, and never
+    trained -- the exact silent failure the test above exists for."""
+    with pytest.raises(ValueError, match="gradnorm"):
+        model(noise_weight=0.3, noise_depth=2, loss_balance="gradnorm")
