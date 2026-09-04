@@ -28,6 +28,7 @@ from sklearn.metrics import roc_auc_score
 
 from baselines.cosinor import paper_cosinor_features
 from structured_rhythm import structured_features
+from random_init_audit import raw_projection
 from baselines.plain_ssl import encode_plain, plain_ssl_encoder
 from baselines.supervised import supervised_baseline_row
 from tasks._eval_protocols import (fast_auc, fit_persubject_probe,
@@ -65,6 +66,34 @@ def fit_probe(feat, ctx, a):
          else fit_persubject_probe)
     return f(feat, ctx.pids, ctx.y, ctx.train_mask, ctx.val_mask, ctx.seed,
              c_grid=a.probe_c, families=tuple(a.probe_family))
+
+
+def combined_rungs(ladder, V, skip):
+    """The concatenated arms, plus the control that makes them readable.
+
+    Every block here is one row per WINDOW, which is what lets them be concatenated at all --
+    `paper_cosinor_features` returns a per-window matrix even though it fits one cosinor per
+    subject. That is asserted rather than assumed: a block that arrived per-subject would
+    still concatenate against a per-subject arm and produce a plausible, meaningless number.
+    """
+    out = {"Raw skip only": np.asarray(skip, dtype=np.float32)}
+    rhythm = [ladder[k] for k in ("Cosinor (paper)", "Structured rhythm") if k in ladder]
+    if not rhythm:
+        return out
+    n = len(V)
+    for name, b in [("V", V), ("skip", skip), ("Random-init", ladder["Random-init"])] + [
+            (f"rhythm[{i}]", b) for i, b in enumerate(rhythm)]:
+        if len(b) != n:
+            raise ValueError(f"combined rung: block '{name}' has {len(b)} rows, not {n}"
+                             " -- the blocks are not all per-window and must not be joined")
+
+    def cat(*blocks):
+        return np.concatenate([np.asarray(b, dtype=np.float32) for b in blocks], axis=1)
+
+    out["DSSL + rhythm"] = cat(V, *rhythm)
+    out["DSSL + rhythm + raw skip"] = cat(V, *rhythm, skip)
+    out["Random-init + rhythm + raw skip"] = cat(ladder["Random-init"], *rhythm, skip)
+    return out
 
 
 def score(clf, feat, ctx, mask=None, unit="participant"):
@@ -219,6 +248,23 @@ def main():
                                   cache_path=rq_path(ctx.variant_dir, "plain_encoder.pt"))
         ladder["DSSL plain (no disentangle)"] = encode_plain(plain, ctx.X, ctx.cfg)
     ladder["DSSL (frozen)"] = V
+
+    # COMBINED rungs. Every arm above is scored alone, and the two datasets disagree about
+    # which one wins -- on GLOBEM the explicit rhythm parameterisations come first and the
+    # learned features fourth, on HRD the order is different -- which is what "they carry
+    # different information" looks like from outside. Nothing has ever put them together.
+    #
+    # The raw skip is here for a measured reason: on HRD a random projection of the raw
+    # window beats the encoder readout by 0.048 at random init, and concatenating the two
+    # (seg 4 + skip, 0.7263) beat every single arm in the project. Standardisation is not a
+    # worry -- make_probe puts a StandardScaler first, so each block is scaled per column.
+    #
+    # The Random-init combination is the CONTROL, and the reason to trust or discard the
+    # other two: without it a winning combined rung says nothing about whether the learned
+    # half contributed, since rhythm+skip alone might carry all of it.
+    ladder.update(combined_rungs(
+        ladder, V, raw_projection(ctx.X, ctx.n_sensors, int(V.shape[1]), ctx.seed)))
+
     rows, probs = [], {}
     maj = float(ctx.y[ctx.train_mask & ctx.last_mask].mean())
 
