@@ -1207,7 +1207,29 @@ class CoST:
                 return z.max(dim=1).values
             if pool == "meanmax":
                 return torch.cat([z.mean(dim=1), z.max(dim=1).values], dim=-1)
-            raise ValueError(f"unknown pool '{pool}' (use last/mean/max/meanmax)")
+            if pool.startswith("seg"):
+                # 'segN' -- the mean within each of N equal time segments, concatenated.
+                # 'seg1' IS 'mean', so this is a strict generalisation of the default and
+                # nothing that ran before behaves differently.
+                #
+                # Measured on GLOBEM LODO, 4 folds x 24 seeds, paired per variant against
+                # the shipped readout ('mean' + a spectral seasonal half):
+                #
+                #   pool=seg2, season_pool=same   +0.0183 +0.0280 +0.0236 +0.0150
+                #                                  20/24   20/24   18/24   19/24
+                #                                  p=.0015 p=.0015 p=.0227 p=.0066
+                #
+                # significant in all four folds, and for the untrained control too -- so it
+                # is a better readout, not evidence of anything learned. Note it is also
+                # NARROWER: 4 x component_dims against the shipped 7 x, because GLOBEM's
+                # 112-step window resolves only three of the harmonic bands.
+                n = int(pool[3:])
+                if n < 1 or n > z.size(1):
+                    raise ValueError(f"pool '{pool}' wants {n} segments of a "
+                                     f"{z.size(1)}-step window")
+                w = z.size(1) // n
+                return z[:, :n * w].reshape(z.size(0), n, w, z.size(2)).mean(dim=2)                                    .reshape(z.size(0), -1)
+            raise ValueError(f"unknown pool '{pool}' (use last/mean/max/meanmax/segN)")
         # plain: single representation (out_s is None). disentangled: [trend ; seasonal].
         if out_s is None:
             out = collapse(out_t)

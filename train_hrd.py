@@ -19,6 +19,8 @@ import os
 import time
 from pathlib import Path
 
+import re
+
 import numpy as np
 import torch
 
@@ -44,6 +46,22 @@ from utils import init_dl_program, stratified_pid_holdout
 # ---------------------------------------------------------------------------
 # helpers
 # ---------------------------------------------------------------------------
+
+
+def _pool_arg(v):
+    """`--pool` accepts the four fixed names plus segN for any positive N.
+
+    argparse `choices` cannot express that, and dropping the check altogether would let a
+    typo reach cost.py, which raises only once a readout is actually collapsed -- after the
+    pretraining it was meant to guard.
+    """
+    import argparse
+    if v in ("last", "mean", "max", "meanmax"):
+        return v
+    if re.fullmatch(r"seg[1-9][0-9]*", v):
+        return v
+    raise argparse.ArgumentTypeError(
+        f"invalid pool {v!r}: use last, mean, max, meanmax, or segN (e.g. seg2)")
 
 
 def balanced_pid_holdout(unique_pids, pid_label, n_per_class, seed):
@@ -464,11 +482,18 @@ def parse_args():
     p.add_argument("--repr-dims", type=int, default=320)
     p.add_argument("--hidden-dims", type=int, default=64)
     p.add_argument("--depth", type=int, default=10)
-    p.add_argument("--pool", choices=["last", "mean", "max", "meanmax"], default="mean",
+    p.add_argument("--pool", type=_pool_arg, default="mean",
+                   metavar="{last,mean,max,meanmax,segN}",
                    help="How the frozen representation is collapsed over the 7-day window "
                         "before the linear probe: 'mean' (default) / 'max' summarise the WHOLE "
                         "window; 'last' = final timestep only (original CoST forecasting "
-                        "readout); 'meanmax' = mean+max concatenated.")
+                        "readout); 'meanmax' = mean+max concatenated; 'segN' averages within "
+                        "each of N equal time segments and concatenates, so 'seg1' IS 'mean'. "
+                        "Pair segN with --season-pool same to apply it to both halves: that "
+                        "beat the shipped readout in all four GLOBEM LODO folds "
+                        "(seg2: +0.018 to +0.028, p<=0.023 paired per variant), for the "
+                        "untrained control as well, so it is a better readout rather than "
+                        "evidence of anything learned.")
     p.add_argument("--season-pool",
                    choices=["spec", "spec_band", "spec_amp", "spec_phase", "same"],
                    default="spec",

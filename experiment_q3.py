@@ -182,6 +182,18 @@ def main():
                         "comparable to their published 0.547. A LODO fold holds 136-217 "
                         "participants but 1287-2025 labelled windows, so the two units are "
                         "not one number measured twice; they are different tasks.")
+    p.add_argument("--pool", default=None, metavar="{mean,segN,...}",
+                   help="Override the readout every encoder arm is collapsed with, without "
+                        "retraining anything: the weights are unchanged and only the way "
+                        "their per-timestep output is summarised moves. Pair with "
+                        "--season-pool same to apply it to the seasonal half too. "
+                        "'seg2 + same' beat the shipped readout in all four GLOBEM LODO "
+                        "folds, paired per variant (+0.018 to +0.028, p<=0.023) -- and for "
+                        "the untrained control as well, so it is a better readout and not "
+                        "evidence of anything learned. Default: whatever the run trained.")
+    p.add_argument("--season-pool", default=None,
+                   choices=["spec", "spec_band", "spec_amp", "spec_phase", "same"],
+                   help="Override the seasonal half's readout. See --pool.")
     p.add_argument("--n-boot", type=int, default=2000)
     p.add_argument("--no-plain-ssl", action="store_true",
                    help="Drop the non-disentangled SSL rung. It is the ONLY baseline that "
@@ -208,6 +220,17 @@ def main():
     _, sig = harmonic_reference(Xs, 24 * 60.0 / ctx.bin_minutes)
     res = {"variant": ctx.tag, "seed": ctx.seed}
 
+    # The readout override lands on ctx.cfg, so EVERY encoder arm -- DSSL, its random-init
+    # control, the plain-SSL twin -- is collapsed the same way. Overriding it at one call
+    # site would compare a new readout against arms still using the old one.
+    if a.pool or a.season_pool:
+        ctx.cfg = dict(ctx.cfg)
+        if a.pool:
+            ctx.cfg["pool"] = a.pool
+        if a.season_pool:
+            ctx.cfg["season_pool"] = a.season_pool
+        print(f"[rq3] readout override: pool={ctx.cfg['pool']} "
+              f"season_pool={ctx.cfg.get('season_pool')}")
     V = encode(ctx.model, ctx.X, ctx.cfg)
     # [V^(T) ; V^(S)]. The trend half is always component_dims wide; the seasonal half is NOT
     # the same width once season_pool='spec' (the run default), where it is the spectral
