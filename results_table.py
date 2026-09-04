@@ -1,0 +1,282 @@
+"""Every measurement this project has made, as one CSV.
+
+The numbers live here rather than being scraped because they came from three places -- local
+JSONs, cluster runs whose artifacts are on Narval, and aggregations printed once into a
+session -- and a table that silently mixed them would be the same failure the RQ3 aggregator
+already hit. Every row therefore carries `source`, and `reproduce` says what would regenerate
+it. A row with no source is not allowed in.
+
+    python results_table.py            -> results_summary.csv
+"""
+import csv
+import sys
+
+FIELDS = ["experiment", "dataset", "protocol", "n_units", "arm", "metric", "value",
+          "vs", "delta", "wins", "p", "verdict", "source", "reproduce"]
+
+# ---------------------------------------------------------------------------------------
+# Each tuple is one row. `value` is the arm's own score; `delta`/`wins`/`p` are filled only
+# where the contrast was actually computed as a PAIRED test, never inferred by subtracting
+# two means -- that distinction cost this project two wrong conclusions.
+# ---------------------------------------------------------------------------------------
+ROWS = [
+    # === validity checks =================================================================
+    ("leak check", "HRD", "24 seeds, participant holdout", 24, "permuted-label null",
+     "AUROC", 0.4967, "chance 0.500", "", "0/24", 0.0015, "no leak",
+     "session, random_init_audit.py", "python random_init_audit.py --aggregate <run>"),
+
+    # === RQ1: does pretraining build rhythm structure? ====================================
+    ("RQ1 structure", "HRD", "24 seeds", 24, "trend stability tau, random-init",
+     "tau", 0.6830, "", "", "", "", "", "session, rhythm_stability.py", ""),
+    ("RQ1 structure", "HRD", "24 seeds", 24, "trend stability tau, DSSL",
+     "tau", 0.5294, "random-init", -0.1536, "0/24", "", "training DEGRADES it",
+     "session, rhythm_stability.py", ""),
+    ("RQ1 structure", "HRD", "24 seeds", 24, "seasonal stability sigma, random-init",
+     "sigma", 0.9314, "", "", "", "", "", "session, rhythm_stability.py", ""),
+    ("RQ1 structure", "HRD", "24 seeds", 24, "seasonal stability sigma, DSSL",
+     "sigma", 0.8959, "random-init", -0.0355, "2/24", "", "training DEGRADES it",
+     "session, rhythm_stability.py", ""),
+    ("RQ1 structure", "HRD", "24 seeds", 24, "daily phase concentration R, random-init",
+     "R", 0.5636, "", "", "", "", "", "session, rhythm_stability.py", ""),
+    ("RQ1 structure", "HRD", "24 seeds", 24, "daily phase concentration R, DSSL",
+     "R", 0.4766, "random-init", -0.0870, "0/24", 1.2e-05, "training DEGRADES it",
+     "session, rhythm_stability.py", ""),
+
+    # === the ladder, HRD ==================================================================
+    ("ladder", "HRD", "24 seeds, participant holdout", 24, "random forest on raw",
+     "AUROC", 0.7310, "", "", "", "", "", "session, fast_audit.py", ""),
+    ("ladder", "HRD", "24 seeds, participant holdout", 24, "raw random projection (512)",
+     "AUROC", 0.7198, "", "", "", "", "", "width_sweep, session", ""),
+    ("ladder", "HRD", "24 seeds, participant holdout", 24, "raw window (2016 dims)",
+     "AUROC", 0.6997, "", "", "", "", "", "dispersion_ceiling.json", ""),
+    ("ladder", "HRD", "24 seeds, participant holdout", 24, "residual window",
+     "AUROC", 0.7028, "", "", "", "", "", "dispersion_ceiling.json", ""),
+    ("ladder", "HRD", "24 seeds, participant holdout", 24, "Random-init encoder",
+     "AUROC", 0.6874, "", "", "", "", "", "run 2224103", ""),
+    ("ladder", "HRD", "24 seeds, participant holdout", 24, "DSSL (frozen)",
+     "AUROC", 0.6790, "Random-init", -0.0083, "10/24", "", "no separation",
+     "run 2224103", ""),
+    ("ladder", "HRD", "24 seeds, participant holdout", 24, "Cosinor (paper)",
+     "AUROC", 0.6579, "", "", "", "", "", "run 2224103", ""),
+    ("ladder", "HRD", "24 seeds, participant holdout", 24, "Supervised (end-to-end)",
+     "AUROC", 0.6609, "", "", "", "", "", "run 2224103", ""),
+    ("ladder", "HRD", "24 seeds, participant holdout", 24, "Handcrafted (mean/std)",
+     "AUROC", 0.4901, "", "", "", "", "", "session", ""),
+
+    # === where the deficit is =============================================================
+    ("architecture loss", "HRD", "4 encoder draws x 24 splits", 96,
+     "raw projection (1760)", "AUROC", 0.7221, "", "", "", "", "",
+     "architecture_loss.json", "python architecture_loss.py --npz hrd_2224103.npz"),
+    ("architecture loss", "HRD", "4 encoder draws x 24 splits", 96,
+     "random-init encoder", "AUROC", 0.6779, "raw projection", -0.0442, "25/96", 2.9e-06,
+     "the ARCHITECTURE loses it, before any training",
+     "architecture_loss.json", "python architecture_loss.py --npz hrd_2224103.npz"),
+    ("architecture loss", "HRD", "4 encoder draws x 24 splits", 96,
+     "encoder trend half", "AUROC", 0.6697, "raw projection", -0.0524, "21/96", "",
+     "both halves lose alike", "architecture_loss.json", ""),
+    ("architecture loss", "HRD", "4 encoder draws x 24 splits", 96,
+     "encoder seasonal half", "AUROC", 0.6666, "raw projection", -0.0555, "19/96", "",
+     "both halves lose alike", "architecture_loss.json", ""),
+
+    # === readout =========================================================================
+    ("readout truncation", "HRD", "24 seeds", 24, "full window", "AUROC", 0.7123,
+     "", "", "", "", "", "cost.py docstring, session", ""),
+    ("readout truncation", "HRD", "24 seeds", 24, "amp+phase, bins 1..T/8", "AUROC", 0.7118,
+     "full window", -0.0005, "13/24", "", "", "cost.py docstring, session", ""),
+    ("readout truncation", "HRD", "24 seeds", 24, "amp+phase, bins 1..4D", "AUROC", 0.6838,
+     "full window", -0.0285, "9/24", "", "", "cost.py docstring, session", ""),
+    ("readout truncation", "HRD", "24 seeds", 24, "amp+phase, five harmonics (SHIPPED)",
+     "AUROC", 0.6622, "full window", -0.0502, "6/24", "", "the shipped readout is the worst",
+     "cost.py docstring, session", ""),
+    ("readout truncation", "HRD", "24 seeds", 24, "amp+phase, every bin", "AUROC", 0.6411,
+     "full window", -0.0712, "4/24", "", "more is not better; there is an optimum",
+     "cost.py docstring, session", ""),
+
+    ("readout width", "HRD", "24 seeds", 24, "raw projection, 16 dims", "AUROC", 0.6865,
+     "", "", "", "", "", "session, width sweep", ""),
+    ("readout width", "HRD", "24 seeds", 24, "raw projection, 256 dims", "AUROC", 0.7122,
+     "", "", "", "", "", "session, width sweep", ""),
+    ("readout width", "HRD", "24 seeds", 24, "raw projection, 512 dims", "AUROC", 0.7198,
+     "1760 dims", 0.0075, "14/24", "", "width is NOT a lever", "session, width sweep", ""),
+    ("readout width", "HRD", "24 seeds", 24, "raw projection, 1760 dims", "AUROC", 0.7123,
+     "", "", "", "", "", "session, width sweep", ""),
+
+    ("readout sweep", "HRD", "3 encoder draws x 24 splits", 72, "PRODUCTION (shipped)",
+     "AUROC", 0.6761, "", "", "", "", "", "readout_sweep.json",
+     "python readout_sweep.py --npz hrd_2224103.npz"),
+    ("readout sweep", "HRD", "3 encoder draws x 24 splits", 72, "both seg 4",
+     "AUROC", 0.7089, "PRODUCTION", 0.0328, "46/72", 0.02,
+     "helps, but nothing in 1 of 3 encoder draws", "readout_sweep.json", ""),
+    ("readout sweep", "HRD", "3 encoder draws x 24 splits", 72, "raw projection",
+     "AUROC", 0.7243, "PRODUCTION", 0.0482, "54/72", 1e-04, "", "readout_sweep.json", ""),
+    ("readout sweep", "HRD", "3 encoder draws x 24 splits", 72, "PRODUCTION + raw skip",
+     "AUROC", 0.7028, "raw projection alone", -0.0215, "", "",
+     "the encoder readout DILUTES the raw signal", "session", ""),
+    ("readout sweep", "HRD", "3 encoder draws x 24 splits", 72, "seg 4 + raw skip",
+     "AUROC", 0.7263, "raw projection alone", 0.0020, "54/72", "",
+     "the encoder adds ~nothing on top of a random projection", "session", ""),
+
+    # === rejected hypotheses ==============================================================
+    ("dispersion hypothesis", "HRD", "24 seeds", 24, "raw projection", "AUROC", 0.7141,
+     "", "", "", "", "", "dispersion_ceiling.json",
+     "python dispersion_ceiling.py --npz hrd_2224103.npz"),
+    ("dispersion hypothesis", "HRD", "24 seeds", 24, "day features + projection",
+     "AUROC", 0.7090, "raw projection", -0.0051, "11/24", "", "adding dispersion HURTS",
+     "dispersion_ceiling.json", ""),
+    ("dispersion hypothesis", "HRD", "24 seeds", 24, "within-day spread (residual)",
+     "AUROC", 0.6289, "raw projection", -0.0853, "5/24", "", "REJECTED",
+     "dispersion_ceiling.json", ""),
+    ("dispersion hypothesis", "HRD", "24 seeds", 24, "day level (1st order only)",
+     "AUROC", 0.5293, "raw projection", -0.1848, "1/24", "", "first order carries nothing",
+     "dispersion_ceiling.json", ""),
+
+    ("missingness hypothesis", "HRD", "24 seeds", 24, "raw projection", "AUROC", 0.7198,
+     "", "", "", "", "", "cluster job 2395606",
+     "sbatch scripts/cpu_job.sh missingness_ceiling.py --npz hrd_2224103.npz"),
+    ("missingness hypothesis", "HRD", "24 seeds", 24, "missingness features (36 dims)",
+     "AUROC", 0.4550, "raw projection", -0.2648, "0/24", "",
+     "REJECTED; the model is not detecting adherence", "cluster job 2395606", ""),
+    ("missingness hypothesis", "HRD", "24 seeds", 24, "coverage only (4 dims)",
+     "AUROC", 0.4484, "raw projection", -0.2713, "0/24", "", "REJECTED",
+     "cluster job 2395606", ""),
+    ("missingness hypothesis", "HRD", "24 seeds", 24, "raw + missingness",
+     "AUROC", 0.6875, "raw projection", -0.0323, "1/24", "", "adding the mask HURTS",
+     "cluster job 2395606", ""),
+    ("missingness extent", "HRD", "3890 windows", 3890, "windows with any interpolated bin",
+     "fraction", 0.816, "", "", "", "", "widespread but shallow",
+     "cluster job 2395606", ""),
+    ("missingness extent", "HRD", "3890 windows", 3890, "mean missing fraction per channel",
+     "fraction", 0.0186, "", "", "", "", "too shallow to be the shortcut hypothesised",
+     "cluster job 2395606", ""),
+
+    # === V^N, the third branch ============================================================
+    ("V^N ceiling", "HRD", "24 seeds", 24, "residual, window-invariant",
+     "AUROC", 0.7202, "full signal", 0.0004, "11/24", 0.84,
+     "BUILD IT -- highest arm in the project", "noise_branch_ceiling.json",
+     "python noise_branch_ceiling.py --npz hrd_2224103.npz"),
+    ("V^N ceiling", "HRD", "24 seeds", 24, "full signal", "AUROC", 0.7198,
+     "", "", "", "", "", "noise_branch_ceiling.json", ""),
+    ("V^N ceiling", "HRD", "24 seeds", 24, "residual, unaugmented", "AUROC", 0.7117,
+     "", "", "", "", "", "noise_branch_ceiling.json", ""),
+    ("V^N ceiling", "HRD", "24 seeds", 24, "residual, participant-invariant",
+     "AUROC", 0.5856, "residual", -0.1260, "4/24", 0.0015,
+     "RULES OUT a participant-level positive pair", "noise_branch_ceiling.json", ""),
+
+    # === GLOBEM LODO ladder ===============================================================
+    ("GLOBEM ladder", "GLOBEM", "LODO, 4 folds x 24 seeds, window unit", 96,
+     "Random-init + rhythm + raw skip", "balanced acc", 0.5554, "Cosinor", 0.0071,
+     "60/96", 0.018, "the only contrast in the project that separated from zero",
+     "runs 2240054-57", "python scripts/rq3_globem_report.py"),
+    ("GLOBEM ladder", "GLOBEM", "LODO, 4 folds x 24 seeds, window unit", 96,
+     "DSSL + rhythm + raw skip", "balanced acc", 0.5543,
+     "Random-init + rhythm + raw skip", -0.0011, "43/96", 0.36,
+     "the learned half contributes nothing", "runs 2240054-57", ""),
+    ("GLOBEM ladder", "GLOBEM", "LODO, 4 folds x 24 seeds, window unit", 96,
+     "DSSL + rhythm", "balanced acc", 0.5518, "", "", "", "", "", "runs 2240054-57", ""),
+    ("GLOBEM ladder", "GLOBEM", "LODO, 4 folds x 24 seeds, window unit", 96,
+     "Cosinor (paper)", "balanced acc", 0.5483, "", "", "", "",
+     "best single arm", "runs 2240054-57", ""),
+    ("GLOBEM ladder", "GLOBEM", "LODO, 4 folds x 24 seeds, window unit", 96,
+     "Structured rhythm", "balanced acc", 0.5425, "", "", "", "", "",
+     "runs 2240054-57", ""),
+    ("GLOBEM ladder", "GLOBEM", "LODO, 4 folds x 24 seeds, window unit", 96,
+     "Raw skip only", "balanced acc", 0.5345, "", "", "", "",
+     "beats both encoders with no training at all", "runs 2240054-57", ""),
+    ("GLOBEM ladder", "GLOBEM", "LODO, 4 folds x 24 seeds, window unit", 96,
+     "DSSL (frozen)", "balanced acc", 0.5307, "Random-init", 0.0000, "49/96", 0.92,
+     "no separation", "runs 2240054-57", ""),
+    ("GLOBEM ladder", "GLOBEM", "LODO, 4 folds x 24 seeds, window unit", 96,
+     "Random-init", "balanced acc", 0.5307, "", "", "", "", "", "runs 2240054-57", ""),
+    ("GLOBEM ladder", "GLOBEM", "LODO, 4 folds x 24 seeds, window unit", 96,
+     "Supervised (end-to-end)", "balanced acc", 0.5244, "", "", "", "", "",
+     "runs 2240054-57", ""),
+    ("GLOBEM ladder", "GLOBEM", "LODO, 4 folds x 24 seeds, window unit", 96,
+     "SSL -> fine-tuned", "balanced acc", 0.5225, "Supervised (end-to-end)", -0.0019,
+     "", "", "pretraining does not help under fine-tuning either",
+     "runs 2240054-57", ""),
+    ("GLOBEM ladder", "GLOBEM", "LODO, 4 folds x 24 seeds, window unit", 96,
+     "Handcrafted (mean/std)", "balanced acc", 0.5109, "", "", "", "", "",
+     "runs 2240054-57", ""),
+    ("GLOBEM ladder", "GLOBEM", "LODO, 4 folds x 24 seeds, window unit", 96,
+     "SSL -> frozen + head", "balanced acc", 0.5056, "", "", "", "", "",
+     "runs 2240054-57", ""),
+
+    # === GLOBEM published benchmark =======================================================
+    ("published benchmark", "GLOBEM", "leave-one-dataset-out, window unit", "",
+     "Reorder (Xu et al.)", "balanced acc", 0.547, "", "", "", "",
+     "the number to beat; +/- 0.008", "GLOBEM paper", ""),
+    ("published benchmark", "GLOBEM", "cross-dataset", "", "Chikersal et al.",
+     "balanced acc", 0.536, "", "", "", "", "+/- 0.002", "GLOBEM paper", ""),
+    ("published benchmark", "GLOBEM", "-", "", "majority class", "balanced acc", 0.500,
+     "", "", "", "", "", "GLOBEM paper", ""),
+
+    # === readout interaction: does a TRAINED encoder gain more? ============================
+    ("readout interaction", "GLOBEM", "4 folds x 24 seeds", 96,
+     "DSSL minus Random-init at the shipped readout", "AUROC delta", 0.0041,
+     "", "", "", "", "", "runs 2240054-57",
+     "python readout_interaction.py --aggregate results_globem/<run>"),
+    ("readout interaction", "GLOBEM", "4 folds x 24 seeds", 96,
+     "DSSL minus Random-init at the best readout", "AUROC delta", 0.0069,
+     "shipped readout", 0.0028, "", "",
+     "REJECT in all 4 folds; the gate was 0.02", "runs 2240054-57", ""),
+    ("seg2 readout", "GLOBEM", "4 folds x 24 seeds, paired per variant", 96,
+     "DSSL (frozen), pool=seg2", "AUROC", "", "pool=mean", -0.0092, "33/96", 0.0029,
+     "REJECTED under the ladder's own probe", "runs 2240054-57",
+     "python scripts/compare_readouts.py rq3_utility_meanpool.csv"),
+    ("seg2 readout", "GLOBEM", "4 folds x 24 seeds, paired per variant", 96,
+     "Random-init, pool=seg2", "AUROC", "", "pool=mean", -0.0098, "34/96", 0.0056,
+     "REJECTED", "runs 2240054-57", ""),
+
+    # === k-fold, first partition ==========================================================
+    ("k-fold ladder", "HRD", "5-fold, every labelled participant, 1 partition", 152,
+     "Raw skip only", "AUROC", 0.7345, "", "", "", "",
+     "PRELIMINARY -- one partition", "kfold_eval.json",
+     "python kfold_eval.py --npz hrd_2224103.npz"),
+    ("k-fold ladder", "HRD", "5-fold, every labelled participant, 1 partition", 152,
+     "rhythm + raw skip", "AUROC", 0.7340, "Raw skip only", -0.0005, "", "",
+     "PRELIMINARY -- the combination adds nothing on HRD, unlike GLOBEM",
+     "kfold_eval.json", ""),
+    ("k-fold ladder", "HRD", "5-fold, every labelled participant, 1 partition", 152,
+     "Random-init + rhythm + raw skip", "AUROC", 0.7067, "rhythm + raw skip", -0.0273,
+     "", "", "PRELIMINARY -- the encoder output hurts", "kfold_eval.json", ""),
+    ("k-fold ladder", "HRD", "5-fold, every labelled participant, 1 partition", 152,
+     "Random-init", "AUROC", 0.6867, "", "", "", "", "PRELIMINARY", "kfold_eval.json", ""),
+    ("k-fold ladder", "HRD", "5-fold, every labelled participant, 1 partition", 152,
+     "Structured rhythm", "AUROC", 0.6453, "", "", "", "", "PRELIMINARY",
+     "kfold_eval.json", ""),
+    ("k-fold ladder", "HRD", "5-fold, every labelled participant, 1 partition", 152,
+     "Handcrafted (mean/std)", "AUROC", 0.4754, "", "", "", "",
+     "PRELIMINARY -- below chance", "kfold_eval.json", ""),
+
+    # === the bar ==========================================================================
+    ("required margin", "HRD", "24 seeds, holdout, Nadeau-Bengio corrected", 24,
+     "decisive win threshold", "AUROC delta", 0.10, "", "", "", "",
+     "set by 36 test participants and rho=0.46, not by any model", "session", ""),
+    ("required margin", "GLOBEM", "LODO, 4 folds x 24 seeds", 96,
+     "decisive win threshold", "balanced acc delta", 0.048, "", "", "", "",
+     "current best contrast is 0.0071", "session", ""),
+]
+
+
+def main():
+    out = sys.argv[1] if len(sys.argv) > 1 else "results_summary.csv"
+    with open(out, "w", newline="", encoding="utf-8") as f:
+        w = csv.writer(f)
+        w.writerow(FIELDS)
+        for r in ROWS:
+            if len(r) != len(FIELDS):
+                raise SystemExit(f"row has {len(r)} fields, expected {len(FIELDS)}: {r[:3]}")
+            if not r[FIELDS.index("source")]:
+                raise SystemExit(f"row with no source is not allowed: {r[:3]}")
+            w.writerow(r)
+    print(f"[saved] {out} -- {len(ROWS)} measurements")
+    seen = {}
+    for r in ROWS:
+        seen[r[0]] = seen.get(r[0], 0) + 1
+    print()
+    for k, v in seen.items():
+        print(f"  {k:24s} {v:3d} rows")
+
+
+if __name__ == "__main__":
+    main()
