@@ -44,3 +44,4 @@ __pycache__/
 # the variant dir; running against a variant dir at the repo root lands it here
 # instead of under results_hrd/.
 /*.npz
+_randinit_cache/
