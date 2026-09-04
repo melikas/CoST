@@ -34,13 +34,19 @@ from pathlib import Path
 import numpy as np
 
 SEGS = [1, 2, 4, 7, 14, 28]
-WIDTH = 1760            # every arm is compared at the production readout width
+WIDTH = 320             # the common width EVERY arm is projected to
 
 
 def _project(F, seed, width=WIDTH):
-    """Down to a common width, so nothing in this table is won by dimension count alone."""
-    if F.shape[1] <= width:
-        return F
+    """Every arm through the same Gaussian map to the same width -- including the ones
+    already narrower than it, which get a random rotation rather than being left alone.
+
+    The first version of this projected only the arms wider than the target and left the
+    rest untouched, which put two different treatments in one table: seg 1/2/4 kept their
+    exact features while seg 7/14/28 were projected, and the arms compared across that line.
+    Width itself is not what moves these numbers -- a sweep of the raw projection over
+    16..1760 dims spans 0.6865 to 0.7198 with no trend -- but the treatment has to be the
+    same for every row or the column is not a comparison."""
     rng = np.random.default_rng(seed)
     W = rng.normal(0, 1.0 / np.sqrt(width), (F.shape[1], width))
     return (F @ W).astype(np.float32)
@@ -61,20 +67,31 @@ def segment_readouts(npz, seed, cache_dir, batch=64, threads=None):
     t0 = time.time()
     m = random_init_model(ctx.cfg, ctx.X, ctx.n_sensors, "cpu", seed)
     m.net.eval()
-    acc = {s: [] for s in SEGS}
+    def segs(z):
+        """z (b, T, d) -> {S: (b, S*d)}, the mean within each of S equal time segments."""
+        T, d = z.shape[1], z.shape[2]
+        return {s: z[:, :s * (T // s)].reshape(z.shape[0], s, T // s, d)
+                .mean(dim=2).reshape(z.shape[0], -1).numpy() for s in SEGS}
+
+    # The trend and seasonal halves are kept APART, because the production readout does not
+    # treat them alike: it mean-pools the trend (160 dims) and reads the seasonal branch
+    # spectrally (1600), and cost.py's own note says time-domain pooling on that branch
+    # provably discards the rhythm. Pooling both -- what the first version of this script
+    # did -- is therefore a readout nobody runs, and calling it the production reference
+    # understated that reference by 0.018.
+    acc = {"t": [], "s": [], "spec": []}
     X = np.asarray(ctx.X, dtype=np.float32)
+    sp = ctx.cfg.get("season_pool") or "spec"
     with torch.no_grad():
         for i in range(0, len(X), batch):
             out_t, out_s = m.net(torch.from_numpy(X[i:i + batch]))
-            # trend and seasonal are read the SAME way here: the question is time
-            # resolution, so the two halves must not differ in anything else.
-            z = out_t if out_s is None else torch.cat([out_t, out_s], dim=-1)
-            T = z.shape[1]
-            for s in SEGS:
-                w = T // s
-                acc[s].append(z[:, :s * w].reshape(z.shape[0], s, w, z.shape[-1])
-                              .mean(dim=2).reshape(z.shape[0], -1).numpy())
-    feats = {f"seg {s:2d}": np.concatenate(acc[s]).astype(np.float32) for s in SEGS}
+            acc["t"].append(segs(out_t))
+            acc["s"].append(segs(out_s))
+            acc["spec"].append(m._seasonal_spectral(out_s, sp).numpy())
+    cat = lambda k, s: np.concatenate([b[s] for b in acc[k]]).astype(np.float32)
+    feats = {f"trend seg {s:2d}": cat("t", s) for s in SEGS}
+    feats.update({f"season seg {s:2d}": cat("s", s) for s in SEGS})
+    feats["season spec"] = np.concatenate(acc["spec"]).astype(np.float32)
     f.parent.mkdir(parents=True, exist_ok=True)
     np.savez_compressed(f, **feats)
     print(f"  encoded seed {seed} in {(time.time() - t0) / 60:.1f} min "
@@ -100,7 +117,18 @@ def main():
     seeds = [int(s) for s in np.load(a.npz, allow_pickle=True)["seeds"]]
     rows = []
     for es in seeds[:a.encoder_seeds]:
-        feats, ctx0 = segment_readouts(a.npz, es, a.cache_dir, threads=a.threads)
+        parts, ctx0 = segment_readouts(a.npz, es, a.cache_dir, threads=a.threads)
+        # Two families. A varies the time resolution of BOTH halves; B is the minimal
+        # change to what actually ships -- the seasonal branch keeps its spectral readout
+        # and only the trend's resolution moves. B is the one a fix would adopt.
+        feats = {"PRODUCTION (trend mean + season spec)":
+                 np.concatenate([parts["trend seg  1"], parts["season spec"]], axis=1)}
+        for s in SEGS:
+            k = f"seg {s:2d}"
+            feats[f"A both {k}"] = np.concatenate(
+                [parts[f"trend {k}"], parts[f"season {k}"]], axis=1)
+            feats[f"B trend {k} + spec"] = np.concatenate(
+                [parts[f"trend {k}"], parts["season spec"]], axis=1)
         feats = {k: _project(v, es) for k, v in feats.items()}
         feats["raw projection"] = raw_projection(ctx0.X, ctx0.n_sensors, WIDTH, es)
         for ss in seeds:
@@ -111,9 +139,10 @@ def main():
             rows.append(r)
             json.dump(rows, open(a.out, "w"), indent=1)
         d = [r for r in rows if r["encoder_seed"] == es]
-        print("  seed %d: " % es
+        print(f"  seed {es}: "
               + "  ".join(f"{k}={np.nanmean([x[k] for x in d]):.4f}"
-                          for k in d[0] if not k.endswith("_seed")), flush=True)
+                          for k in ("PRODUCTION (trend mean + season spec)",
+                                    "raw projection")), flush=True)
 
     names = [k for k in rows[0] if not k.endswith("_seed")]
     print(f"\n  {len(rows)} measurements, HRD, same probe and splits."
@@ -122,7 +151,7 @@ def main():
     base = np.array([r["seg  1"] for r in rows], float)
     for n in names:
         v = np.array([r[n] for r in rows], float)
-        print(f"  {n:20s} {np.nanmean(v):7.4f} {np.nanmean(v - base):+10.4f} "
+        print(f"  {n:34s} {np.nanmean(v):7.4f} {np.nanmean(v - base):+14.4f} "
               f"{int(np.nansum(v - base > 0)):4d}/{len(rows)}")
 
 
