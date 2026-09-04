@@ -173,6 +173,26 @@ class TransformerFeatureExtractor(nn.Module):
         return x.transpose(1, 2)             # B x output_dims x T
 
 
+def _residual_projection(length, bins_per_day, poly_degree=3, harmonics=4):
+    """I - D (D'D)^-1 D' for D = [polynomial in t | daily harmonics], as a (T, T) matrix.
+
+    Applying this is identical to taking the least-squares residual tasks.decompose
+    returns, and a test asserts that against it. A moving-average trend would need padding
+    a 7-day window cannot justify -- on a planted rhythm-plus-drift signal circular padding
+    left 14% of the rhythm in the residual, edge replication 7%, odd reflection 5% -- while
+    a design-matrix fit has no edges and recovers it exactly.
+    """
+    t = np.arange(int(length), dtype=np.float64)
+    u = (t - t.mean()) / (t.std() + 1e-12)
+    cols = [u ** k for k in range(poly_degree + 1)]
+    w = int(bins_per_day)
+    for k in range(1, harmonics + 1):
+        cols += [np.cos(2 * np.pi * k * t / w), np.sin(2 * np.pi * k * t / w)]
+    D = np.stack(cols, axis=1)
+    P = D @ np.linalg.pinv(D)
+    return torch.from_numpy((np.eye(len(t)) - P).astype(np.float32))
+
+
 class CoSTEncoder(nn.Module):
     def __init__(self, input_dims, output_dims,
                  kernels: List[int],
@@ -180,7 +200,8 @@ class CoSTEncoder(nn.Module):
                  hidden_dims=64, depth=10,
                  mask_mode='none', backbone='tcn', pe='sinusoidal',
                  n_time_features=0, time2vec_dim=65, disentangle=True,
-                 bins_per_day=96, mask_prob=0.5, seasonal_bands='harmonics'):
+                 bins_per_day=96, mask_prob=0.5, seasonal_bands='harmonics',
+                 noise_branch=False, noise_depth=None):
         super().__init__()
 
         component_dims = output_dims // 2
@@ -264,6 +285,40 @@ class CoSTEncoder(nn.Module):
 
         self.repr_dropout = nn.Dropout(p=0.1)
 
+        # V^N: the third component the hypothesis names and the model never had.
+        #
+        #   signal = trend + seasonal + noise
+        #            V^T   + V^S      + (discarded)
+        #
+        # The residual is where the signal measurably is -- probed alone it scores 0.7117
+        # against 0.6228 for trend and seasonal together, on 24 HRD seeds -- and augmenting
+        # it the way the objective does leaves 0.7202, above every arm in the project. So
+        # there is something for this branch to hold. The one design it rules out is a
+        # participant-level positive pair: that invariant subspace collapses to 0.5856,
+        # 4/24, p=0.0015, so V^N contrasts WINDOWS.
+        #
+        # It gets its own stack rather than a head on the shared backbone. A third head
+        # would be a third view of the same features with nothing tying it to the residual;
+        # feeding it the residual explicitly is what makes it the noise branch rather than
+        # a copy of the trend branch.
+        self.noise_branch = bool(noise_branch)
+        if self.noise_branch:
+            if backbone != 'tcn':
+                raise ValueError("noise_branch needs backbone='tcn'; the residual path is "
+                                 f"a dilated conv stack and got backbone={backbone!r}")
+            nd = depth if noise_depth is None else int(noise_depth)
+            self.noise_fc = nn.Linear(self.n_sensor_dims, hidden_dims)
+            self.noise_extractor = DilatedConvEncoder(
+                hidden_dims, [hidden_dims] * nd + [component_dims], kernel_size=3)
+            # The residual is a FIXED linear operator, so it is a buffer and not a data
+            # pipeline change: R = I - D (D'D)^-1 D' projects a window onto the orthogonal
+            # complement of [polynomial in t | daily harmonics], which is exactly what
+            # tasks.decompose computes by least squares. Keeping it here means the branch
+            # sees the residual OF THE AUGMENTED VIEW, which is what it must contrast, and
+            # that no caller's tuple arity changes.
+            self.register_buffer("noise_proj",
+                                 _residual_projection(length, bins_per_day), persistent=False)
+
         self.kernels = kernels
 
         # Trend (TFD) and Seasonal (SFD) disentangling heads exist ONLY when
@@ -298,6 +353,25 @@ class CoSTEncoder(nn.Module):
                 [BandedFourierLayer(output_dims, w, b, nb, length=length, bounds=bd)
                  for b, (bd, w) in enumerate(zip(self.seasonal_bands, widths))]
             )
+
+    def encode_noise(self, x):
+        """V^N from the residual of `x`, B x T x component_dims. None when the branch is off.
+
+        `x` is the SIGNAL, not the residual: the projection is applied here so the branch
+        sees the residual of whatever view it is handed, and so that no caller has to
+        compute or carry one.
+
+        Kept out of `forward` on purpose: adding a third return value would change the
+        arity every existing caller unpacks, and `out_t, out_s = net(x)` appears in the
+        loss, in encode(), in the plain-SSL twin and in four experiment scripts.
+        """
+        if not self.noise_branch:
+            return None
+        x = torch.nan_to_num(x[..., :self.n_sensor_dims], nan=0.0)
+        r = torch.einsum("ts,bsc->btc", self.noise_proj.to(x.dtype), x)
+        z = self.noise_fc(r)                                     # B x T x hidden
+        z = self.noise_extractor(z.transpose(1, 2)).transpose(1, 2)
+        return self.repr_dropout(z)
 
     def forward(self, x, tcn_output=False, mask=None):  # x: B x T x input_dims
         # peel off the appended clock/time channels; they are injected below as an

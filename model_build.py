@@ -66,6 +66,14 @@ def build_model(cfg, X, n_sensors, device, **override):
         # ran the raw-atan2 readout, and rebuilding it any other way would reproduce a
         # different model than the one whose numbers are archived beside it.
         phase_readout=cfg.get("phase_readout", "angle"),
+        # 0.0 = no V^N branch at all, matching cost.py's own default, so a config written
+        # before this key existed rebuilds exactly the model it was -- including the
+        # random-init control, which is built from the config with no checkpoint to
+        # correct it and would otherwise be a different architecture than the encoder it
+        # is the control FOR.
+        noise_weight=cfg.get("noise_weight", 0.0),
+        noise_branch=cfg.get("noise_branch", False),
+        noise_depth=cfg.get("noise_depth", None),
         mask_mode=cfg["mask_mode"], mask_prob=cfg["mask_keep_prob"],
         phase_mode=cfg["phase_encoding"], device=device, lr=cfg["lr"],
         batch_size=cfg["batch_size"])

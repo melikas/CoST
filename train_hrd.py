@@ -494,6 +494,20 @@ def parse_args():
                         "(seg2: +0.018 to +0.028, p<=0.023 paired per variant), for the "
                         "untrained control as well, so it is a better readout rather than "
                         "evidence of anything learned.")
+    p.add_argument("--noise-weight", type=float, default=0.0,
+                   help="Weight of V^N, the third component the hypothesis names and the "
+                        "model never had: signal = trend + seasonal + noise, with the last "
+                        "one discarded. 0 (default) leaves the branch unbuilt and every "
+                        "archived config trains the model it trained. Non-zero builds a "
+                        "separate stack over the residual -- computed inside the encoder by "
+                        "a fixed least-squares projection, so no data path changes -- and "
+                        "adds an in-batch instance contrast on it. The residual carries "
+                        "0.7117 probed alone against 0.6228 for trend and seasonal "
+                        "together (24 HRD seeds), and 0.7202 after the shipped "
+                        "augmentations, above every arm in this project.")
+    p.add_argument("--noise-depth", type=int, default=None,
+                   help="Conv depth of the V^N stack (default: the main --depth). Lower is "
+                        "cheaper; at 3 the branch adds about 1%% of parameters.")
     p.add_argument("--season-pool",
                    choices=["spec", "spec_band", "spec_amp", "spec_phase", "same"],
                    default="spec",

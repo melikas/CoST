@@ -1,6 +1,7 @@
 """Does the instrument measure what it claims? Plant one thing at a time; only it may move."""
 import numpy as np
-from dispersion_ceiling import decompose, day_features
+from tasks.decompose import decompose
+from dispersion_ceiling import day_features
 
 W, D, C = 96, 7, 3
 T = W * D

@@ -312,8 +312,12 @@ class CoSTModel(nn.Module):
                  phase_mode: str = "circular",
                  trend_pool: str = "random",
                  negatives: str = "global",
-                 n_negatives: int = 0):
+                 n_negatives: int = 0,
+                 noise_weight: float = 0.0):
         super().__init__()
+        # Weight of the V^N term. 0 turns the branch's objective off completely, so a run
+        # written before this key existed trains exactly the model it trained.
+        self.noise_weight = float(noise_weight)
 
         # 'random' is upstream CoST: the trend term contrasts ONE random timestep, pushed
         # through head_q. But head_q is discarded at inference and encode() mean-pools the
@@ -634,10 +638,25 @@ class CoSTModel(nn.Module):
         seasonal_loss = (self.instance_contrastive_loss(q_s_amp, k_s_amp) +
                          self.instance_contrastive_loss(q_s_phase, k_s_phase)) / 2
 
+        # V^N: the third component the hypothesis names. Contrasted at the WINDOW level,
+        # which is not a free choice -- the invariant subspace of a participant-level
+        # positive pair carries 0.5856 against the residual's own 0.7117 (4/24, p=0.0015),
+        # so that pairing is ruled out by measurement rather than by taste.
+        #
+        # The same in-batch instance contrast the seasonal branch uses, not a second MoCo
+        # queue: positives are two views of one window and negatives are the rest of the
+        # batch, which is exactly the pairing whose ceiling was measured at 0.7202 -- above
+        # every arm in this project.
+        noise_loss = None
+        if self.noise_weight > 0 and getattr(self.encoder_q, "noise_branch", False):
+            noise_loss = self.instance_contrastive_loss(self.encoder_q.encode_noise(x_q),
+                                                        self.encoder_q.encode_noise(x_k))
+
         # GradNorm balances trend vs seasonal.
         if return_parts:
             return trend_loss, seasonal_loss
-        return trend_loss + self.alpha * seasonal_loss
+        total = trend_loss + self.alpha * seasonal_loss
+        return total if noise_loss is None else total + self.noise_weight * noise_loss
 
     @torch.no_grad()
     def _momentum_update_key_encoder(self):
@@ -689,6 +708,14 @@ class CoST:
                  shift_sigma: float = 0.5,
                  smooth_bins: int = 0,
                  phase_readout: str = "angle",
+                 # V^N, the third component the hypothesis names and the model never had.
+                 # noise_weight=0 (the default) leaves the branch unbuilt and the loss
+                 # untouched, so every archived config trains the model it trained.
+                 # noise_branch=True builds it WITHOUT training it, which is what the
+                 # architecture-matched random-init control needs.
+                 noise_weight: float = 0.0,
+                 noise_branch: bool = False,
+                 noise_depth: Optional[int] = None,
                  moco_k: int = 4096,
                  trend_pool: str = "random",
                  positive_pair: str = "window",
@@ -761,6 +788,10 @@ class CoST:
             seasonal_bands=seasonal_bands,
             mask_mode=mask_mode,
             mask_prob=mask_prob,
+            # A non-zero weight implies the branch; `noise_branch` alone builds it without
+            # training it, which is what the architecture-matched random-init control needs.
+            noise_branch=bool(noise_weight) or bool(noise_branch),
+            noise_depth=noise_depth,
         ).to(self.device)
 
         # MoCo head/queue dim: two branches (CoST) -> per-branch component_dims;
@@ -797,6 +828,7 @@ class CoST:
             trend_pool=trend_pool,
             negatives=negatives,
             n_negatives=n_negatives,
+            noise_weight=noise_weight,
             device=self.device,
         ).to(self.device)
 
@@ -1237,6 +1269,12 @@ class CoST:
             season = (collapse(out_s) if season_pool is None
                       else self._seasonal_spectral(out_s, season_pool))
             out = torch.cat([collapse(out_t), season], dim=-1)
+        # V^N joins the readout when the branch exists, pooled the same way as the trend
+        # half. A branch trained but not read would be a cost with no effect, which is a
+        # failure mode this project has already paid for once.
+        v_n = self.net.encode_noise(x.to(self.device, non_blocking=True))
+        if v_n is not None:
+            out = torch.cat([out, collapse(v_n)], dim=-1)
         return rearrange(out.cpu(), 'b d -> b () d')
     
     def encode(self, data, mode, mask=None, encoding_window=None, casual=False, sliding_length=None, sliding_padding=0, batch_size=None, pool="mean", season_pool=None):
