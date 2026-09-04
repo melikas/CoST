@@ -621,11 +621,28 @@ def _interpolate_interior_gaps(values: np.ndarray) -> np.ndarray:
 
 def _build_window_array(mean_by_bin: pd.DataFrame, count_by_bin: pd.DataFrame,
                         target_bins: int, n_sensors: int, bin_minutes: int,
-                        max_window_missing: float) -> Optional[np.ndarray]:
-    """Bin -> gate -> interpolate for one window. None when the window fails the gate."""
+                        max_window_missing: float,
+                        observed_out: Optional[List[np.ndarray]] = None,
+                        ) -> Optional[np.ndarray]:
+    """Bin -> gate -> interpolate for one window. None when the window fails the gate.
+
+    `observed_out`, when given, receives this window's observation mask: True where a raw
+    sample landed in that bin for that channel, False where the value returned below was
+    manufactured by interpolation. It is appended only for windows that PASS the gate, in
+    the same order the windows themselves are, so the two stay aligned one to one. The
+    default None leaves every existing caller returning exactly what it returned before.
+
+    Worth keeping because the gate admits up to `max_window_missing` (0.30) of a channel's
+    bins, fills them by linear interpolation, and then throws away the record of which bins
+    those were. The encoder is handed the result with no way to tell a measured value from a
+    manufactured one -- and linear interpolation manufactures precisely the smooth
+    low-frequency shape the trend branch and the Fourier layer are built to fit.
+    """
     values, observed = _fill_bin_grid(mean_by_bin, count_by_bin, target_bins, n_sensors)
     if not _window_is_usable(observed, bin_minutes, max_window_missing):
         return None
+    if observed_out is not None:
+        observed_out.append(observed)
     return _interpolate_interior_gaps(values)
 
 
@@ -673,6 +690,7 @@ def _window_participant(
     clock_features: bool = False,
     calendar_index: bool = False,
     align_midnight: bool = False,
+    observed_out: Optional[List[np.ndarray]] = None,
 ) -> List[Window]:
     """Cut one participant's record into consecutive fixed-size windows.
 
@@ -718,7 +736,7 @@ def _window_participant(
 
         sensor_values = _build_window_array(
             mean_by_bin, count_by_bin, target_bins, n_sensors, bin_minutes,
-            max_window_missing)
+            max_window_missing, observed_out=observed_out)
         if sensor_values is None:
             continue
 
@@ -786,6 +804,7 @@ def prepare_hrd_dataset(
     calendar_index: bool = False,
     align_midnight: bool = False,
     cache_raw: bool = False,
+    keep_observed: bool = False,
 ) -> Dict[str, object]:
     """Full HRD preprocessing -> non-overlapping windowed classification dataset for CoST.
 
@@ -818,6 +837,8 @@ def prepare_hrd_dataset(
     all_windows: List[np.ndarray] = []
     all_labels: List[int] = []
     all_pids: List[str] = []
+    # None unless asked for, so the windower's inner call is a no-op and X is unchanged.
+    all_observed: Optional[List[np.ndarray]] = [] if keep_observed else None
     all_window_ids: List[str] = []
     all_window_energy: List[float] = []
 
@@ -826,7 +847,7 @@ def prepare_hrd_dataset(
         for window, window_start in _window_participant(
             participant_rows, window_minutes, bin_minutes, sensor_cols, max_window_missing,
             z_score, clock_features=clock_features, calendar_index=calendar_index,
-            align_midnight=align_midnight,
+            align_midnight=align_midnight, observed_out=all_observed,
         ):
             all_windows.append(window)
             all_labels.append(label)
@@ -867,6 +888,8 @@ def prepare_hrd_dataset(
         "sensor_cols": sensor_cols,
         "n_sensors": len(sensor_cols),
         "n_features": n_features,
+        # (N, T, n_sensors) bool, aligned row for row with X. Absent unless keep_observed.
+        **({"observed": np.stack(all_observed, axis=0)} if all_observed is not None else {}),
     }
 
 
