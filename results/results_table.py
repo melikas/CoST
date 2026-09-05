@@ -16,6 +16,7 @@ from pathlib import Path
 # would not import. scripts/ already does this; the pattern is the same.
 sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
 
+import argparse
 import csv
 import sys
 
@@ -306,7 +307,15 @@ ROWS = [
 
 
 def main():
-    out = sys.argv[1] if len(sys.argv) > 1 else "results_summary.csv"
+    # argparse, not sys.argv[1]. Taking the first argument as the output path meant
+    # `--help` was read as a FILENAME, and the table was written to a file called "--help"
+    # -- which then got committed.
+    ap = argparse.ArgumentParser(description=__doc__,
+                                formatter_class=argparse.RawDescriptionHelpFormatter)
+    ap.add_argument("--out", default=str(Path(__file__).resolve().parent
+                                        / "results_summary.csv"),
+                    help="where to write the CSV (default: %(default)s)")
+    out = ap.parse_args().out
     with open(out, "w", newline="", encoding="utf-8") as f:
         w = csv.writer(f)
         w.writerow(FIELDS)
