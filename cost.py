@@ -583,9 +583,14 @@ class CoSTModel(nn.Module):
         m = mask.unsqueeze(-1).expand_as(target)
         if not m.any():
             return None
-        # Scale-free: the residual's variance differs by orders of magnitude between
-        # channels, and an unnormalised MSE would be a report on the loudest one.
-        sd = target.std(dim=1, keepdim=True).clamp_min(1e-6)
+        # Per CHANNEL over the whole batch, not per window. Normalising each window's own
+        # standard deviation looked equivalent and is not: a near-binary channel -- sleep --
+        # has windows whose residual is almost constant, the clamp at 1e-6 then divides by
+        # about nothing, and the loss came out at 5.1e6 instead of order 1. The floor is
+        # relative to the batch's own scale so it cannot be tuned into irrelevance by the
+        # units the data happens to arrive in.
+        sd = target.std(dim=(0, 1), keepdim=True)
+        sd = sd.clamp_min(0.01 * sd.mean().clamp_min(1e-8))
         return F.mse_loss((pred / sd)[m], (target / sd)[m])
 
     def _trend_view(self, z, idx):

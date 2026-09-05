@@ -218,3 +218,32 @@ def test_the_loss_weights_channels_evenly():
     assert float(norm.max() / norm.min()) < 1.05, f"channels still uneven: {norm}"
     torch.manual_seed(0)
     assert np.isfinite(float(m.cost._masked_noise_loss(x)))
+
+
+def test_the_masked_loss_is_order_one_on_a_near_constant_channel():
+    """The failure this guards against was silent and total. Normalising by each window's
+    OWN standard deviation looks equivalent to normalising per channel and is not: a
+    near-binary channel has windows whose residual is almost constant, the clamp then
+    divides by about nothing, and on real HRD windows the loss came out at 5.1e6 instead of
+    order 1. A run started that way would have been dominated by the division and every
+    number from it meaningless -- with nothing in the output to say so."""
+    m = model(noise_weight=0.5, noise_depth=2, max_train_length=336)
+    rng = np.random.default_rng(0)
+    x = rng.normal(0, 1, (8, 336, 3)).astype(np.float32)
+    # Channel 2 is built from exactly the basis the reference fits -- a cubic plus the four
+    # daily harmonics -- so its residual is numerically zero. A square wave is NOT this case:
+    # four harmonics leave it a residual of 0.16, and the first version of this test used one
+    # and never reached the condition it was written for.
+    t = np.arange(336)
+    u = (t - t.mean()) / t.std()
+    ch = 0.7 * u ** 3 - 0.4 * u + sum(np.sin(2 * np.pi * k * t / 96 + k) for k in (1, 2, 3, 4))
+    x[:, :, 2] = ch.astype(np.float32)
+    xt = torch.from_numpy(x)
+    with torch.no_grad():
+        r = m.net.residual_of(xt)
+    per_window = r.std(dim=1)
+    assert float(per_window.min()) < 1e-3, "the test data lacks the near-constant case"
+    torch.manual_seed(0)
+    loss = float(m.cost._masked_noise_loss(xt))
+    assert np.isfinite(loss), "the loss is not finite"
+    assert loss < 100.0, f"the loss exploded on a near-constant channel: {loss}"
