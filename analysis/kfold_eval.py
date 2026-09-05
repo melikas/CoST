@@ -23,6 +23,14 @@ had only ever run on GLOBEM -- both land before a GPU is needed.
     python kfold_eval.py --npz hrd_2224103.npz --null
     python kfold_eval.py --npz hrd_2224103.npz
 """
+import sys
+from pathlib import Path
+
+# Run as `python analysis/<name>.py` from the repository root: the interpreter puts
+# this file's own directory on sys.path, not the project root, so the shared modules
+# would not import. scripts/ already does this; the pattern is the same.
+sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
+
 import argparse
 import json
 from pathlib import Path
@@ -34,7 +42,7 @@ from tasks.kfold import participant_folds, split_masks
 
 def arms(ctx, width=512, cache_dir="_randinit_cache", npz=None):
     """{name: (n_windows, d)} -- everything measurable without pretraining."""
-    from random_init_audit import raw_projection
+    from analysis.random_init_audit import raw_projection
     from structured_rhythm import structured_features
     from tasks.energy import handcrafted_features
     out = {}
@@ -133,7 +141,7 @@ def main():
     ap.add_argument("--out", default=None)
     a = ap.parse_args()
 
-    from local_context import local_context
+    from analysis.local_context import local_context
     seeds = [int(s) for s in np.load(a.npz, allow_pickle=True)["seeds"]]
     ctx = local_context(a.npz, seeds[0])
     A = arms(ctx, npz=a.npz)

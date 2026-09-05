@@ -28,7 +28,7 @@ from sklearn.metrics import roc_auc_score
 
 from baselines.cosinor import paper_cosinor_features
 from structured_rhythm import structured_features
-from random_init_audit import raw_projection
+from analysis.random_init_audit import raw_projection
 from baselines.plain_ssl import encode_plain, plain_ssl_encoder
 from baselines.supervised import supervised_baseline_row
 from tasks._eval_protocols import (fast_auc, fit_persubject_probe,

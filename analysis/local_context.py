@@ -9,6 +9,14 @@ scored.
 be mistakable for one that has an untrained encoder sitting in it, which would be scored as if
 it meant something.
 """
+import sys
+from pathlib import Path
+
+# Run as `python analysis/<name>.py` from the repository root: the interpreter puts
+# this file's own directory on sys.path, not the project root, so the shared modules
+# would not import. scripts/ already does this; the pattern is the same.
+sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
+
 import json
 from types import SimpleNamespace
 

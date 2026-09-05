@@ -32,5 +32,5 @@ pip install --no-index torch numpy pandas scikit-learn einops
 export PYTHONUNBUFFERED=1
 CACHE_DIR="${SLURM_TMPDIR:-/tmp}/dump_cache"; mkdir -p "$CACHE_DIR"
 
-python dump_context.py --run-dir "$RUN_DIR" --out "$OUT" --cache-dir "$CACHE_DIR"
+python analysis/dump_context.py --run-dir "$RUN_DIR" --out "$OUT" --cache-dir "$CACHE_DIR"
 ls -lh "$OUT"

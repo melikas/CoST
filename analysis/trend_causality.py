@@ -21,6 +21,14 @@ both, so the comparison is paired at the level of the encoder and not just the s
 
     python trend_causality.py --npz hrd_2224103.npz --draws 3
 """
+import sys
+from pathlib import Path
+
+# Run as `python analysis/<name>.py` from the repository root: the interpreter puts
+# this file's own directory on sys.path, not the project root, so the shared modules
+# would not import. scripts/ already does this; the pattern is the same.
+sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
+
 import argparse
 import json
 import os
@@ -65,8 +73,8 @@ def main():
     ap.add_argument("--out", default="trend_causality.json")
     a = ap.parse_args()
 
-    from local_context import local_context
-    from random_init_audit import _probe_auc
+    from analysis.local_context import local_context
+    from analysis.random_init_audit import _probe_auc
     from tasks.sign_test import sign_summary
 
     seeds = [int(s) for s in np.load(a.npz, allow_pickle=True)["seeds"]]

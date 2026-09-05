@@ -5,8 +5,8 @@ from pathlib import Path
 import numpy as np
 import pytest
 
-from readout_interaction import aggregate, arms
-from readout_sweep import SEGS
+from analysis.readout_interaction import aggregate, arms
+from analysis.readout_sweep import SEGS
 
 
 def _parts(n=6, d=3, T=112):

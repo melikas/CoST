@@ -3,12 +3,12 @@
 # The day-resolved phase-concentration gate, over the 24 saved encoders of one run.
 #
 #   sbatch --array=0-23%24 scripts/stability_gate.sh results_hrd/2002135
-#   SCRIPT=readout_interaction.py sbatch --array=0 scripts/stability_gate.sh results_hrd/2002135
+#   SCRIPT=analysis/readout_interaction.py sbatch --array=0 scripts/stability_gate.sh results_hrd/2002135
 #   SCRIPT=experiment_q3.py EXTRA='--no-supervised --no-plain-ssl' \
 #     sbatch --gres=gpu:a100_3g.20gb:1 --time=3:00:00 --array=0-23%12 \
 #     scripts/stability_gate.sh results_hrd/2002135
 #
-# SCRIPT selects which CPU gate to run (default rhythm_stability.py). A gate that needs
+# SCRIPT selects which CPU gate to run (default analysis/rhythm_stability.py). A gate that needs
 # no encoder needs only --array=0; one that reads every seed needs the full range.
 # EXTRA passes flags through to it. A gate needing a GPU asks for one on the sbatch
 # command line -- SLURM reads #SBATCH before this script runs, so it cannot be set here.
@@ -81,7 +81,7 @@ export PYTHONUNBUFFERED=1
 export OMP_NUM_THREADS="${SLURM_CPUS_PER_TASK:-12}"
 CACHE_DIR="${SLURM_TMPDIR:-/tmp}/hrd_cache"; mkdir -p "$CACHE_DIR"
 
-PY_SCRIPT="${SCRIPT:-rhythm_stability.py}"
+PY_SCRIPT="${SCRIPT:-analysis/rhythm_stability.py}"
 [ -f "$PY_SCRIPT" ] || { echo "[gate] no such script: $PY_SCRIPT"; exit 1; }
 echo "[gate] running $PY_SCRIPT"
 # shellcheck disable=SC2086  -- EXTRA is a caller-supplied argument list, word splitting wanted

@@ -49,6 +49,14 @@ Run (no GPU):
     sbatch --array=0-23%24 scripts/stability_gate.sh results_hrd/<run>   # one seed per task
     python rhythm_stability.py --aggregate results_hrd/<run>             # then the verdict
 """
+import sys
+from pathlib import Path
+
+# Run as `python analysis/<name>.py` from the repository root: the interpreter puts
+# this file's own directory on sys.path, not the project root, so the shared modules
+# would not import. scripts/ already does this; the pattern is the same.
+sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
+
 import argparse
 import json
 from pathlib import Path

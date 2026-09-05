@@ -52,3 +52,8 @@ noise_branch_ceiling.json
 dispersion_ceiling.json
 kfold_eval.json
 kfold_null.json
+
+# analysis artifacts: the numbers live in results/results_summary.csv, the JSONs are scratch
+*.log
+trend_causality.json
+kfold_null.json

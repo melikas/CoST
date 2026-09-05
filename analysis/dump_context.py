@@ -13,6 +13,14 @@ second chance to disagree with the first.
 
     python dump_context.py --run-dir results_hrd/2166049 --out hrd_2166049.npz
 """
+import sys
+from pathlib import Path
+
+# Run as `python analysis/<name>.py` from the repository root: the interpreter puts
+# this file's own directory on sys.path, not the project root, so the shared modules
+# would not import. scripts/ already does this; the pattern is the same.
+sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
+
 import argparse
 import json
 

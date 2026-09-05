@@ -3,7 +3,7 @@ import numpy as np
 import pytest
 import torch
 
-from local_context import local_context
+from analysis.local_context import local_context
 from model_build import random_init_model
 
 NPZ = "hrd_2224103.npz"

@@ -22,6 +22,14 @@ describe initialisation, which is the whole point.
 Run (no GPU needed):
     python pretext_difficulty.py --variant-dir results_hrd/<run>/tcn_none_seed42
 """
+import sys
+from pathlib import Path
+
+# Run as `python analysis/<name>.py` from the repository root: the interpreter puts
+# this file's own directory on sys.path, not the project root, so the shared modules
+# would not import. scripts/ already does this; the pattern is the same.
+sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
+
 import argparse
 
 import numpy as np
@@ -110,7 +118,7 @@ def main():
     a = ap.parse_args()
 
     if a.npz:
-        from local_context import local_context
+        from analysis.local_context import local_context
         import numpy as _np
         ctx = local_context(a.npz, [int(x) for x in _np.load(a.npz, allow_pickle=True)["seeds"]][0])
     elif a.variant_dir:

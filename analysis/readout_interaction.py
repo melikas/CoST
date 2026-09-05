@@ -28,6 +28,14 @@ in nothing else, since random_init_model mirrors the layout of the encoder it co
       scripts/stability_gate.sh results_globem/2240054
     python readout_interaction.py --aggregate results_globem/2240054
 """
+import sys
+from pathlib import Path
+
+# Run as `python analysis/<name>.py` from the repository root: the interpreter puts
+# this file's own directory on sys.path, not the project root, so the shared modules
+# would not import. scripts/ already does this; the pattern is the same.
+sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
+
 import argparse
 import glob
 import json
@@ -42,7 +50,7 @@ NAME = "readout_interaction"
 
 def arms(parts):
     """{readout: features}. 'PRODUCTION' is the shipped one and the reference for the rest."""
-    from readout_sweep import SEGS, production_readout
+    from analysis.readout_sweep import SEGS, production_readout
     out = {"PRODUCTION": production_readout(parts)}
     for s in SEGS:
         k = f"seg {s:2d}"
@@ -158,7 +166,7 @@ def main():
         aggregate(a.aggregate)
         return
     if a.widths:
-        from readout_sweep import readout_parts
+        from analysis.readout_sweep import readout_parts
         from tasks._experiment_common import load_context, random_init_model
         ctx = load_context(a.widths, a.cache_dir, gpu=-1)
         m = ctx.model if getattr(ctx, "trained", True) else random_init_model(ctx)
@@ -169,7 +177,7 @@ def main():
     if not a.variant_dir:
         ap.error("one of --variant-dir or --aggregate is required")
 
-    from readout_sweep import readout_parts
+    from analysis.readout_sweep import readout_parts
     from tasks._experiment_common import load_context, out_dir, random_init_model, save
 
     ctx = load_context(a.variant_dir, a.cache_dir, gpu=-1)

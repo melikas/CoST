@@ -25,6 +25,14 @@ batch, without ever materialising the (3890, 672, 320) feature tensor.
 
     python readout_sweep.py --npz hrd_2224103.npz --encoder-seeds 3
 """
+import sys
+from pathlib import Path
+
+# Run as `python analysis/<name>.py` from the repository root: the interpreter puts
+# this file's own directory on sys.path, not the project root, so the shared modules
+# would not import. scripts/ already does this; the pattern is the same.
+sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
+
 import argparse
 import json
 import os
@@ -85,7 +93,7 @@ def production_readout(parts):
 def segment_readouts(npz, seed, cache_dir, batch=64, threads=None):
     """`readout_parts` for one RANDOM-INIT draw over an npz dump, cached on disk."""
     import torch
-    from local_context import local_context
+    from analysis.local_context import local_context
     from model_build import random_init_model
     ctx = local_context(npz, seed)
     f = Path(cache_dir) / f"readout_{Path(npz).stem}_{seed}.npz"
@@ -116,8 +124,8 @@ def main():
     ap.add_argument("--out", default="readout_sweep.json")
     a = ap.parse_args()
 
-    from local_context import local_context
-    from random_init_audit import _probe_auc, raw_projection
+    from analysis.local_context import local_context
+    from analysis.random_init_audit import _probe_auc, raw_projection
 
     seeds = [int(s) for s in np.load(a.npz, allow_pickle=True)["seeds"]]
     rows, dims = [], {}
