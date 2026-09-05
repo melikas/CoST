@@ -34,14 +34,44 @@ ROWS = [
      "AUROC", 0.4967, "chance 0.500", "", "0/24", 0.0015, "no leak",
      "session, random_init_audit.py", "python random_init_audit.py --aggregate <run>"),
 
-    # === the single number that explains the rest ========================================
-    ("pretext difficulty", "HRD", "random-init encoder, shipped global queue", "",
-     "MoCo top-1 retrieval at initialisation", "top-1", 1.000, "chance 1/(1+K)", "", "", "",
-     "the pretext task is ALREADY SOLVED before training; the loss starts at zero, so "
-     "there is nothing for pretraining to learn -- this is why the frozen DSSL "
-     "representation has never separated from its own random-init control",
-     "pretext_difficulty.py",
-     "python pretext_difficulty.py --variant-dir results_hrd/<run>/tcn_none_seed42"),
+    # === the two axes a positive pair fixes at once, and why neither option works ========
+    ("positive pair", "HRD", "random-init encoder, K=8192, run 2224103 config", "",
+     "window pair -- difficulty at init", "MoCo top-1", 0.8223, "chance 0.0001", "", "", "",
+     "6737x chance: the task is nearly solved before training, so the gradient is tiny -- "
+     "this is why the frozen DSSL representation has never separated from its own "
+     "random-init control", "analysis/pretext_difficulty.py",
+     "python analysis/pretext_difficulty.py --npz hrd_2224103.npz"),
+    ("positive pair", "HRD", "random-init encoder, K=8192, run 2224103 config", "",
+     "participant pair -- difficulty at init", "MoCo top-1", 0.0312, "chance 0.0001",
+     "", "", "", "256x chance: this pair IS hard, and it is the only implemented one that is",
+     "analysis/pretext_difficulty.py", ""),
+    ("positive pair", "HRD", "24 seeds", 24, "no pairing (upper bound) -- ceiling",
+     "AUROC", 0.7123, "", "", "", "", "", "results/positive_pair_ceiling.json",
+     "python analysis/positive_pair_ceiling.py --npz hrd_2224103.npz"),
+    ("positive pair", "HRD", "24 seeds", 24, "window pair -- ceiling",
+     "AUROC", 0.7151, "no pairing", 0.0028, "", "",
+     "keeps the signal, but the task is already solved", "results/positive_pair_ceiling.json",
+     ""),
+    ("positive pair", "HRD", "24 seeds", 24, "participant pair -- ceiling",
+     "AUROC", 0.6658, "no pairing", -0.0466, "", "",
+     "the only HARD pair caps the representation BELOW the 0.7198 an untrained random "
+     "projection already reaches -- so pretraining on it cannot beat doing nothing",
+     "results/positive_pair_ceiling.json", ""),
+    ("positive pair", "HRD", "24 seeds", 24, "day-disjoint pair -- ceiling",
+     "AUROC", 0.6574, "no pairing", -0.0549, "", "",
+     "the candidate for sitting between the two; it sits below both, so it is dominated "
+     "and its difficulty need not be measured", "results/positive_pair_ceiling.json", ""),
+
+    # === trend head read position =========================================================
+    ("trend causality", "HRD", "3 encoder draws x 24 splits", 72,
+     "causal trend read (shipped)", "AUROC", 0.6761, "", "", "", "", "",
+     "results/trend_causality.json",
+     "python analysis/trend_causality.py --npz hrd_2224103.npz"),
+    ("trend causality", "HRD", "3 encoder draws x 24 splits", 72,
+     "centred trend read", "AUROC", 0.6758, "causal read", -0.0003, "31/56", 0.5044,
+     "no difference; the causal read costs nothing and buys nothing, and forecasting does "
+     "not need it either -- a forecast at t encodes a window ENDING at t",
+     "results/trend_causality.json", ""),
 
     # === RQ1: does pretraining build rhythm structure? ====================================
     ("RQ1 structure", "HRD", "24 seeds", 24, "trend stability tau, random-init",

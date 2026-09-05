@@ -90,6 +90,22 @@ def measure(model, X, pids, n_neg, mode, positive, batch_size, warm_batches,
     return np.array(top1, float), (m.neg_short, m.neg_calls)
 
 
+def _ceilings(path):
+    """{positive pair: ceiling AUROC} from positive_pair_ceiling.py, or {} if not measured.
+
+    Read rather than hard-coded so the two halves of the gate cannot drift: if the ceilings
+    are re-measured, this picks up the new numbers without an edit here.
+    """
+    import json
+    from pathlib import Path
+    p = Path(path)
+    if not p.exists():
+        return {}
+    rows = json.load(open(p))
+    keys = [k for k in rows[0] if k != "seed"]
+    return {k: float(np.nanmean([r[k] for r in rows])) for k in keys}
+
+
 def main():
     ap = argparse.ArgumentParser(description=__doc__,
                                  formatter_class=argparse.RawDescriptionHelpFormatter)
@@ -113,6 +129,16 @@ def main():
                     help="queue size the sweep will use. It matters here: the "
                          "same-participant pool is K/n_pretrain_pids, and if that is below "
                          "--n-negatives the sampler must draw with replacement.")
+    ap.add_argument("--ceilings",
+                    default=str(Path(__file__).resolve().parent.parent
+                                / "results" / "positive_pair_ceiling.json"),
+                    help="Ceilings measured by analysis/positive_pair_ceiling.py. Difficulty "
+                         "alone cannot pass this gate: a pair that is hard can also be one "
+                         "that discards the signal (default: %(default)s).")
+    ap.add_argument("--baseline", type=float, default=0.7198,
+                    help="What an UNTRAINED baseline already reaches, which the hard pair's "
+                         "ceiling has to clear for pretraining on it to be worth anything. "
+                         "Default is the raw random projection on HRD over 24 seeds.")
     ap.add_argument("--warm-batches", type=int, default=40)
     ap.add_argument("--measure-batches", type=int, default=40)
     a = ap.parse_args()
@@ -154,10 +180,38 @@ def main():
 
     g, s = res["window"]["top1"], res["participant"]["top1"]
     print("")
-    verdict = ("SUBMIT      -- the trend task is learnable at init" if s <= 0.30 else
-               "DO NOT SUBMIT -- still solved at init; the gradient would teach nothing")
     print(f"  window {g:.4f} -> participant {s:.4f}   (gate: participant <= 0.30)")
+
+    # DIFFICULTY IS NECESSARY, NOT SUFFICIENT. This gate used to pass on the left column
+    # alone, and that verdict is wrong: a positive pair fixes two things at once, and the
+    # one it makes hard it can also make useless. Measured on HRD, 24 seeds:
+    #
+    #     window pair        top-1 0.8223  (6737x chance)   ceiling 0.7151
+    #     participant pair   top-1 0.0312  ( 256x chance)   ceiling 0.6658
+    #
+    # The only pair that is HARD caps the representation at 0.6658, below the 0.7198 a
+    # random projection of the raw window already reaches with no training at all. Passing
+    # that pair on difficulty alone would send a sweep whose best possible outcome is worse
+    # than doing nothing -- which is exactly what this file exists to prevent.
+    ceil = _ceilings(a.ceilings)
+    hard = s <= 0.30
+    c = ceil.get("participant pair")
+    print(f"  ceiling of the hard pair: "
+          + (f"{c:.4f}   (baseline to beat: {a.baseline:.4f})" if c is not None
+             else f"UNKNOWN -- run analysis/positive_pair_ceiling.py"))
+    if not hard:
+        verdict = "DO NOT SUBMIT -- still solved at init; the gradient would teach nothing"
+    elif c is None:
+        verdict = ("MEASURE THE CEILING FIRST -- the task is learnable, but a pair that is "
+                   "hard can also be one that discards the signal")
+    elif c <= a.baseline:
+        verdict = (f"DO NOT SUBMIT -- the task is learnable but its ceiling {c:.4f} is at or "
+                   f"below the {a.baseline:.4f} an untrained baseline already reaches, so the "
+                   f"best possible outcome is worse than not pretraining")
+    else:
+        verdict = "SUBMIT      -- learnable at init AND its ceiling clears the baseline"
     print(f"  VERDICT: {verdict}")
+    res["verdict"] = verdict
     if a.negatives == "subject" and res["participant"]["shortfall"] > 0.10:
         # Only meaningful when the SUBJECT-conditional denominator is in use; it is not the
         # default, because restricting the negatives was measured to leave difficulty
@@ -169,7 +223,12 @@ def main():
     res["chance"] = chance
     res["verdict"] = verdict
     res["n_pretrain_participants"] = int(n_pid)
-    save(out_dir(ctx, "rq1"), "pretext_difficulty", res)
+    # --npz mode has no variant directory to write into, and the gate's whole value is the
+    # verdict printed above -- crashing after producing it would throw the answer away.
+    if getattr(ctx, "variant_dir", None):
+        save(out_dir(ctx, "rq1"), "pretext_difficulty", res)
+    else:
+        print(f"[gate] no variant directory (--npz mode); result not saved")
 
 
 if __name__ == "__main__":
