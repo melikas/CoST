@@ -57,3 +57,7 @@ kfold_null.json
 *.log
 # trend_causality.json is tracked under results/
 kfold_null.json
+trend_causality.json
+block_pretext.log
+sanity.log
+pretext_gate.log
