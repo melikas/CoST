@@ -120,6 +120,55 @@ ROWS = [
      "", "", "", "NO SIGNAL -- regression to the mean plus noise; gate was +0.02",
      "rhythm_dynamics.py", ""),
 
+    # === RQ2: the one level where pretraining wins =======================================
+    # Stratified Mann-Whitney concordance C: within one (participant, phase-shift level),
+    # does the personalised distance in representation space rank the windows that genuinely
+    # moved AWAY from their own rhythm above the ones that moved closer? Null is exactly 0.5.
+    # `[ceiling]` arms are references, not competitors: the ground truth is defined in 24-h
+    # cosinor space, so a cosinor reader measures in the same space the target lives in.
+    ("RQ2 concordance", "HRD", "run 2224103, 24 seeds", 24, "Cosinor [ceiling]",
+     "C", 0.9210, "DSSL", -0.0467, "2/24", 0.000036,
+     "the reference, not a competitor -- the ground truth is defined in its own space",
+     "run 2224103 RQ2/rq2_concordance.csv",
+     "python experiment_q2.py --variant-dir results_hrd/2224103/<variant>"),
+    ("RQ2 concordance", "HRD", "run 2224103, 24 seeds", 24, "DSSL V^S phase",
+     "C", 0.8802, "DSSL", -0.0058, "3/24", 0.000277,
+     "the phase block alone is slightly BETTER than the whole representation",
+     "run 2224103 RQ2/rq2_concordance.csv", ""),
+    ("RQ2 concordance", "HRD", "run 2224103, 24 seeds", 24, "DSSL (frozen)",
+     "C", 0.8743, "", "", "", "", "first among the arms that are not ceilings",
+     "run 2224103 RQ2/rq2_concordance.csv", ""),
+    ("RQ2 concordance", "HRD", "run 2224103, 24 seeds", 24, "Random-init",
+     "C", 0.8651, "DSSL", 0.0093, "21/24", 0.000277,
+     "THE FIRST SEPARATION IN THIS PROJECT: DSSL beats its own architecture-matched "
+     "untrained control, p=0.0003, where five RQ3 protocols found exactly zero",
+     "run 2224103 RQ2/rq2_concordance.csv", ""),
+    ("RQ2 concordance", "HRD", "run 2224103, 24 seeds", 24, "Raw (hourly) [ceiling]",
+     "C", 0.8233, "DSSL", 0.0510, "21/24", 0.000277,
+     "DSSL clears a design ceiling", "run 2224103 RQ2/rq2_concordance.csv", ""),
+    ("RQ2 concordance", "HRD", "run 2224103, 24 seeds", 24, "Structured rhythm",
+     "C", 0.8168, "DSSL", 0.0575, "21/24", 0.000277,
+     "DSSL clears the explicit rhythm parameterisation",
+     "run 2224103 RQ2/rq2_concordance.csv", ""),
+    ("RQ2 concordance", "HRD", "run 2224103, 24 seeds", 24, "DSSL V^T (trend block)",
+     "C", 0.6054, "DSSL", 0.2689, "24/24", 0.0,
+     "the trend block carries almost none of it",
+     "run 2224103 RQ2/rq2_concordance.csv", ""),
+    ("RQ2 concordance", "HRD", "run 2224103, 24 seeds", 24, "DSSL V^S amp (amplitude block)",
+     "C", 0.5661, "DSSL", 0.3082, "24/24", 0.0,
+     "and neither does the amplitude block -- which is the same asymmetry RQ1 found "
+     "independently: pretraining builds phase and degrades amplitude",
+     "run 2224103 RQ2/rq2_concordance.csv", ""),
+    ("RQ2 concordance", "HRD", "run 2224103, 24 seeds", 24, "Handcrafted (mean/std)",
+     "C", 0.5016, "DSSL", 0.3727, "24/24", 0.0, "at chance, as it must be",
+     "run 2224103 RQ2/rq2_concordance.csv", ""),
+    ("RQ2 concordance", "HRD", "run 2412728, 14 seeds so far", 14, "Random-init",
+     "C", 0.8451, "DSSL 0.8289", -0.0161, "4/14", 0.1796,
+     "a SECOND run does not reproduce the separation. Not a contradiction -- it is not "
+     "significant -- but its absolute C differs by 0.045, so the two configs are not the "
+     "same and that has to be resolved before either is quoted",
+     "run 2412728 RQ2/rq2_concordance.csv", ""),
+
     # === the ladder, HRD ==================================================================
     ("ladder", "HRD", "24 seeds, participant holdout", 24, "random forest on raw",
      "AUROC", 0.7310, "", "", "", "", "", "session, fast_audit.py", ""),

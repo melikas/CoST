@@ -1,0 +1,242 @@
+[
+ {
+  "seed": 101,
+  "raw projection (78d)": 0.7006172839506173,
+  "raw projection (512d)": 0.6574074074074074,
+  "structured rhythm (78d)": 0.6358024691358025,
+  "structured rhythm (512d)": 0.6512345679012346,
+  "CONTROL time-shuffled raw (512d)": 0.4907407407407407,
+  "CONTROL gaussian noise (512d)": 0.5524691358024691,
+  "CONTROL permuted labels (512d)": 0.4555555555555556
+ },
+ {
+  "seed": 13,
+  "raw projection (78d)": 0.6049382716049383,
+  "raw projection (512d)": 0.6604938271604939,
+  "structured rhythm (78d)": 0.6728395061728395,
+  "structured rhythm (512d)": 0.654320987654321,
+  "CONTROL time-shuffled raw (512d)": 0.4845679012345679,
+  "CONTROL gaussian noise (512d)": 0.5432098765432098,
+  "CONTROL permuted labels (512d)": 0.43143812709030105
+ },
+ {
+  "seed": 17,
+  "raw projection (78d)": 0.6882716049382716,
+  "raw projection (512d)": 0.7098765432098766,
+  "structured rhythm (78d)": 0.6851851851851851,
+  "structured rhythm (512d)": 0.6234567901234568,
+  "CONTROL time-shuffled raw (512d)": 0.4506172839506173,
+  "CONTROL gaussian noise (512d)": 0.46296296296296297,
+  "CONTROL permuted labels (512d)": 0.5854545454545454
+ },
+ {
+  "seed": 22,
+  "raw projection (78d)": 0.6203703703703703,
+  "raw projection (512d)": 0.7314814814814815,
+  "structured rhythm (78d)": 0.6265432098765432,
+  "structured rhythm (512d)": 0.6450617283950617,
+  "CONTROL time-shuffled raw (512d)": 0.3580246913580247,
+  "CONTROL gaussian noise (512d)": 0.5370370370370371,
+  "CONTROL permuted labels (512d)": 0.43478260869565216
+ },
+ {
+  "seed": 23,
+  "raw projection (78d)": 0.7006172839506173,
+  "raw projection (512d)": 0.7037037037037037,
+  "structured rhythm (78d)": 0.6975308641975309,
+  "structured rhythm (512d)": 0.7191358024691358,
+  "CONTROL time-shuffled raw (512d)": 0.537037037037037,
+  "CONTROL gaussian noise (512d)": 0.45061728395061723,
+  "CONTROL permuted labels (512d)": 0.4690909090909091
+ },
+ {
+  "seed": 29,
+  "raw projection (78d)": 0.6450617283950617,
+  "raw projection (512d)": 0.6481481481481481,
+  "structured rhythm (78d)": 0.6141975308641976,
+  "structured rhythm (512d)": 0.6080246913580246,
+  "CONTROL time-shuffled raw (512d)": 0.48456790123456783,
+  "CONTROL gaussian noise (512d)": 0.5308641975308642,
+  "CONTROL permuted labels (512d)": 0.40384615384615385
+ },
+ {
+  "seed": 31,
+  "raw projection (78d)": 0.7932098765432098,
+  "raw projection (512d)": 0.8209876543209877,
+  "structured rhythm (78d)": 0.7530864197530864,
+  "structured rhythm (512d)": 0.7530864197530864,
+  "CONTROL time-shuffled raw (512d)": 0.6574074074074074,
+  "CONTROL gaussian noise (512d)": 0.6419753086419753,
+  "CONTROL permuted labels (512d)": 0.5523809523809524
+ },
+ {
+  "seed": 37,
+  "raw projection (78d)": 0.6265432098765432,
+  "raw projection (512d)": 0.6049382716049383,
+  "structured rhythm (78d)": 0.5154320987654321,
+  "structured rhythm (512d)": 0.43209876543209874,
+  "CONTROL time-shuffled raw (512d)": 0.3858024691358025,
+  "CONTROL gaussian noise (512d)": 0.6820987654320987,
+  "CONTROL permuted labels (512d)": 0.5555555555555556
+ },
+ {
+  "seed": 41,
+  "raw projection (78d)": 0.7314814814814814,
+  "raw projection (512d)": 0.6728395061728395,
+  "structured rhythm (78d)": 0.5987654320987654,
+  "structured rhythm (512d)": 0.6141975308641976,
+  "CONTROL time-shuffled raw (512d)": 0.4135802469135802,
+  "CONTROL gaussian noise (512d)": 0.4938271604938272,
+  "CONTROL permuted labels (512d)": 0.6153846153846154
+ },
+ {
+  "seed": 42,
+  "raw projection (78d)": 0.6141975308641976,
+  "raw projection (512d)": 0.6882716049382716,
+  "structured rhythm (78d)": 0.6820987654320988,
+  "structured rhythm (512d)": 0.6697530864197531,
+  "CONTROL time-shuffled raw (512d)": 0.6388888888888888,
+  "CONTROL gaussian noise (512d)": 0.5462962962962963,
+  "CONTROL permuted labels (512d)": 0.5619047619047619
+ },
+ {
+  "seed": 45,
+  "raw projection (78d)": 0.8950617283950617,
+  "raw projection (512d)": 0.8024691358024691,
+  "structured rhythm (78d)": 0.6820987654320988,
+  "structured rhythm (512d)": 0.5524691358024691,
+  "CONTROL time-shuffled raw (512d)": 0.49382716049382713,
+  "CONTROL gaussian noise (512d)": 0.44753086419753085,
+  "CONTROL permuted labels (512d)": 0.6666666666666667
+ },
+ {
+  "seed": 53,
+  "raw projection (78d)": 0.6851851851851852,
+  "raw projection (512d)": 0.7407407407407407,
+  "structured rhythm (78d)": 0.7962962962962962,
+  "structured rhythm (512d)": 0.7962962962962963,
+  "CONTROL time-shuffled raw (512d)": 0.5864197530864197,
+  "CONTROL gaussian noise (512d)": 0.5370370370370371,
+  "CONTROL permuted labels (512d)": 0.5692307692307692
+ },
+ {
+  "seed": 59,
+  "raw projection (78d)": 0.5648148148148149,
+  "raw projection (512d)": 0.7438271604938271,
+  "structured rhythm (78d)": 0.5709876543209876,
+  "structured rhythm (512d)": 0.558641975308642,
+  "CONTROL time-shuffled raw (512d)": 0.6141975308641976,
+  "CONTROL gaussian noise (512d)": 0.48148148148148145,
+  "CONTROL permuted labels (512d)": 0.6470588235294118
+ },
+ {
+  "seed": 61,
+  "raw projection (78d)": 0.7191358024691358,
+  "raw projection (512d)": 0.6882716049382716,
+  "structured rhythm (78d)": 0.7654320987654321,
+  "structured rhythm (512d)": 0.7932098765432098,
+  "CONTROL time-shuffled raw (512d)": 0.4783950617283951,
+  "CONTROL gaussian noise (512d)": 0.478395061728395,
+  "CONTROL permuted labels (512d)": 0.5616883116883117
+ },
+ {
+  "seed": 67,
+  "raw projection (78d)": 0.5493827160493827,
+  "raw projection (512d)": 0.7222222222222222,
+  "structured rhythm (78d)": 0.6049382716049383,
+  "structured rhythm (512d)": 0.7623456790123457,
+  "CONTROL time-shuffled raw (512d)": 0.6049382716049383,
+  "CONTROL gaussian noise (512d)": 0.5123456790123457,
+  "CONTROL permuted labels (512d)": 0.37142857142857144
+ },
+ {
+  "seed": 7,
+  "raw projection (78d)": 0.5925925925925926,
+  "raw projection (512d)": 0.654320987654321,
+  "structured rhythm (78d)": 0.7253086419753086,
+  "structured rhythm (512d)": 0.6327160493827161,
+  "CONTROL time-shuffled raw (512d)": 0.46296296296296297,
+  "CONTROL gaussian noise (512d)": 0.3487654320987654,
+  "CONTROL permuted labels (512d)": 0.5083612040133779
+ },
+ {
+  "seed": 71,
+  "raw projection (78d)": 0.611111111111111,
+  "raw projection (512d)": 0.8395061728395061,
+  "structured rhythm (78d)": 0.7746913580246914,
+  "structured rhythm (512d)": 0.6790123456790123,
+  "CONTROL time-shuffled raw (512d)": 0.4629629629629629,
+  "CONTROL gaussian noise (512d)": 0.5679012345679012,
+  "CONTROL permuted labels (512d)": 0.545138888888889
+ },
+ {
+  "seed": 73,
+  "raw projection (78d)": 0.7253086419753086,
+  "raw projection (512d)": 0.7654320987654322,
+  "structured rhythm (78d)": 0.6759259259259259,
+  "structured rhythm (512d)": 0.7685185185185186,
+  "CONTROL time-shuffled raw (512d)": 0.4753086419753087,
+  "CONTROL gaussian noise (512d)": 0.4567901234567901,
+  "CONTROL permuted labels (512d)": 0.3194444444444445
+ },
+ {
+  "seed": 79,
+  "raw projection (78d)": 0.867283950617284,
+  "raw projection (512d)": 0.8641975308641976,
+  "structured rhythm (78d)": 0.8024691358024691,
+  "structured rhythm (512d)": 0.75,
+  "CONTROL time-shuffled raw (512d)": 0.5,
+  "CONTROL gaussian noise (512d)": 0.5617283950617284,
+  "CONTROL permuted labels (512d)": 0.3923076923076923
+ },
+ {
+  "seed": 82,
+  "raw projection (78d)": 0.6697530864197531,
+  "raw projection (512d)": 0.7777777777777778,
+  "structured rhythm (78d)": 0.7191358024691358,
+  "structured rhythm (512d)": 0.6944444444444444,
+  "CONTROL time-shuffled raw (512d)": 0.5462962962962963,
+  "CONTROL gaussian noise (512d)": 0.5401234567901234,
+  "CONTROL permuted labels (512d)": 0.5653846153846154
+ },
+ {
+  "seed": 83,
+  "raw projection (78d)": 0.617283950617284,
+  "raw projection (512d)": 0.6882716049382717,
+  "structured rhythm (78d)": 0.5648148148148149,
+  "structured rhythm (512d)": 0.5895061728395061,
+  "CONTROL time-shuffled raw (512d)": 0.4012345679012346,
+  "CONTROL gaussian noise (512d)": 0.5586419753086419,
+  "CONTROL permuted labels (512d)": 0.5317725752508361
+ },
+ {
+  "seed": 89,
+  "raw projection (78d)": 0.6574074074074074,
+  "raw projection (512d)": 0.6975308641975309,
+  "structured rhythm (78d)": 0.6358024691358025,
+  "structured rhythm (512d)": 0.6481481481481481,
+  "CONTROL time-shuffled raw (512d)": 0.5277777777777778,
+  "CONTROL gaussian noise (512d)": 0.6296296296296297,
+  "CONTROL permuted labels (512d)": 0.5272727272727273
+ },
+ {
+  "seed": 91,
+  "raw projection (78d)": 0.7376543209876543,
+  "raw projection (512d)": 0.7253086419753085,
+  "structured rhythm (78d)": 0.6574074074074074,
+  "structured rhythm (512d)": 0.5617283950617283,
+  "CONTROL time-shuffled raw (512d)": 0.6882716049382716,
+  "CONTROL gaussian noise (512d)": 0.4135802469135802,
+  "CONTROL permuted labels (512d)": 0.6266233766233766
+ },
+ {
+  "seed": 97,
+  "raw projection (78d)": 0.7561728395061729,
+  "raw projection (512d)": 0.6666666666666666,
+  "structured rhythm (78d)": 0.7037037037037037,
+  "structured rhythm (512d)": 0.7098765432098766,
+  "CONTROL time-shuffled raw (512d)": 0.4691358024691358,
+  "CONTROL gaussian noise (512d)": 0.47530864197530864,
+  "CONTROL permuted labels (512d)": 0.4821428571428571
+ }
+]
