@@ -260,7 +260,7 @@ for _f in train_hrd.py train_hrd_energy.py data_processing/data_preprocessing.py
           tasks/rhythm.py tasks/decomposition.py tasks/_eval_protocols.py tasks/energy.py \
           tasks/_experiment_common.py \
           experiment_q1.py experiment_q2.py experiment_q3.py \
-          scripts/collect_results.py scripts/_results.py scripts/_style.py \
+          scripts/collect_results.py scripts/_results.py tasks/style.py \
           models datasets/HRD_RAW_MinuteLevel.csv; do
   [ -e "$_f" ] || MISSING="$MISSING $_f"
 done
