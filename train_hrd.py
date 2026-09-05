@@ -1244,7 +1244,8 @@ def main():
     # Sliding trailing windows, one per labelled day. Non-fatal: never abort the depression run.
     if args.energy_probe:
         try:
-            from data_processing.data_preprocessing import (prepare_hrd_energy_sliding,
+            from data_processing.data_preprocessing import (drop_sensor_channels,
+                                                            prepare_hrd_energy_sliding,
                                                 clear_hrd_cache)
             from tasks.energy import run_energy_tasks
             print("[energy] emotional-energy probe (reusing frozen encoder, sliding windows) ...")
@@ -1258,6 +1259,15 @@ def main():
                 clock_features=args.with_clock_features,   # match the encoder's channel count
                 calendar_index=args.pe in CALENDAR_PES)
             clear_hrd_cache()                          # last consumer -- free the ~1 GiB tables
+            # The SAME channel drop the depression path applies at line ~836. Without it the
+            # energy windows keep a channel the encoder was never built for, and input_fc --
+            # Linear(3, 64) after dropping Steps -- is handed 4 columns. The whole energy
+            # probe then dies with `mat1 and mat2 shapes cannot be multiplied (43008x4 and
+            # 3x64)`, non-fatally, so every run using --drop-channels has silently produced
+            # no energy results at all. The clock/calendar flags above are passed for exactly
+            # this reason and the channel drop was the one that was missed.
+            if args.drop_channels:
+                edata = drop_sensor_channels(edata, args.drop_channels)
             Xe, eee, pe = edata["X"], edata["ee"], edata["pids"]
             print(f"[energy] {len(Xe):,} probe windows (every {args.energy_stride} labelled "
                   f"day(s)) in {time.time() - _t:.0f}s")
