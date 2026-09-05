@@ -53,6 +53,9 @@ _OWNER = [
     # control does? It is scored as a utility ladder at the benchmark window unit, so
     # it sits with RQ3 rather than with the RQ1 recovery diagnostics.
     ("readout_interaction", "RQ3"),
+    # RQ1 split into the amplitude and phase halves of the seasonal component, which
+    # three other measurements say move in opposite directions under pretraining.
+    ("block_recovery", "RQ1"),
     # ---- descriptive, owned by no RQ -----------------------------------------------
     ("hrd_tsne", "RQ0_descriptive"),
     ("hrd_umap", "RQ0_descriptive"),

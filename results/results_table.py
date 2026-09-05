@@ -328,6 +328,41 @@ ROWS = [
      "SSL -> frozen + head", "balanced acc", 0.5056, "", "", "", "", "",
      "runs 2240054-57", ""),
 
+    # === RQ3 under a phase-only seasonal readout ==========================================
+    # Predicted IN ADVANCE from RQ1 and RQ2, which agree that pretraining builds the phase
+    # block and degrades the amplitude one: dropping amplitude from the readout should help
+    # DSSL and not its untrained control. It did, in the means -- and the interaction test
+    # says that is not established.
+    ("spec_phase readout", "GLOBEM", "LODO, 4 folds x 24 seeds, window unit", 96,
+     "DSSL + rhythm + raw skip", "balanced acc", 0.5573, "Cosinor", 0.0090, "61/96", 0.0103,
+     "the best arm this project has produced, above the published 0.547",
+     "runs 2240054-57, spec_phase",
+     "EXTRA='--season-pool spec_phase' via scripts/stability_gate.sh"),
+    ("spec_phase readout", "GLOBEM", "LODO, 4 folds x 24 seeds, window unit", 96,
+     "Random-init + rhythm + raw skip", "balanced acc", 0.5548, "Cosinor", 0.0065, "56/95",
+     0.1002, "the control version is no longer the significant one -- under the previous "
+     "readout it was, at p=0.018, and the DSSL version was not",
+     "runs 2240054-57, spec_phase", ""),
+    ("spec_phase readout", "GLOBEM", "LODO, 4 folds x 24 seeds, window unit", 96,
+     "DSSL (frozen)", "balanced acc", 0.5260, "Random-init", 0.0056, "57/95", 0.0642,
+     "was exactly +0.0000 at 49/96 under the full spectral readout",
+     "runs 2240054-57, spec_phase", ""),
+    ("spec_phase readout", "GLOBEM", "paired per variant vs the spec readout", 96,
+     "DSSL (frozen), spec_phase minus spec", "AUROC", "", "spec readout", 0.0043, "57/96",
+     0.0822, "DSSL goes UP when the amplitude block is dropped",
+     "runs 2240054-57", "python scripts/compare_readouts.py rq3_utility_spec.csv"),
+    ("spec_phase readout", "GLOBEM", "paired per variant vs the spec readout", 96,
+     "Random-init, spec_phase minus spec", "balanced acc", "", "spec readout", -0.0044,
+     "38/96", 0.0519, "and the control goes DOWN -- the predicted asymmetry, in the means",
+     "runs 2240054-57", ""),
+    ("spec_phase readout", "GLOBEM", "interaction, paired per variant", 96,
+     "(DSSL after-before) minus (control after-before)", "balanced acc", "", "zero", 0.0057,
+     "51/96", 0.6101,
+     "THE ASYMMETRY IS NOT ESTABLISHED. The means move apart but the sign holds in half the "
+     "variants, so a few of them carry it -- the exact failure compare_readouts was built "
+     "to catch, and it was read off the means first anyway",
+     "runs 2240054-57", ""),
+
     # === GLOBEM published benchmark =======================================================
     ("published benchmark", "GLOBEM", "leave-one-dataset-out, window unit", "",
      "Reorder (Xu et al.)", "balanced acc", 0.547, "", "", "", "",
