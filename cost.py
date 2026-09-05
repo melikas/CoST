@@ -313,11 +313,15 @@ class CoSTModel(nn.Module):
                  trend_pool: str = "random",
                  negatives: str = "global",
                  n_negatives: int = 0,
-                 noise_weight: float = 0.0):
+                 noise_weight: float = 0.0,
+                 noise_mask_frac: float = 0.3,
+                 noise_span: int = 8):
         super().__init__()
         # Weight of the V^N term. 0 turns the branch's objective off completely, so a run
         # written before this key existed trains exactly the model it trained.
         self.noise_weight = float(noise_weight)
+        self.noise_mask_frac = float(noise_mask_frac)
+        self.noise_span = int(noise_span)
 
         # 'random' is upstream CoST: the trend term contrasts ONE random timestep, pushed
         # through head_q. But head_q is discarded at inference and encode() mean-pools the
@@ -548,6 +552,42 @@ class CoSTModel(nn.Module):
         loss = (logits[:, i, B + i - 1].mean() + logits[:, B + i, i].mean()) / 2
         return loss
 
+    def _masked_noise_loss(self, x):
+        """MSE on the residual at timesteps the branch was not shown.
+
+        Not contrastive, and that is the point. Every other objective here is invariance
+        learning: it can only discard, and its ceiling is the predictive content of whatever
+        its positive pair leaves invariant. Measured over every implemented pair on HRD, no
+        such ceiling clears what an untrained baseline already reaches -- window 0.7151,
+        participant 0.6658, day-disjoint 0.6574, against 0.7198 for a random projection of
+        the raw window. That family is bounded on this data.
+
+        A prediction task is not bounded that way. It cannot be satisfied by throwing
+        anything away, and it cannot be solved at initialisation -- which the contrastive
+        trend task can, at 26x chance.
+
+        Contiguous SPANS, not scattered timesteps. A residual is high-frequency, so a
+        scattered mask is filled by interpolating the neighbours on either side, and the
+        branch would learn a smoother rather than the structure. A span long enough to cover
+        several bins has no such shortcut.
+        """
+        import math
+        B, T = x.size(0), x.size(1)
+        n_span = max(1, int(round(self.noise_mask_frac * T / self.noise_span)))
+        mask = torch.zeros(B, T, dtype=torch.bool, device=x.device)
+        starts = torch.randint(0, max(1, T - self.noise_span), (B, n_span), device=x.device)
+        for k in range(n_span):
+            idx = starts[:, k].unsqueeze(1) + torch.arange(self.noise_span, device=x.device)
+            mask.scatter_(1, idx.clamp(max=T - 1), True)
+        pred, target = self.encoder_q.reconstruct_noise(x, mask)
+        m = mask.unsqueeze(-1).expand_as(target)
+        if not m.any():
+            return None
+        # Scale-free: the residual's variance differs by orders of magnitude between
+        # channels, and an unnormalised MSE would be a report on the loudest one.
+        sd = target.std(dim=1, keepdim=True).clamp_min(1e-6)
+        return F.mse_loss((pred / sd)[m], (target / sd)[m])
+
     def _trend_view(self, z, idx):
         """The vector the trend term contrasts: one timestep (upstream) or the mean."""
         return z.mean(1) if self.trend_pool == "mean" else z[:, idx]
@@ -649,8 +689,7 @@ class CoSTModel(nn.Module):
         # every arm in this project.
         noise_loss = None
         if self.noise_weight > 0 and getattr(self.encoder_q, "noise_branch", False):
-            noise_loss = self.instance_contrastive_loss(self.encoder_q.encode_noise(x_q),
-                                                        self.encoder_q.encode_noise(x_k))
+            noise_loss = self._masked_noise_loss(x_q)
 
         # GradNorm balances trend vs seasonal.
         if return_parts:
@@ -716,6 +755,11 @@ class CoST:
                  noise_weight: float = 0.0,
                  noise_branch: bool = False,
                  noise_depth: Optional[int] = None,
+                 # Fraction of timesteps hidden, and how long each hidden run is. Spans, not
+                 # scattered steps: a scattered mask on a high-frequency residual is filled
+                 # by interpolating its neighbours, which teaches a smoother.
+                 noise_mask_frac: float = 0.3,
+                 noise_span: int = 8,
                  moco_k: int = 4096,
                  trend_pool: str = "random",
                  positive_pair: str = "window",
@@ -839,6 +883,8 @@ class CoST:
             negatives=negatives,
             n_negatives=n_negatives,
             noise_weight=noise_weight,
+            noise_mask_frac=noise_mask_frac,
+            noise_span=noise_span,
             device=self.device,
         ).to(self.device)
 

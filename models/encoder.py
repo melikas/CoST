@@ -318,6 +318,22 @@ class CoSTEncoder(nn.Module):
             # that no caller's tuple arity changes.
             self.register_buffer("noise_proj",
                                  _residual_projection(length, bins_per_day), persistent=False)
+            # A DECODER -- the layer this model has never had. Every objective here so far is
+            # contrastive, and contrastive learning is invariance learning: it can only
+            # discard, and its ceiling is the predictive content of whatever its positive
+            # pair leaves invariant. Measured over every implemented pair, no such ceiling
+            # clears what an untrained baseline already reaches, so that family is bounded on
+            # this data.
+            #
+            # Masked reconstruction is not bounded that way. It asks the branch to PREDICT
+            # the residual at timesteps it was not shown, so it cannot be solved by discarding
+            # anything, and its ceiling is the content of the input rather than of an
+            # invariant subspace. The residual is where the depression label measurably is --
+            # 0.6862 probed alone against 0.6228 for trend and seasonal together.
+            self.noise_decoder = nn.Sequential(
+                nn.Conv1d(component_dims, hidden_dims, 3, padding=1),
+                nn.GELU(),
+                nn.Conv1d(hidden_dims, self.n_sensor_dims, 3, padding=1))
 
         self.kernels = kernels
 
@@ -371,6 +387,49 @@ class CoSTEncoder(nn.Module):
                  for b, (bd, w) in enumerate(zip(self.seasonal_bands, widths))]
             )
 
+    def residual_of(self, x):
+        """The residual component of `x`, B x T x n_sensors.
+
+        Exposed because the masked objective needs it as a TARGET as well as an input, and
+        recomputing it in the loss would be a second definition of the same thing.
+        """
+        z = torch.nan_to_num(x[..., :self.n_sensor_dims], nan=0.0)
+        T = self.noise_proj.size(0)
+        if z.size(1) != T:
+            # The projection is built once at `length` (= max_train_length). The seasonal
+            # branch has the same dependence and silently reads the wrong frequency bands
+            # when they disagree; this says so instead.
+            raise ValueError(
+                f"residual projection was built for windows of {T} steps and got "
+                f"{z.size(1)}. The noise branch needs max_train_length to equal the window "
+                f"length, which build_model gives it unless --max-train-length crops.")
+        return torch.einsum("ts,bsc->btc", self.noise_proj.to(z.dtype), z)
+
+    def reconstruct_noise(self, x, mask):
+        """Predict the residual at the MASKED timesteps from the ones left visible.
+
+        `mask` is B x T, True where a timestep is hidden. The branch never sees those steps,
+        so the only way to score there is to have modelled how the residual moves -- which is
+        what makes this task unsolvable at initialisation, unlike the trend branch's
+        contrastive one, whose top-1 is 26x chance before any training.
+
+        Returns (prediction, target), both B x T x n_sensors, for the caller to score on the
+        masked positions.
+        """
+        if not self.noise_branch:
+            return None, None
+        # The projection defines the TARGET and never touches the input. Applying it to the
+        # input first and masking afterwards does not hide anything: R = I - P mixes the
+        # whole time axis through P's twelve basis functions, so the residual at a visible
+        # step still carries the masked ones. Measured before this was fixed, shifting the
+        # masked inputs by 5.0 moved the prediction by 0.23 -- a task partly solvable by
+        # reading the leak rather than by modelling anything.
+        xs = torch.nan_to_num(x[..., :self.n_sensor_dims], nan=0.0)
+        vis = xs * (~mask).unsqueeze(-1).to(xs.dtype)
+        z = self.noise_fc(vis)
+        z = self.noise_extractor(z.transpose(1, 2))
+        return self.noise_decoder(z).transpose(1, 2), self.residual_of(x)
+
     def encode_noise(self, x):
         """V^N from the residual of `x`, B x T x component_dims. None when the branch is off.
 
@@ -384,9 +443,10 @@ class CoSTEncoder(nn.Module):
         """
         if not self.noise_branch:
             return None
-        x = torch.nan_to_num(x[..., :self.n_sensor_dims], nan=0.0)
-        r = torch.einsum("ts,bsc->btc", self.noise_proj.to(x.dtype), x)
-        z = self.noise_fc(r)                                     # B x T x hidden
+        # The RAW signal, matching what reconstruct_noise is trained on -- feeding the
+        # residual here and the signal there would read the branch in a state it never saw.
+        # What makes this the noise branch is its objective, not a projection on its input.
+        z = self.noise_fc(torch.nan_to_num(x[..., :self.n_sensor_dims], nan=0.0))
         z = self.noise_extractor(z.transpose(1, 2)).transpose(1, 2)
         return self.repr_dropout(z)
 

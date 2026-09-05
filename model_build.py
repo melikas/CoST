@@ -74,6 +74,8 @@ def build_model(cfg, X, n_sensors, device, **override):
         noise_weight=cfg.get("noise_weight", 0.0),
         noise_branch=cfg.get("noise_branch", False),
         noise_depth=cfg.get("noise_depth", None),
+        noise_mask_frac=cfg.get("noise_mask_frac", 0.3),
+        noise_span=cfg.get("noise_span", 8),
         mask_mode=cfg["mask_mode"], mask_prob=cfg["mask_keep_prob"],
         phase_mode=cfg["phase_encoding"], device=device, lr=cfg["lr"],
         batch_size=cfg["batch_size"])
