@@ -96,11 +96,6 @@ def seed_cells(variants):
     return sorted({(k.run, k.holdout, k.label, k.seed) for k in variants})
 
 
-def in_cell(k, cell):
-    """True when variant ``k`` belongs to the ``seed_cells`` entry ``cell``."""
-    return (k.run, k.holdout, k.label, k.seed) == cell
-
-
 def census(variants, results_dir=""):
     """Print a one-line census and warn loudly when a tree mixes folds or targets."""
     cells = seed_cells(variants)

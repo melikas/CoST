@@ -43,7 +43,7 @@ from pathlib import Path
 
 import numpy as np
 
-from tasks.sign_test import sign_p, sign_summary
+from tasks.sign_test import sign_summary
 
 NAME = "readout_interaction"
 

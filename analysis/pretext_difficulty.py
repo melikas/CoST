@@ -196,9 +196,9 @@ def main():
     ceil = _ceilings(a.ceilings)
     hard = s <= 0.30
     c = ceil.get("participant pair")
-    print(f"  ceiling of the hard pair: "
+    print("  ceiling of the hard pair: "
           + (f"{c:.4f}   (baseline to beat: {a.baseline:.4f})" if c is not None
-             else f"UNKNOWN -- run analysis/positive_pair_ceiling.py"))
+             else "UNKNOWN -- run analysis/positive_pair_ceiling.py"))
     if not hard:
         verdict = "DO NOT SUBMIT -- still solved at init; the gradient would teach nothing"
     elif c is None:
@@ -228,7 +228,7 @@ def main():
     if getattr(ctx, "variant_dir", None):
         save(out_dir(ctx, "rq1"), "pretext_difficulty", res)
     else:
-        print(f"[gate] no variant directory (--npz mode); result not saved")
+        print("[gate] no variant directory (--npz mode); result not saved")
 
 
 if __name__ == "__main__":

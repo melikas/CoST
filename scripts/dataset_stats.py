@@ -24,7 +24,7 @@ import numpy as np
 import pandas as pd
 
 sys.path.insert(0, str(Path(__file__).resolve().parent))
-from _style import (BASE, C_GLB, C_HRD, CRIT, GRID, INK, INK2,   # noqa: E402
+from tasks.style import (BASE, C_GLB, C_HRD, CRIT, GRID, INK, INK2,   # noqa: E402
                     MUTED, SURFACE, save, strip)
 import matplotlib.pyplot as plt                              # noqa: E402
 from matplotlib.patches import Rectangle                     # noqa: E402

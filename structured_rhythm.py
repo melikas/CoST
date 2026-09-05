@@ -130,19 +130,3 @@ def structured_features(X, bins_per_day, n_sensors, harmonics=4):
               wk_a, np.cos(wk_p), np.sin(wk_p)]
     return np.nan_to_num(np.concatenate(blocks, axis=1).astype(np.float32),
                          nan=0.0, posinf=0.0, neginf=0.0)
-
-
-def feature_names(n_sensors, bins_per_day, harmonics=4):
-    """Column names in the exact order structured_features emits them."""
-    H = min(int(harmonics), max_harmonics(bins_per_day))
-    C = int(n_sensors)
-    iu, ju = np.triu_indices(C, k=1)
-    out = [f"mesor_c{c}" for c in range(C)]
-    for tag in ("amp", "cos_phase", "sin_phase", "R", "cv"):
-        out += [f"{tag}_h{h}_c{c}" for h in range(1, H + 1) for c in range(C)]
-    out += [f"cos_dphi_c{i}c{j}" for i, j in zip(iu, ju)]
-    out += [f"sin_dphi_c{i}c{j}" for i, j in zip(iu, ju)]
-    out += [f"weekly_amp_c{c}" for c in range(C)]
-    out += [f"weekly_cos_c{c}" for c in range(C)]
-    out += [f"weekly_sin_c{c}" for c in range(C)]
-    return out

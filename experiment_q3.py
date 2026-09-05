@@ -159,7 +159,8 @@ def degrade(X, kind, level, n_sensors, sig, bpd, bin_minutes, rng):
 
 
 def main():
-    p = argparse.ArgumentParser(description=__doc__)
+    p = argparse.ArgumentParser(description=__doc__,
+                                formatter_class=argparse.RawDescriptionHelpFormatter)
     p.add_argument("--variant-dir", required=True)
     p.add_argument("--cache-dir", default=None)
     p.add_argument("--gpu", type=int, default=0)

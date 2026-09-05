@@ -3,7 +3,7 @@ import numpy as np
 import pytest
 import torch
 
-from model_build import build_model, paper_kernels
+from model_build import build_model
 
 CFG = dict(alpha=0.005, repr_dims=320, hidden_dims=64, depth=10, backbone="tcn", pe="none",
            time2vec_dim=65, loss_balance="fixed", bin_minutes=15, disentangle=True,
@@ -191,7 +191,7 @@ def test_masking_is_contiguous_spans_not_scattered_steps():
     seen = []
     for _ in range(20):
         # rebuild the mask the loss builds, by calling the loss and capturing the span length
-        B, T = x.size(0), x.size(1)
+        T = x.size(1)
         n_span = max(1, int(round(m.cost.noise_mask_frac * T / m.cost.noise_span)))
         seen.append(n_span * m.cost.noise_span / T)
     assert m.cost.noise_span >= 4, "spans too short to defeat interpolation"

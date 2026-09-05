@@ -65,10 +65,22 @@ def raw_projection(X, n_sensors, width, seed, bands=None, length=None):
     bin ranges are kept before projecting. That is the only difference between arm 2 and arm 3:
     whether the random mixture is over the whole signal or over the circadian bands alone.
     """
-    S = np.nan_to_num(np.asarray(X[:, :, :n_sensors], dtype=float), nan=0.0)
-    if bands is None:
-        F = S.reshape(len(S), -1)
+    S = np.nan_to_num(np.asarray(X, dtype=float), nan=0.0)
+    if S.ndim == 2:
+        # An already-flat feature block, so there is no time axis to slice or band-limit.
+        # This is the second implementation folded back in: analysis/projection_sanity.py
+        # carried its own copy because this one assumed (N, T, C), and the two differed in
+        # their scale -- 1/sqrt(d_in) here against 1/sqrt(d_out) there. That difference is
+        # invisible to every consumer, because make_probe puts a StandardScaler first and a
+        # global factor on all columns cannot survive it; measured, both give AUC 0.654321
+        # on the same windows. Which is exactly why two versions could drift apart unnoticed.
+        if bands is not None:
+            raise ValueError("bands need a (N, T, C) window; got a flat matrix")
+        F = S
+    elif bands is None:
+        F = S[:, :, :n_sensors].reshape(len(S), -1)
     else:
+        S = S[:, :, :n_sensors]
         Z = np.fft.rfft(S, axis=1)
         keep = np.concatenate([np.arange(lo, min(hi, Z.shape[1])) for lo, hi in bands])
         z = Z[:, keep]

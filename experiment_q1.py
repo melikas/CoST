@@ -136,7 +136,8 @@ def headline(model, X_feat, tau, sig, fit, sel, test, stride=4, plain=False, gro
 
 
 def main():
-    p = argparse.ArgumentParser(description=__doc__)
+    p = argparse.ArgumentParser(description=__doc__,
+                                formatter_class=argparse.RawDescriptionHelpFormatter)
     p.add_argument("--variant-dir", required=True)
     p.add_argument("--cache-dir", default=None, help="Scratch dir for the windowed-dataset cache")
     p.add_argument("--gpu", type=int, default=0)

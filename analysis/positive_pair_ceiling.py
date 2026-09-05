@@ -55,7 +55,6 @@ def invariant_window(X, cfg, n_sensors, draws, seed):
     depress the ceiling for a reason that has nothing to do with the augmentation.
     """
     import torch
-    from cost import PretrainDataset
     ds = _dataset(X, cfg, n_sensors, "window", seed)
     out = np.zeros_like(np.asarray(X, dtype=np.float32))
     with torch.no_grad():

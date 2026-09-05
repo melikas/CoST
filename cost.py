@@ -205,9 +205,7 @@ class PretrainDataset(Dataset):
 
     def __getitem__(self, item):
         i = item % self.N
-        j = i
-        if self.peers is not None and len(self.peers[i]):
-            j = int(self.peers[i][random.randrange(len(self.peers[i]))])
+        j = self._peer(i)
         # Same pair for both branches -- the historical behaviour, returned in the same
         # 4-view shape so the training loop has one code path.
         if self.positive == "day-disjoint":
@@ -571,7 +569,6 @@ class CoSTModel(nn.Module):
         branch would learn a smoother rather than the structure. A span long enough to cover
         several bins has no such shortcut.
         """
-        import math
         B, T = x.size(0), x.size(1)
         n_span = max(1, int(round(self.noise_mask_frac * T / self.noise_span)))
         mask = torch.zeros(B, T, dtype=torch.bool, device=x.device)

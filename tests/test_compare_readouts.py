@@ -3,8 +3,6 @@ import subprocess
 import sys
 from pathlib import Path
 
-import pytest
-
 HEADER = "role,representation,auc,ci_lo,ci_hi,balanced_acc\n"
 
 

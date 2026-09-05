@@ -1,6 +1,5 @@
 """The arms are assembled right, and the verdict follows the numbers rather than the wish."""
 import json
-from pathlib import Path
 
 import numpy as np
 import pytest
@@ -71,7 +70,6 @@ def test_aggregate_refuses_an_empty_run(tmp_path):
 def test_vs_production_table_is_paired_not_averaged(tmp_path, capsys):
     """A readout that beats PRODUCTION in every variant must read 24/24, and one that beats
     it only on average -- big wins on a few, losses on the rest -- must not."""
-    names = ["PRODUCTION", "both seg  4", "both seg 28"]
     rng = np.random.default_rng(2)
     n = 24
     for i in range(n):

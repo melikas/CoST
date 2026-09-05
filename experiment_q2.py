@@ -33,17 +33,15 @@ The claim this file supports is therefore about rhythmic PHASE deviation, and sa
   python experiment_q2.py --variant-dir results_hrd/<run>/<backbone>_<pe>_seed<S>
 """
 import argparse
-import sys
-from pathlib import Path as _Path
 
 import matplotlib
 matplotlib.use("Agg")
 import matplotlib.pyplot as plt
 
 # The project's single figure style, shared with scripts/collect_results.py so the paper's
-# figures cannot drift apart. It lives under scripts/ (not an importable package).
-sys.path.insert(0, str(_Path(__file__).resolve().parent / "scripts"))
-from _style import ACCENT, BASE, GRID, INK, INK2, MUTED, SURFACE, strip  # noqa: E402
+# figures cannot drift apart. It used to live under scripts/, which is not an importable
+# package, so all five of its consumers manipulated sys.path to reach it.
+from tasks.style import ACCENT, BASE, GRID, INK, INK2, MUTED, SURFACE, strip
 import numpy as np
 import pandas as pd
 from scipy.stats import rankdata
@@ -241,7 +239,8 @@ def concordance(per_stratum, pid_of, draw=None):
 
 
 def main():
-    p = argparse.ArgumentParser(description=__doc__)
+    p = argparse.ArgumentParser(description=__doc__,
+                                formatter_class=argparse.RawDescriptionHelpFormatter)
     p.add_argument("--variant-dir", required=True)
     p.add_argument("--cache-dir", default=None)
     p.add_argument("--gpu", type=int, default=0)

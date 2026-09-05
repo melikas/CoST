@@ -185,11 +185,6 @@ class WindowingConfig:
     def n_time_features(self) -> int:
         return len(self.clock_field_ranges)
 
-    @property
-    def bins_per_window(self) -> int:
-        return self.window_hours * 60 // self.bin_minutes
-
-
 CHANNELS = ChannelConfig()
 CLEANING = CleaningConfig()
 WINDOWING = WindowingConfig()

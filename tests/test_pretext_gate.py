@@ -1,5 +1,4 @@
 """The gate must refuse a pair that is learnable but useless, not just one that is solved."""
-import json
 import subprocess
 import sys
 from pathlib import Path

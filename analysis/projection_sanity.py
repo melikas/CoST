@@ -42,20 +42,6 @@ import json
 import numpy as np
 
 
-def project(F, width, seed):
-    """A Gaussian projection of an ALREADY FLAT feature matrix.
-
-    raw_projection takes (N, T, C) windows and flattens them itself, so passing it a
-    2-D block raises. This is the same map for a block that is already flat, and it is what
-    lets the rhythm arm be compared at the projection's width instead of its own.
-    """
-    F = np.asarray(F, dtype=float)
-    F = (F - F.mean(0)) / (F.std(0) + 1e-8)
-    rng = np.random.default_rng(seed)
-    W = rng.normal(0, 1.0 / np.sqrt(width), (F.shape[1], int(width)))
-    return (F @ W).astype(np.float32)
-
-
 def main():
     ap = argparse.ArgumentParser(description=__doc__,
                                 formatter_class=argparse.RawDescriptionHelpFormatter)
@@ -91,7 +77,7 @@ def main():
         r[f"raw projection ({W}d)"] = _probe_auc(raw_projection(S, ns, W, sd), ctx)
         r["raw projection (512d)"] = _probe_auc(raw_projection(S, ns, 512, sd), ctx)
         r[f"structured rhythm ({W}d)"] = _probe_auc(rhythm, ctx)
-        r["structured rhythm (512d)"] = _probe_auc(project(rhythm, 512, sd), ctx)
+        r["structured rhythm (512d)"] = _probe_auc(raw_projection(rhythm, None, 512, sd), ctx)
         # controls
         r["CONTROL time-shuffled raw (512d)"] = _probe_auc(
             raw_projection(S_shuf, ns, 512, sd), ctx)
@@ -122,7 +108,7 @@ def main():
     print()
     ctrl = max(np.nanmean([r[n] for r in rows]) for n in names if n.startswith("CONTROL"))
     print("  Every CONTROL must sit at chance. If one does not, the probe is reading")
-    print(f"  something other than the signal and no number here means anything.")
+    print("  something other than the signal and no number here means anything.")
     print(f"  worst control: {ctrl:.4f}"
           + ("   -- OK" if ctrl < 0.58 else "   -- PROBLEM, stop and investigate"))
 

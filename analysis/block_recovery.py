@@ -106,7 +106,6 @@ def readout_blocks(model, X, cfg):
     """{block: (n, d)} -- the trend half, and the amplitude and phase halves of the
     spectral seasonal readout, exactly as the shipped readout builds them."""
     import torch
-    from model_build import encode_repr
     net = model.net
     net.eval()
     Xf = np.asarray(X, dtype=np.float32)
@@ -133,7 +132,7 @@ def aggregate(run_dir):
     blocks = list(rows[0]["DSSL"])
     print()
     print(f"  {len(rows)} seeds, HRD -- held-out R2 of recovering the TRUE seasonal")
-    print(f"  component's amplitude and phase from the representation")
+    print("  component's amplitude and phase from the representation")
     for tgt in ("amp", "phase"):
         print()
         print(f"  --- target: seasonal {tgt} ---")

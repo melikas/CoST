@@ -852,7 +852,7 @@ def fig_pe_dissociation(cur, out_dir, backbone="tcn"):
     import matplotlib
     matplotlib.use("Agg")
     import matplotlib.pyplot as plt
-    from _style import BASE, GRID, INK, INK2, MUTED, POS, SURFACE, save, strip
+    from tasks.style import BASE, GRID, INK, INK2, MUTED, POS, SURFACE, save, strip
 
     tr = defaultdict(lambda: {"auc": [], "dis": []})
     for k, r in cur.items():
@@ -911,7 +911,7 @@ def fig_clock_ablation(on, off, out_dir):
     import matplotlib
     matplotlib.use("Agg")
     import matplotlib.pyplot as plt
-    from _style import BASE, GRID, INK, INK2, MUTED, NEG, POS, SURFACE, save, strip
+    from tasks.style import BASE, GRID, INK, INK2, MUTED, NEG, POS, SURFACE, save, strip
 
     # Pair a clock-on cell with the clock-off cell matching on everything but the run id --
     # fold and target included, so a DS1 cell is never differenced against a DS2 one.
