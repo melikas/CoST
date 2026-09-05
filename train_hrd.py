@@ -505,6 +505,13 @@ def parse_args():
                         "0.7117 probed alone against 0.6228 for trend and seasonal "
                         "together (24 HRD seeds), and 0.7202 after the shipped "
                         "augmentations, above every arm in this project.")
+    p.add_argument("--noise-mask-frac", type=float, default=0.3,
+                   help="Fraction of timesteps hidden from the V^N branch (default: "
+                        "%(default)s).")
+    p.add_argument("--noise-span", type=int, default=8,
+                   help="Length of each hidden run. Spans, not scattered steps: a scattered "
+                        "mask on a high-frequency residual is filled by interpolating its "
+                        "neighbours, which teaches a smoother (default: %(default)s).")
     p.add_argument("--noise-depth", type=int, default=None,
                    help="Conv depth of the V^N stack (default: the main --depth). Lower is "
                         "cheaper; at 3 the branch adds about 1%% of parameters.")
@@ -939,6 +946,19 @@ def main():
         smooth_bins=args.smooth_bins,
         phase_readout=args.phase_readout,
         decomp_aug=args.decomp_aug,
+        # V^N. These were added to CoST and to model_build and NOT to this list, which is
+        # the one the training run actually uses -- model_build's docstring says model
+        # construction lives in one place and this call is the exception. The result was
+        # silent and total: noise_weight reached metrics.json and the variant tag from
+        # vars(args), so runs 2438763 and 2438765 were named _nw0.3 and described
+        # themselves as V^N runs, while CoST took its default of 0.0 and built no branch.
+        # Both encoders came out at exactly 110.32 MB -- byte-identical in size to the
+        # baseline -- and nothing said so until RQ2 tried to load one into a model that
+        # did have the branch.
+        noise_weight=args.noise_weight,
+        noise_depth=args.noise_depth,
+        noise_mask_frac=args.noise_mask_frac,
+        noise_span=args.noise_span,
         n_sensors=data["n_sensors"],
         mask_mode=args.mask_mode,
         mask_prob=args.mask_keep_prob,
