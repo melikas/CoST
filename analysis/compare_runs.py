@@ -170,19 +170,26 @@ def scan(treat, pattern, expected):
         if not shared and not ambig:
             continue
         off = _differences(treat, other, expected)
-        cand.append((len(off), -len(shared), run, len(shared), ambig, off))
+        # A run sharing no usable seed has nothing to compare, so it reports zero
+        # differences -- which sorted it to the top under the banner "matches on
+        # everything". Zero differences out of zero comparisons is not a match, and reading
+        # it as one is how a run that cannot be a control comes to look like the best one.
+        cand.append((0 if shared else 1, len(off), -len(shared), run, len(shared),
+                     ambig, off))
     if not cand:
         raise SystemExit(f"  nothing under {pattern} shares a seed with the treatment")
     print(f"\n  {len(cand)} candidate control(s), fewest moved variables first")
     print("  'ambig' counts seeds holding several variants -- those need --control-only\n")
     print(f"  {'run':32s} {'seeds':>6s} {'ambig':>6s} {'moved':>6s}  differing keys")
-    for n_off, _, run, n_sh, ambig, off in sorted(cand):
-        keys = ", ".join(sorted(off)) if off else "-- matches on everything --"
+    for _, n_off, _, run, n_sh, ambig, off in sorted(cand):
+        keys = ("-- nothing compared --" if not n_sh else
+                ", ".join(sorted(off)) if off else "-- matches on everything --")
         # Trimmed from the LEFT: the run id is the tail of the path, so cutting the head
         # keeps the one part of it that identifies the run.
         shown = run if len(run) <= 32 else "..." + run[-29:]
-        print(f"  {shown:32s} {n_sh:6d} {ambig:6d} {n_off:6d}  {keys[:80]}")
-    print("\n  Only a control moving 0 keys makes the difference below the treatment.")
+        print(f"  {shown:32s} {n_sh:6d} {ambig:6d} {'' if not n_sh else n_off:>6}  "
+              f"{keys[:80]}")
+    print("\n  Only a control moving 0 keys over a non-zero number of seeds is a control.")
 
 
 def read(variant_dir, rq, key):

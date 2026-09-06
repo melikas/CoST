@@ -206,3 +206,24 @@ def test_scan_counts_ambiguous_seeds_instead_of_hiding_them(tmp_path, capsys):
     scan(collect([t]), str(tmp_path / "runs" / "*"), [])
     line = [l for l in capsys.readouterr().out.splitlines() if "multi" in l][0]
     assert line.split()[1:3] == ["0", "1"]      # 0 usable seeds, 1 ambiguous
+
+
+def test_zero_differences_from_zero_comparisons_is_not_a_match(tmp_path, capsys):
+    """A run sharing no usable seed has nothing to compare, so it reports zero differences.
+    Ranked as a match, it sorted above every run that WAS comparable -- which is how a
+    candidate that cannot be a control comes to look like the best one."""
+    t = tmp_path / "treat"
+    _variant(t, 7, BASE)
+    runs = tmp_path / "runs"
+    _variant(runs / "comparable", 7, {**BASE, "smooth_bins": 5})
+    # The real shape of this: the run holds several variants for the shared seed, so every
+    # one of them is dropped and nothing is left to compare.
+    for tag in ("tcn_none_seed7", "tcn_none_seed7_plain"):
+        d = runs / "unusable" / tag
+        d.mkdir(parents=True)
+        (d / "metrics.json").write_text(json.dumps({"config": BASE}), encoding="utf-8")
+    scan(collect([t]), str(runs / "*"), [])
+    body = [l for l in capsys.readouterr().out.splitlines()
+            if "comparable" in l or "unusable" in l]
+    assert "comparable" in body[0] and "smooth_bins" in body[0]
+    assert "unusable" in body[1] and "nothing compared" in body[1]
