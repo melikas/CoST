@@ -93,6 +93,7 @@ srun python train.py \
   --iters "$ITERS" \
   --device cuda \
   --quiet \
+  --save-encoder \
   --out "$OUT" \
   "$@"
 

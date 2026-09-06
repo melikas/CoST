@@ -386,12 +386,24 @@ class CoST:
 
     # -- persistence ------------------------------------------------------------------
     def save(self, path):
-        torch.save({"net": self.net.state_dict(), "phase_readout": self.phase_readout,
-                    "n_iters": self.n_iters}, path)
+        # `phase_readout_at_construction` is PROVENANCE ONLY and `load` must never apply it.
+        # These weights are readout-agnostic -- the readout is chosen at encode time and
+        # never enters training -- so a checkpoint cannot own one. It is recorded under a
+        # name that cannot be mistaken for a setting.
+        torch.save({"net": self.net.state_dict(), "n_iters": self.n_iters,
+                    "phase_readout_at_construction": self.phase_readout}, path)
 
     def load(self, path):
+        """Load weights. The caller's `phase_readout` is preserved, deliberately.
+
+        An earlier version restored `phase_readout` from the checkpoint, which silently
+        overrode the readout the caller had asked for: every encoder is written under the
+        readout it happened to be constructed with, so asking for 'circular' and loading a
+        checkpoint built as 'angle' returned angle output under a circular label. That is
+        the same class of failure that made runs 2224103 and 2412728 disagree, and it would
+        have made the readout axis of this experiment measure nothing.
+        """
         ck = torch.load(path, map_location=self.device)
         self.net.load_state_dict(ck["net"])
-        self.phase_readout = ck.get("phase_readout", self.phase_readout)
         self.n_iters = ck.get("n_iters", 0)
         return self

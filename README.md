@@ -93,9 +93,8 @@ it, and the control that produces it is part of the contribution.
 
 ## Running it
 
-The pipeline is seven modules: `data_loader` → `model` + `objective` → `cost` → `train`,
-with `cv` supplying the protocol and `probe` the read-out. `eval.py` (RQ1/RQ2/RQ3) is the
-one piece still to be written; `train.py` writes the frozen representations it will consume.
+The pipeline is eight modules: `data_loader` → `model` + `objective` → `cost` → `train` →
+`eval`, with `cv` supplying the protocol and `probe` the read-out.
 
 ```bash
 pip install -r requirements.txt          # CosinorPy is needed for the cosinor baseline
@@ -127,6 +126,17 @@ NPZ=globem_windows.npz DATASET=globem OUT=results_oneshot_globem \
 Every task passes the same `--master-seed`; `cv.make_folds` is deterministic, so all tasks
 reconstruct the same partition and `--only-fold` selects one. Changing it between tasks
 voids every paired comparison. See `CLUSTER.md` for upload, monitoring and cleanup.
+
+Evaluation shards the same way, and writes one publication-ready report:
+
+```bash
+python eval.py --run runs/oneshot --npz hrd_2224103.npz --only-fold r0f0   # per fold
+python eval.py --run runs/oneshot --aggregate                              # results_summary.txt
+```
+
+RQ2 re-encodes phase-perturbed windows, so it needs the encoders, not just the stored
+representations — run training with `--save-encoder` (`scripts/oneshot.sh` passes it) or
+`--skip-rq2`.
 
 `--sensor-csv` is not yet wired: cohort building from the raw CSV still lives in the
 pre-cleanup `data_processing/`, so runs go through an `--npz` window cache.

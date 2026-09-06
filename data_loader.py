@@ -43,6 +43,11 @@ class Cohort:
     n_sensors: int
     bins_per_day: int
     labelled: frozenset         # participants that actually carry a label
+    # "pid_<isotime>" per window. RQ2 needs each window's elapsed start time to require that
+    # a personal baseline be CONTIGUOUS: windows are indexed by position, but the quality
+    # gate drops some, so position stops proxying time. Measured on this cohort, 3.8% of
+    # consecutive stored windows are more than 7 days apart, median gap 21 days.
+    window_ids: object = None
     source: str = ""
 
     @property
@@ -52,6 +57,10 @@ class Cohort:
     @property
     def n_features(self):
         return int(self.X.shape[-1])
+
+    @property
+    def bin_minutes(self):
+        return int(round(24 * 60 / self.bins_per_day))
 
     def participants(self):
         """(ids, labels) for the labelled cohort only, one row per participant."""
@@ -110,7 +119,9 @@ def load_npz(path):
     pids = z["pids"]
     c = Cohort(X=z["X"], y=z["y"], pids=pids,
                n_sensors=int(z["n_sensors"]), bins_per_day=int(z["bins_per_day"]),
-               labelled=labelled_from_masks(z, pids), source=str(path))
+               labelled=labelled_from_masks(z, pids),
+               window_ids=z["window_ids"] if "window_ids" in z.files else None,
+               source=str(path))
     if len(c.X) != len(c.y) or len(c.X) != len(c.pids):
         raise ValueError(f"{path}: X/y/pids lengths disagree")
     if not c.labelled:
