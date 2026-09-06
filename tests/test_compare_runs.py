@@ -14,14 +14,17 @@ from pathlib import Path
 ROOT = Path(__file__).resolve().parent.parent
 sys.path.insert(0, str(ROOT / "analysis"))
 import pytest  # noqa: E402
-from compare_runs import (check_configs, collect, metrics,  # noqa: E402
-                          scan, seed_of)
+from compare_runs import (check_cohort, check_configs, collect,  # noqa: E402
+                          metrics, scan, seed_of)
 
 
-def _variant(run, seed, cfg, rq=None):
+def _variant(run, seed, cfg, rq=None, test_pids=None):
     d = run / f"tcn_none_seed{seed}_nw0.3"
     d.mkdir(parents=True, exist_ok=True)
-    (d / "metrics.json").write_text(json.dumps({"config": cfg}), encoding="utf-8")
+    m = {"config": cfg}
+    if test_pids is not None:
+        m["test_pids"] = sorted(test_pids)
+    (d / "metrics.json").write_text(json.dumps(m), encoding="utf-8")
     for name, payload in (rq or {}).items():
         (d / name).mkdir(exist_ok=True)
         (d / name / f"{name.lower()}.json").write_text(json.dumps(payload), encoding="utf-8")
@@ -134,3 +137,34 @@ def test_scan_ignores_runs_that_share_no_seed(tmp_path):
     _variant(runs / "elsewhere", 999, BASE)
     with pytest.raises(SystemExit):
         scan(collect([t]), str(runs / "*"), [])
+
+
+def test_the_same_seed_on_a_changed_dataset_is_refused(tmp_path, capsys):
+    """The confound no configuration comparison can see. The split is a deterministic
+    function of --seed and the participant pool, so if a shared seed puts different people in
+    test, the dataset moved underneath the two runs while every argparse value stayed equal --
+    which is exactly what a schema migration does."""
+    t, c = tmp_path / "t", tmp_path / "c"
+    _variant(t, 7, BASE, test_pids=["p1", "p2", "p3"])
+    _variant(c, 7, BASE, test_pids=["p1", "p2", "p9"])
+    diff = check_cohort(collect([t]), collect([c]))
+    assert [d[0] for d in diff] == [7]
+    assert "1 differing" in capsys.readouterr().out
+
+
+def test_an_identical_split_passes(tmp_path):
+    t, c = tmp_path / "t", tmp_path / "c"
+    for s in (7, 13):
+        _variant(t, s, BASE, test_pids=["p1", "p2"])
+        _variant(c, s, BASE, test_pids=["p2", "p1"])   # order must not matter
+    assert check_cohort(collect([t]), collect([c])) == []
+
+
+def test_a_run_predating_the_pid_record_is_unrecorded_not_a_mismatch(tmp_path, capsys):
+    """Older runs wrote no test_pids. Counting that as a differing cohort would refuse every
+    comparison against them; counting it as a match would claim a check that did not run."""
+    t, c = tmp_path / "t", tmp_path / "c"
+    _variant(t, 7, BASE, test_pids=["p1"])
+    _variant(c, 7, BASE)
+    assert check_cohort(collect([t]), collect([c])) == []
+    assert "1 unrecorded" in capsys.readouterr().out

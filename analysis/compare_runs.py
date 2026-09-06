@@ -69,11 +69,44 @@ def collect(run_dirs, quiet=False):
     return out
 
 
-def config(variant_dir):
+def _metrics_json(variant_dir):
     p = Path(variant_dir) / "metrics.json"
     if not p.exists():
         return None
-    return json.loads(p.read_text(encoding="utf-8")).get("config", {})
+    return json.loads(p.read_text(encoding="utf-8"))
+
+
+def config(variant_dir):
+    m = _metrics_json(variant_dir)
+    return None if m is None else m.get("config", {})
+
+
+def check_cohort(treat, control):
+    """Both arms must have seen the same data, which the configuration cannot tell you.
+
+    The split is a deterministic function of --seed and the post-windowing participant pool,
+    and metrics.json records WHICH participants landed in test. So for a shared seed the two
+    runs agree exactly, or the dataset changed underneath them -- a new CSV schema, a
+    different preprocessing decision, a channel added -- while every argparse value stayed
+    identical. Pairing on seed is then comparing two different cohorts and calling it a
+    matched pair, and nothing else in this file would notice.
+    """
+    same, diff, missing = 0, [], 0
+    for s in sorted(set(treat) & set(control)):
+        a, b = _metrics_json(treat[s]), _metrics_json(control[s])
+        if a is None or b is None or "test_pids" not in a or "test_pids" not in b:
+            missing += 1
+            continue
+        if a["test_pids"] == b["test_pids"]:
+            same += 1
+        else:
+            diff.append((s, len(set(a["test_pids"]) & set(b["test_pids"])),
+                         len(a["test_pids"]), len(b["test_pids"])))
+    print(f"  cohort: {same} seed(s) with an identical test split, {len(diff)} differing"
+          + (f", {missing} unrecorded" if missing else ""))
+    for s, shared, na, nb in diff[:3]:
+        print(f"    seed {s}: {shared} participants in common, {na} vs {nb} in test")
+    return diff
 
 
 def _differences(treat, control, expected):
@@ -187,11 +220,18 @@ def main():
     if not shared:
         raise SystemExit("  no shared seeds -- these two sweeps cannot be paired")
 
-    if check_configs(treat, control, a.expect) and not a.force:
+    bad_cfg = check_configs(treat, control, a.expect)
+    bad_cohort = check_cohort(treat, control)
+    if (bad_cfg or bad_cohort) and not a.force:
         raise SystemExit(
-            "\n  REFUSED: the arms differ outside --expect, so any difference below would be\n"
-            "  part treatment and part confound. Add the key to --expect if it IS the thing\n"
-            "  under test, or pick a control that matches. --force prints it anyway.")
+            "\n  REFUSED: " + ("the arms differ outside --expect, so any difference below\n"
+                               "  would be part treatment and part confound. Add the key to "
+                               "--expect if it IS\n  the thing under test, or pick a control "
+                               "that matches." if bad_cfg else
+                               "a shared seed put different participants in test, so the two\n"
+                               "  arms did not see the same data and pairing on seed compares "
+                               "two cohorts.")
+            + " --force prints it anyway.")
 
     rows = {}
     for s in shared:
