@@ -13,7 +13,9 @@ from pathlib import Path
 
 ROOT = Path(__file__).resolve().parent.parent
 sys.path.insert(0, str(ROOT / "analysis"))
-from compare_runs import check_configs, collect, metrics, seed_of  # noqa: E402
+import pytest  # noqa: E402
+from compare_runs import (check_configs, collect, metrics,  # noqa: E402
+                          scan, seed_of)
 
 
 def _variant(run, seed, cfg, rq=None):
@@ -104,3 +106,31 @@ def test_a_null_auc_is_dropped_rather_than_read_as_zero(tmp_path):
     d = _variant(tmp_path / "t", 7, BASE,
                  rq={"RQ3": {"utility": {"A": {"auc": None}, "B": {"auc": 0.6}}}})
     assert metrics(d) == {("RQ3", "B"): 0.6}
+
+
+def test_scan_ranks_the_matching_control_first(tmp_path, capsys):
+    """`2438763` was assumed to be the V^N sweep's control because it carried the same
+    `_nw0.3` tag, and it moves three other variables. The tag is not the configuration."""
+    t = tmp_path / "treat"
+    _variant(t, 7, {**BASE, "noise_weight": 0.3})
+    _variant(t, 13, {**BASE, "noise_weight": 0.3})
+    runs = tmp_path / "runs"
+    for s in (7, 13):
+        _variant(runs / "match", s, {**BASE, "noise_weight": 0.0})
+        _variant(runs / "tagged", s, {**BASE, "noise_weight": 0.0,
+                                      "smooth_bins": 5, "decomp_aug": True})
+    scan(collect([t]), str(runs / "*"), ["noise_weight"])
+    lines = [l for l in capsys.readouterr().out.splitlines()
+             if "match" in l or "tagged" in l]
+    assert "match" in lines[0] and "matches on everything" in lines[0]
+    assert "tagged" in lines[1] and "smooth_bins" in lines[1] and "decomp_aug" in lines[1]
+
+
+def test_scan_ignores_runs_that_share_no_seed(tmp_path):
+    """A sweep over different seeds cannot be paired, so it is not a candidate at all."""
+    t = tmp_path / "treat"
+    _variant(t, 7, BASE)
+    runs = tmp_path / "runs"
+    _variant(runs / "elsewhere", 999, BASE)
+    with pytest.raises(SystemExit):
+        scan(collect([t]), str(runs / "*"), [])

@@ -44,12 +44,13 @@ def seed_of(variant_dir):
     return int(name.split("seed")[1].split("_")[0]) if "seed" in name else None
 
 
-def collect(run_dirs):
+def collect(run_dirs, quiet=False):
     """{seed: variant_dir} over one or more sweep directories.
 
     Several sweeps are accepted as one control because a stage-0 array and its self-healed
     tail land in different folders while being the same run; a seed appearing twice with
     different configurations is a mistake, and is reported rather than silently resolved.
+    `quiet` is for --scan, which reads dozens of runs and would bury its own table.
     """
     out, seen = {}, {}
     for run in run_dirs:
@@ -62,8 +63,9 @@ def collect(run_dirs):
             if s in out:
                 seen.setdefault(s, [out[s]]).append(v)
             out[s] = v
-    for s, dirs in seen.items():
-        print(f"  NOTE seed {s} appears in {len(dirs)} directories; using {out[s]}")
+    for s, dirs in sorted(seen.items()):
+        if not quiet:
+            print(f"  NOTE seed {s} appears in {len(dirs)} directories; using {out[s]}")
     return out
 
 
@@ -74,25 +76,62 @@ def config(variant_dir):
     return json.loads(p.read_text(encoding="utf-8")).get("config", {})
 
 
-def check_configs(treat, control, expected):
-    """Refuse the comparison unless the two arms differ only in `expected`."""
+def _differences(treat, control, expected):
+    """{key: {(treatment value, control value)}} over every shared seed, minus `expected`."""
     expected = set(expected) | INCIDENTAL
-    offending, checked = {}, 0
+    off = {}
     for s in sorted(set(treat) & set(control)):
         a, b = config(treat[s]), config(control[s])
         if a is None or b is None:
             continue
-        checked += 1
         for k in set(a) | set(b):
             if k in expected or a.get(k) == b.get(k):
                 continue
-            offending.setdefault(k, set()).add((json.dumps(a.get(k)), json.dumps(b.get(k))))
-    print(f"\n  configuration: {checked} seed pairs compared, "
-          f"{len(offending)} unexpected difference(s)")
-    for k, vals in sorted(offending.items()):
+            off.setdefault(k, set()).add((json.dumps(a.get(k)), json.dumps(b.get(k))))
+    return off
+
+
+def check_configs(treat, control, expected):
+    """Refuse the comparison unless the two arms differ only in `expected`."""
+    off = _differences(treat, control, expected)
+    n = len(set(treat) & set(control))
+    print(f"\n  configuration: {n} seed pairs compared, {len(off)} unexpected difference(s)")
+    for k, vals in sorted(off.items()):
         for x, y in sorted(vals)[:3]:
             print(f"    {k}: treatment {x}  vs  control {y}")
-    return offending
+    return off
+
+
+def scan(treat, pattern, expected):
+    """Rank candidate controls for `treat` by how many variables they move.
+
+    A control is not something to remember, it is something to look up. `2438763` was assumed
+    to be the matched control for the V^N sweep because it carried the same `_nw0.3` tag, and
+    it moves three other variables -- decomp_aug, drop_channels and smooth_bins -- every one
+    of which this project has separately measured as mattering. The tag is not the
+    configuration, and a ranked list is the difference between a measurement and a confound.
+    """
+    cand = []
+    for run in sorted(glob.glob(pattern)):
+        if not Path(run).is_dir():
+            continue
+        other = collect([run], quiet=True)
+        shared = set(treat) & set(other)
+        if not shared:
+            continue
+        off = _differences(treat, other, expected)
+        cand.append((len(off), -len(shared), run, len(shared), off))
+    if not cand:
+        raise SystemExit(f"  nothing under {pattern} shares a seed with the treatment")
+    print(f"\n  {len(cand)} candidate control(s), fewest moved variables first\n")
+    print(f"  {'run':32s} {'seeds':>6s} {'moved':>6s}  differing keys")
+    for n_off, _, run, n_sh, off in sorted(cand):
+        keys = ", ".join(sorted(off)) if off else "-- matches on everything --"
+        # Trimmed from the LEFT: the run id is the tail of the path, so cutting the head
+        # keeps the one part of it that identifies the run.
+        shown = run if len(run) <= 32 else "..." + run[-29:]
+        print(f"  {shown:32s} {n_sh:6d} {n_off:6d}  {keys[:88]}")
+    print("\n  Only a control moving 0 keys makes the difference below the treatment.")
 
 
 def read(variant_dir, rq, key):
@@ -125,12 +164,21 @@ def main():
     ap = argparse.ArgumentParser(description=__doc__,
                                 formatter_class=argparse.RawDescriptionHelpFormatter)
     ap.add_argument("--treat", nargs="+", required=True)
-    ap.add_argument("--control", nargs="+", required=True)
+    ap.add_argument("--control", nargs="+", help="required unless --scan is given")
     ap.add_argument("--expect", nargs="*", default=[],
                     help="configuration keys allowed to differ -- i.e. the thing under test")
     ap.add_argument("--force", action="store_true",
                     help="print the table even when the arms are confounded")
+    ap.add_argument("--scan", metavar="GLOB",
+                    help="instead of comparing, rank every run under GLOB by how many "
+                         "configuration keys it moves against --treat")
     a = ap.parse_args()
+
+    if a.scan:
+        scan(collect(a.treat), a.scan, a.expect)
+        return
+    if not a.control:
+        ap.error("--control is required unless --scan is given")
 
     treat, control = collect(a.treat), collect(a.control)
     shared = sorted(set(treat) & set(control))
