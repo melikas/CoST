@@ -218,7 +218,12 @@ class CoSTEncoder(nn.Module):
         self.repr_dropout = nn.Dropout(p=0.1)
 
         if not disentangle:
-            self.component_dims = output_dims
+            # The plain-SSL control: the backbone output IS the representation. The width
+            # attributes are still defined -- as the whole width for the seasonal side and
+            # zero for the trend side -- so callers that report the split (train.plan) do
+            # not have to special-case the control they exist to compare against.
+            self.component_dims = self.seasonal_dims = output_dims
+            self.trend_dims = 0
             self.kernels, self.tfd, self.sfd, self.bands = [], None, None, []
             return
 

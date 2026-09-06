@@ -93,32 +93,43 @@ it, and the control that produces it is part of the contribution.
 
 ## Running it
 
+The pipeline is seven modules: `data_loader` → `model` + `objective` → `cost` → `train`,
+with `cv` supplying the protocol and `probe` the read-out. `eval.py` (RQ1/RQ2/RQ3) is the
+one piece still to be written; `train.py` writes the frozen representations it will consume.
+
 ```bash
 pip install -r requirements.txt          # CosinorPy is needed for the cosinor baseline
 
-# HRD
-python train_hrd.py --sensor-csv datasets/HRD_RAW_MinuteLevel.csv \
-    --backbone tcn --pe none --repr-dims 320 --disentangle --save-encoder \
-    --output-dir results_hrd --run-id demo --seed 42
-for Q in 1 2 3; do python experiment_q$Q.py --variant-dir results_hrd/demo/tcn_none_seed42; done
+# Resolve the whole run -- geometry, arms, folds, detectable margin -- before any GPU time.
+python train.py --npz hrd_2224103.npz --out runs/oneshot --dry-run
 
-# GLOBEM -- same scripts, --dataset switches the loader
-python train_hrd.py --dataset globem --sensor-csv datasets/GLOBEM_REDUCED.csv \
-    --backbone tcn --pe none --repr-dims 320 --disentangle --save-encoder \
-    --test-per-class 60 --output-dir results_globem --run-id demo --seed 42
+# The pre-registered 4-arm run, locally
+python train.py --npz hrd_2224103.npz --out runs/oneshot
 ```
 
-`scripts/run.sh` is the sweep, and drives both cohorts:
+The design is a 2×2: `phase_readout ∈ {angle, circular}` × objective weights ∈ `{paper,
+contracted}`, over 10-fold × 3 repeats on all 114 labelled participants. It costs **60
+encoder fits, not 120** — `phase_readout` is applied at encode time and never enters the
+training path, so one encoder is read out both ways, which also makes that contrast exactly
+paired.
+
+`scripts/oneshot.sh` shards it across a SLURM array, one `(weights, fold)` pair per task:
 
 ```bash
-sbatch --array=0-23%12 scripts/run.sh                                   # HRD
+sbatch --array=0,30%2  scripts/oneshot.sh    # stage 0 -- time it before committing
+sacct -j <jobid> --format=JobID%20,State,Elapsed,MaxRSS
+sbatch --array=0-59%12 scripts/oneshot.sh    # the full run
 
-DATASET=globem SENSOR_CSV=datasets/GLOBEM_REDUCED.csv \
-OUTPUT_DIR=results_globem ENERGY_FLAG= TEST_PER_CLASS=60 \
-    sbatch --array=0-23%12 scripts/run.sh                               # GLOBEM
+NPZ=globem_windows.npz DATASET=globem OUT=results_oneshot_globem \
+    sbatch --array=0-59%12 scripts/oneshot.sh
 ```
 
-`ENERGY_FLAG` must be empty for GLOBEM: emotional energy is an HRD-only measurement.
+Every task passes the same `--master-seed`; `cv.make_folds` is deterministic, so all tasks
+reconstruct the same partition and `--only-fold` selects one. Changing it between tasks
+voids every paired comparison. See `CLUSTER.md` for upload, monitoring and cleanup.
+
+`--sensor-csv` is not yet wired: cohort building from the raw CSV still lives in the
+pre-cleanup `data_processing/`, so runs go through an `--npz` window cache.
 `KEEP_ENC_ALL=1` keeps every task's encoder, which is what lets a readout or probe
 question be re-tested later without retraining.
 

@@ -87,16 +87,37 @@ class IsotropicPairScaler(BaseEstimator, TransformerMixin):
         return (np.asarray(X, dtype=float) - self.mean_) / self.scale_
 
 
-def phase_block_layout(readout, n_bands_dims, n_leading=None):
-    """Where the (cos, sin) blocks sit in a `season_pool='spec'` readout.
+def spectral_freqs(seq_len, bins_per_day):
+    """The harmonics the seasonal readout reports: 1 cycle per window (circaseptan), 1 per
+    day (circadian), and its 2nd-4th harmonics, dropping any at or above Nyquist.
 
-    The readout is [amp | phase] under 'angle' and [amp | cos | sin] under 'circular', each
-    block `n_bands_dims` wide. Returns (pair_start, width) for `IsotropicPairScaler`, or
-    (None, 0) when there is no pair to couple.
+        HRD    T=672, 96/day -> D=7  -> [1, 7, 14, 21, 28]   (5)
+        GLOBEM T=112,  4/day -> D=28 -> [1, 28, 56]          (3)
+    """
+    D = max(1, seq_len // int(bins_per_day))
+    return [i for i in (1, D, 2 * D, 3 * D, 4 * D) if 0 < i <= seq_len // 2]
+
+
+def phase_block_layout(readout, seasonal_dims, seq_len, bins_per_day, n_leading=0):
+    """Where the (cos, sin) blocks sit in a representation, for `IsotropicPairScaler`.
+
+    Two offsets have to be right, and getting either wrong is worse than not scaling at all,
+    because it couples columns that are not a pair and leaves the real pair sheared:
+
+      * EACH BLOCK IS |f| * seasonal_dims WIDE, not seasonal_dims. The readout stacks blocks
+        shaped (b, |f|, d) flattened to |f|*d, and HRD reports |f| = 5 harmonics, so a block
+        is 5 * 160 = 800 columns.
+      * THE TREND BLOCK COMES FIRST in the full representation. `CoST.encode` concatenates
+        [trend | amp | cos | sin], so on HRD the cos block starts at 160 + 800 = 960. Pass
+        `n_leading=trend_dims` when probing the full vector, and `n_leading=0` when probing
+        the seasonal block on its own.
+
+    Returns (pair_start, width), or (None, 0) for the 'angle' readout, which has no pair.
     """
     if readout != "circular":
         return None, 0
-    return (n_bands_dims if n_leading is None else n_leading), n_bands_dims
+    block = len(spectral_freqs(seq_len, bins_per_day)) * int(seasonal_dims)
+    return int(n_leading) + block, block
 
 
 def make_probe(mode, C, seed, n_pca=0, pair_start=None, pair_width=0):
