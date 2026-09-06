@@ -1,0 +1,187 @@
+"""The evaluation protocol: repeated grouped K-fold over every labelled participant, with
+strictly decoupled seeds and a Nadeau-Bengio corrected margin.
+
+WHY NOT THE OLD SINGLE HOLDOUT. It tested on 36 of 114 labelled participants and fit the
+probe on 78, and the resulting detectable margin was 0.100 AUROC -- a property of the
+cohort, not of any model. Measured over 267 seed-runs the per-seed SD of participant-level
+AUROC is 0.1041, of which the Hanley-McNeil sampling term at n=36 is 0.0990: 90% of the
+variance is test-set sampling noise, which is exactly the part that shrinks when every
+participant is tested. Under 10-fold x 3 repeats the margin falls to 0.032.
+
+That does not turn RQ3 into a win -- DSSL vs its random-init control is -0.0083, genuinely
+zero. It makes the negative result provable: the gaps that matter (RF-on-raw over DSSL,
+0.052; random projection over DSSL, 0.041) cross 0.032 and do not cross 0.100.
+
+SEED DECOUPLING. Previously `seed == split_seed == model_seed`, so data variance and
+optimisation variance were confounded and could not be separated after the fact. Here they
+are drawn from one master seed through independent streams and are guaranteed distinct:
+
+    split_seed  -- which participants land in which fold. Varies per REPEAT.
+    model_seed  -- weight init and batch order. Varies per FOLD within a repeat.
+    probe_seed  -- probe solver state. Varies per fold.
+
+Holding split_seed fixed within a repeat is what makes the folds of that repeat a partition
+of the same 114 participants; varying model_seed within it is what stops a single unlucky
+initialisation from being read as a property of the split.
+"""
+from __future__ import annotations
+
+import math
+from dataclasses import dataclass, asdict
+
+import numpy as np
+
+__all__ = ["Fold", "make_folds", "nadeau_bengio", "required_margin", "paired_test"]
+
+
+@dataclass(frozen=True)
+class Fold:
+    """One trained model's worth of work: which participants are held out, and the three
+    independent seeds that produced it."""
+    repeat: int
+    fold: int
+    split_seed: int
+    model_seed: int
+    probe_seed: int
+    test_pids: tuple
+    train_pids: tuple
+
+    @property
+    def tag(self) -> str:
+        return f"r{self.repeat}f{self.fold}"
+
+    def as_dict(self):
+        d = asdict(self)
+        d["test_pids"] = list(self.test_pids)
+        d["train_pids"] = list(self.train_pids)
+        return d
+
+
+def _streams(master_seed):
+    """Three independent SeedSequence children. Distinct by construction, not by luck."""
+    ss = np.random.SeedSequence(master_seed)
+    return [np.random.default_rng(c) for c in ss.spawn(3)]
+
+
+def make_folds(pids, labels, n_folds=10, n_repeats=3, master_seed=20260906):
+    """Stratified, participant-disjoint folds: `n_repeats` independent partitions of every
+    participant into `n_folds` groups, stratified on the participant-level label.
+
+    A participant appears in exactly one test fold per repeat, so one repeat yields one
+    out-of-fold prediction for every participant -- which is what lets the repeat be scored
+    as a single AUROC over all of them rather than as an average of small noisy folds.
+    """
+    pids = np.asarray(pids)
+    labels = np.asarray(labels)
+    if len(pids) != len(labels):
+        raise ValueError(f"pids and labels differ in length: {len(pids)} vs {len(labels)}")
+    if len(set(pids.tolist())) != len(pids):
+        raise ValueError("make_folds expects one row per participant, not per window")
+
+    rng_split, rng_model, rng_probe = _streams(master_seed)
+    out = []
+    for rep in range(n_repeats):
+        split_seed = int(rng_split.integers(1, 2 ** 31 - 1))
+        part = np.empty(len(pids), dtype=int)
+        # Stratify: deal each class round-robin into folds, from an order this repeat's
+        # split_seed alone decides.
+        rr = np.random.default_rng(split_seed)
+        for cls in np.unique(labels):
+            idx = np.flatnonzero(labels == cls)
+            rr.shuffle(idx)
+            part[idx] = np.arange(len(idx)) % n_folds
+        for f in range(n_folds):
+            te = np.flatnonzero(part == f)
+            tr = np.flatnonzero(part != f)
+            if len(te) == 0 or len(np.unique(labels[tr])) < 2:
+                raise ValueError(
+                    f"repeat {rep} fold {f} is degenerate ({len(te)} test, "
+                    f"{len(np.unique(labels[tr]))} train classes) -- reduce n_folds")
+            out.append(Fold(
+                repeat=rep, fold=f, split_seed=split_seed,
+                model_seed=int(rng_model.integers(1, 2 ** 31 - 1)),
+                probe_seed=int(rng_probe.integers(1, 2 ** 31 - 1)),
+                test_pids=tuple(pids[te].tolist()), train_pids=tuple(pids[tr].tolist())))
+    _assert_decoupled(out)
+    return out
+
+
+def _assert_decoupled(folds):
+    """The invariant DECISION 3 asked for, enforced rather than documented."""
+    for f in folds:
+        if len({f.split_seed, f.model_seed, f.probe_seed}) != 3:
+            raise AssertionError(f"seeds collided on {f.tag}: {f.split_seed}, "
+                                 f"{f.model_seed}, {f.probe_seed}")
+    per_repeat = {}
+    for f in folds:
+        per_repeat.setdefault(f.repeat, set()).add(f.split_seed)
+    for rep, seeds in per_repeat.items():
+        if len(seeds) != 1:
+            raise AssertionError(f"repeat {rep} has {len(seeds)} split seeds; a repeat is "
+                                 "one partition and must have exactly one")
+    if len({f.model_seed for f in folds}) != len(folds):
+        raise AssertionError("model seeds are not unique across folds")
+
+
+# --------------------------------------------------------------------------------------
+# Inference
+# --------------------------------------------------------------------------------------
+def nadeau_bengio(n_folds, n_repeats):
+    """Variance-inflation factor for correlated resampled estimates: 1/K + n_test/n_train.
+
+    Under K-fold, n_test/n_train = (1/F)/(1 - 1/F) = 1/(F-1). The naive 1/K is what makes
+    K-fold CV look far more precise than it is; the second term is the price of folds that
+    share training data.
+    """
+    if n_folds < 2:
+        raise ValueError("n_folds must be at least 2")
+    return 1.0 / (n_folds * n_repeats) + 1.0 / (n_folds - 1)
+
+
+def required_margin(sd, n_folds, n_repeats, t_multiplier=2.010):
+    """Smallest difference in means this design can call significant."""
+    return t_multiplier * sd * math.sqrt(nadeau_bengio(n_folds, n_repeats))
+
+
+def paired_test(a, b, n_folds, n_repeats):
+    """Nadeau-Bengio corrected paired t-test between two arms scored on the same folds.
+
+    Returns mean difference, corrected SE, t, and the design's detectable margin. The
+    correction is the whole point: without it, 30 correlated folds are treated as 30
+    independent samples and every arm looks significant.
+    """
+    a, b = np.asarray(a, dtype=float), np.asarray(b, dtype=float)
+    if a.shape != b.shape:
+        raise ValueError(f"arms differ in shape: {a.shape} vs {b.shape}")
+    d = a - b
+    n = len(d)
+    if n < 2:
+        raise ValueError("need at least 2 paired estimates")
+    sd = float(d.std(ddof=1))
+    se = math.sqrt(nadeau_bengio(n_folds, n_repeats)) * sd
+    margin = required_margin(sd, n_folds, n_repeats)
+    mean = float(d.mean())
+
+    # Zero variance is degenerate, not insignificant. If every fold produced the SAME
+    # non-zero difference the effect is perfectly consistent and t is unbounded; if every
+    # difference is zero there is no effect at all. Testing `se > 0` alone reported both as
+    # "not significant", which is wrong in the first case and right only by accident in the
+    # second.
+    if sd == 0.0:
+        nonzero = mean != 0.0
+        return {"n": n, "mean_diff": mean, "sd": 0.0, "se_corrected": 0.0,
+                "t": float("inf") if nonzero else 0.0,
+                "wins": int((d > 0).sum()), "required_margin": 0.0,
+                "significant": bool(nonzero), "degenerate": True}
+
+    return {
+        "n": n,
+        "mean_diff": mean,
+        "sd": sd,
+        "se_corrected": float(se),
+        "t": mean / float(se),
+        "wins": int((d > 0).sum()),
+        "required_margin": float(margin),
+        "significant": bool(abs(mean) > margin),
+        "degenerate": False,
+    }

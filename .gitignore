@@ -61,3 +61,7 @@ trend_causality.json
 block_pretext.log
 sanity.log
 pretext_gate.log
+
+# Runner output: plan.json plus per-fold artifacts.
+runs/
+metrics.json
