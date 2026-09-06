@@ -168,3 +168,41 @@ def test_a_run_predating_the_pid_record_is_unrecorded_not_a_mismatch(tmp_path, c
     _variant(c, 7, BASE)
     assert check_cohort(collect([t]), collect([c])) == []
     assert "1 unrecorded" in capsys.readouterr().out
+
+
+def test_a_seed_in_several_variants_is_refused_not_guessed(tmp_path):
+    """A sweep holds several variants per seed, so a seed does not identify a run. Keying on
+    seed alone kept whichever directory sorted last and made the arm a mixture of variants
+    that merely shared a random seed."""
+    run = tmp_path / "r"
+    for tag in ("tcn_none_seed7", "tcn_none_seed7_plain", "tcn_none_seed7_clock"):
+        d = run / tag
+        d.mkdir(parents=True)
+        (d / "metrics.json").write_text(json.dumps({"config": BASE}), encoding="utf-8")
+    with pytest.raises(SystemExit, match="AMBIGUOUS"):
+        collect([run])
+
+
+def test_a_substring_resolves_the_ambiguity(tmp_path):
+    run = tmp_path / "r"
+    for tag in ("tcn_none_seed7", "tcn_none_seed7_plain"):
+        d = run / tag
+        d.mkdir(parents=True)
+        (d / "metrics.json").write_text(json.dumps({"config": BASE}), encoding="utf-8")
+    got = collect([run], only="_plain")
+    assert Path(got[7]).name == "tcn_none_seed7_plain"
+
+
+def test_scan_counts_ambiguous_seeds_instead_of_hiding_them(tmp_path, capsys):
+    """During --scan an ambiguous seed is dropped rather than refused, so it has to be
+    counted -- otherwise a sweep with four variants per seed reports as having none."""
+    t = tmp_path / "treat"
+    _variant(t, 7, BASE)
+    run = tmp_path / "runs" / "multi"
+    for tag in ("tcn_none_seed7", "tcn_none_seed7_plain"):
+        d = run / tag
+        d.mkdir(parents=True)
+        (d / "metrics.json").write_text(json.dumps({"config": BASE}), encoding="utf-8")
+    scan(collect([t]), str(tmp_path / "runs" / "*"), [])
+    line = [l for l in capsys.readouterr().out.splitlines() if "multi" in l][0]
+    assert line.split()[1:3] == ["0", "1"]      # 0 usable seeds, 1 ambiguous

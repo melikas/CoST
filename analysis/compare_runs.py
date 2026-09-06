@@ -44,29 +44,44 @@ def seed_of(variant_dir):
     return int(name.split("seed")[1].split("_")[0]) if "seed" in name else None
 
 
-def collect(run_dirs, quiet=False):
-    """{seed: variant_dir} over one or more sweep directories.
-
-    Several sweeps are accepted as one control because a stage-0 array and its self-healed
-    tail land in different folders while being the same run; a seed appearing twice with
-    different configurations is a mistake, and is reported rather than silently resolved.
-    `quiet` is for --scan, which reads dozens of runs and would bury its own table.
-    """
-    out, seen = {}, {}
+def _find(run_dirs, only=None):
+    """{seed: [variant_dir, ...]} -- every directory matching, ambiguity included."""
+    found = {}
     for run in run_dirs:
         for v in sorted(glob.glob(str(Path(run) / "*"))):
-            if not Path(v).is_dir():
-                continue
             s = seed_of(v)
-            if s is None:
+            if s is None or not Path(v).is_dir():
                 continue
-            if s in out:
-                seen.setdefault(s, [out[s]]).append(v)
-            out[s] = v
-    for s, dirs in sorted(seen.items()):
-        if not quiet:
-            print(f"  NOTE seed {s} appears in {len(dirs)} directories; using {out[s]}")
-    return out
+            if only and only not in Path(v).name:
+                continue
+            found.setdefault(s, []).append(v)
+    return found
+
+
+def collect(run_dirs, only=None, quiet=False):
+    """{seed: variant_dir} over one or more sweep directories.
+
+    Several sweeps are accepted as one arm because a stage-0 array and its self-healed tail
+    land in different folders while being the same run.
+
+    A sweep usually holds several VARIANTS per seed -- tcn_none, tcn_none_plain, a clock
+    ablation -- so a seed does not identify a run on its own. The first version of this
+    keyed on seed alone and silently kept whichever directory sorted last, which made an arm
+    a mixture of variants that merely shared a random seed. An ambiguous seed is refused
+    here, with the candidates printed, because which variant is the comparison is a question
+    only the caller can answer.
+    """
+    found = _find(run_dirs, only)
+    bad = {s: d for s, d in found.items() if len(d) > 1}
+    if bad and not quiet:
+        s, dirs = sorted(bad.items())[0]
+        raise SystemExit(
+            f"\n  AMBIGUOUS: {len(bad)} seed(s) match more than one directory, so this arm\n"
+            f"  would be a mixture of variants. Seed {s} matches:\n"
+            + "".join(f"    {d}\n" for d in dirs)
+            + "  Narrow it with --treat-only / --control-only (a substring of the directory\n"
+              "  name, e.g. the variant tag).")
+    return {s: d[0] for s, d in found.items() if len(d) == 1}
 
 
 def _metrics_json(variant_dir):
@@ -148,22 +163,25 @@ def scan(treat, pattern, expected):
     for run in sorted(glob.glob(pattern)):
         if not Path(run).is_dir():
             continue
-        other = collect([run], quiet=True)
+        found = _find([run])
+        other = {s: d[0] for s, d in found.items() if len(d) == 1}
+        ambig = sum(1 for s, d in found.items() if len(d) > 1 and s in treat)
         shared = set(treat) & set(other)
-        if not shared:
+        if not shared and not ambig:
             continue
         off = _differences(treat, other, expected)
-        cand.append((len(off), -len(shared), run, len(shared), off))
+        cand.append((len(off), -len(shared), run, len(shared), ambig, off))
     if not cand:
         raise SystemExit(f"  nothing under {pattern} shares a seed with the treatment")
-    print(f"\n  {len(cand)} candidate control(s), fewest moved variables first\n")
-    print(f"  {'run':32s} {'seeds':>6s} {'moved':>6s}  differing keys")
-    for n_off, _, run, n_sh, off in sorted(cand):
+    print(f"\n  {len(cand)} candidate control(s), fewest moved variables first")
+    print("  'ambig' counts seeds holding several variants -- those need --control-only\n")
+    print(f"  {'run':32s} {'seeds':>6s} {'ambig':>6s} {'moved':>6s}  differing keys")
+    for n_off, _, run, n_sh, ambig, off in sorted(cand):
         keys = ", ".join(sorted(off)) if off else "-- matches on everything --"
         # Trimmed from the LEFT: the run id is the tail of the path, so cutting the head
         # keeps the one part of it that identifies the run.
         shown = run if len(run) <= 32 else "..." + run[-29:]
-        print(f"  {shown:32s} {n_sh:6d} {n_off:6d}  {keys[:88]}")
+        print(f"  {shown:32s} {n_sh:6d} {ambig:6d} {n_off:6d}  {keys[:80]}")
     print("\n  Only a control moving 0 keys makes the difference below the treatment.")
 
 
@@ -202,18 +220,22 @@ def main():
                     help="configuration keys allowed to differ -- i.e. the thing under test")
     ap.add_argument("--force", action="store_true",
                     help="print the table even when the arms are confounded")
+    ap.add_argument("--treat-only", metavar="SUBSTRING",
+                    help="keep only variant directories whose name contains this")
+    ap.add_argument("--control-only", metavar="SUBSTRING")
     ap.add_argument("--scan", metavar="GLOB",
                     help="instead of comparing, rank every run under GLOB by how many "
                          "configuration keys it moves against --treat")
     a = ap.parse_args()
 
     if a.scan:
-        scan(collect(a.treat), a.scan, a.expect)
+        scan(collect(a.treat, a.treat_only), a.scan, a.expect)
         return
     if not a.control:
         ap.error("--control is required unless --scan is given")
 
-    treat, control = collect(a.treat), collect(a.control)
+    treat = collect(a.treat, a.treat_only)
+    control = collect(a.control, a.control_only)
     shared = sorted(set(treat) & set(control))
     print(f"\n  treatment {len(treat)} seeds | control {len(control)} seeds "
           f"| {len(shared)} paired")
@@ -240,7 +262,16 @@ def main():
             rows.setdefault(k, []).append((mt[k], mc[k]))
 
     if not rows:
-        raise SystemExit("  no metric is present in both arms -- check the RQ json files")
+        # Which arm is empty is the whole diagnosis: a control predating the current RQ
+        # schema writes no rq1/rq2/rq3.json at all, and reporting only "no shared metric"
+        # sends you looking for a mismatch in names that is really a missing file.
+        s = sorted(shared)[0]
+        for label, d in (("treatment", treat[s]), ("control", control[s])):
+            have = sorted({k[0] for k in metrics(d)}) or ["nothing"]
+            print(f"  {label} seed {s} has: {', '.join(have)}")
+        raise SystemExit(
+            "  no metric is present in both arms. An arm with nothing predates the current\n"
+            "  RQ output schema and cannot be compared without re-running it.")
 
     for level in ("RQ1", "RQ2", "RQ3"):
         keys = [k for k in rows if k[0] == level]
