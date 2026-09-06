@@ -260,7 +260,7 @@ for _f in train_hrd.py train_hrd_energy.py data_processing/data_preprocessing.py
           tasks/rhythm.py tasks/decomposition.py tasks/_eval_protocols.py tasks/energy.py \
           tasks/_experiment_common.py \
           experiment_q1.py experiment_q2.py experiment_q3.py \
-          scripts/collect_results.py scripts/_results.py tasks/style.py \
+          tasks/style.py \
           models datasets/HRD_RAW_MinuteLevel.csv; do
   [ -e "$_f" ] || MISSING="$MISSING $_f"
 done
@@ -401,17 +401,9 @@ SAVE_ENC="--save-encoder"
 KEEP_ENC="${KEEP_ENC_ALL:-0}"
 if [ "$SEED" = "${SEEDS[0]}" ]; then KEEP_ENC=1; fi
 
-# Queue the summary ONCE, from task 0, depending on the whole array. It cannot be
-# an EXIT trap (tasks would race on summary.csv) nor queued at submission time
-# (the array job id is not known until sbatch returns).
-if [ "${SLURM_ARRAY_TASK_ID}" = "0" ] && [ -n "${SLURM_ARRAY_JOB_ID:-}" ]; then
-  _sum="cd $PROJECT && python scripts/collect_results.py --results-dir $OUTPUT_DIR/$RUN_ID --csv $OUTPUT_DIR/$RUN_ID/summary.csv"
-  sbatch --dependency=afterany:"$SLURM_ARRAY_JOB_ID" --account="$SLURM_JOB_ACCOUNT" \
-         --time=30:00 --mem=8G --cpus-per-task=1 --job-name=cost_sum \
-         --output="logs/cost_sum-%j.out" --wrap "$_sum" 2>/dev/null \
-    && echo "[summary] queued for after array $SLURM_ARRAY_JOB_ID" \
-    || echo "[summary] queue failed; run by hand afterwards: $_sum"
-fi
+# The cross-variant summary job was dropped in the cleanup: it ran
+# scripts/collect_results.py, which is deleted. Each task still writes its own results
+# under $VARIANT_DIR; the sweep-level summary.csv is folded into eval.py in step 2.
 
 # ============================================================================
 # TRAIN
