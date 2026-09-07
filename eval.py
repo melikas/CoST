@@ -545,6 +545,24 @@ def _collect(per_fold, rq, path, sub=None):
 CONTRAST_COLS = ["diff", "margin", "wins", "verdict"]
 
 
+def _robust(v, n=3):
+    """Median [Q1, Q3] -- the primary summary for a metric with an unbounded tail.
+
+    R^2 is a ratio and is unbounded below, so one fold where the fit extrapolates badly
+    moves the mean and dominates the SD without saying anything about typical behaviour.
+    Measured here: dropping the single worst fold takes angle_contracted's amplitude SD
+    from 0.840 to 0.081 and its mean from 0.695 to 0.848 -- 90% of the spread was one
+    fold out of thirty. The median is unmoved by that fold, so it is reported first, with
+    the mean, the SD and the count of negative-R^2 folds kept beside it: the tail is
+    disclosed rather than trimmed, which is what makes this robust rather than selective.
+    """
+    v = v[np.isfinite(v)]
+    if not len(v):
+        return "n/a"
+    q1, q3 = np.percentile(v, [25, 75])
+    return f"{np.median(v):.{n}f} [{q1:.{n}f}, {q3:.{n}f}]"
+
+
 def _contrast(t):
     """The four cells every paired contrast prints: effect, margin, wins, verdict.
 
@@ -686,13 +704,15 @@ is against a linear compression of the same input, and is stated that way.
         tags, series = _collect(per_fold, "rq1", metric)
         if not series:
             continue
-        rev = better == "higher"
-        rows = [[n, _fmt(np.nanmean(v), 3), _fmt(np.nanstd(v, ddof=1), 3),
+        sign = -1 if better == "higher" else 1
+        rows = [[n, _robust(v), _fmt(np.nanmean(v), 3), _fmt(np.nanstd(v, ddof=1), 3),
+                 int((v < 0).sum()) if unit == "R2" else "-",
                  int(np.isfinite(v).sum())]
                 for n, v in sorted(series.items(),
-                                   key=lambda kv: -np.nanmean(kv[1]) if rev else np.nanmean(kv[1]))]
+                                   key=lambda kv: sign * np.nanmedian(kv[1]))]
         A(f"\n{metric} ({unit}, {better} is better)")
-        A(_table(rows, ["representation", f"mean {unit}", "SD", "folds"]))
+        A(_table(rows, ["representation", f"median [IQR] {unit}", "mean", "SD",
+                        "n(R2<0)", "folds"]))
 
     A("\n" + rule)
     A("END")
