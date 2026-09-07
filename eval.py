@@ -53,7 +53,13 @@ from probe import make_probe
 PHASE_LEVELS = (0.5, 1.0, 2.0, 3.0, 4.0)
 BASELINE_R = 4                      # personal reference = 4 preceding windows = 28 days
 RIDGE_ALPHAS = (0.1, 1.0, 10.0, 100.0, 1000.0)
-PROBE_C = (0.01, 0.1, 1.0)
+# 0.001 is here for the participant-level arms: aggregation makes the feature block four
+# times wider while cutting the rows from ~3500 windows to ~102 participants, so the useful
+# penalty range extends further than the window-level probe ever needed. The grid is applied
+# identically to every arm and selected on training rows only, so no arm gains an option
+# another was denied -- but window-level numbers can shift slightly against the previous run
+# because the grid they select from has changed too.
+PROBE_C = (0.001, 0.01, 0.1, 1.0)
 
 
 # =======================================================================================
@@ -291,18 +297,15 @@ def participant_scores(prob, pids_w, y_w):
     return pu, ps, ys
 
 
-def probe_auc(Xtr, ytr, Xte, pids_te, y_te_w, seed, mode="supervised",
-              pair_start=None, pair_width=0):
-    """Fit a probe on the training participants, score the held-out ones.
+def fit_probe(Xtr, ytr, seed, mode="supervised", pair_start=None, pair_width=0):
+    """Fit a probe, choosing C on the TRAINING rows only.
 
-    `C` is chosen on the TRAINING split only, by a small internal grid, and the winning
-    value is applied identically to every arm -- so no arm is granted a probe another was
-    denied. That was measured to matter: the probe family alone was worth nearly half the
-    margin being competed for on the GLOBEM benchmark.
+    The same grid and the same selection rule are applied to every arm, so no arm is
+    granted a probe another was denied -- measured to matter, since the probe family alone
+    was worth nearly half the margin being competed for on the GLOBEM benchmark.
     """
     best, best_c = -np.inf, PROBE_C[0]
-    n = len(Xtr)
-    cut = max(1, int(n * 0.75))
+    cut = max(1, int(len(Xtr) * 0.75))
     for c in PROBE_C:
         try:
             pr = make_probe(mode, c, seed, pair_start=pair_start, pair_width=pair_width)
@@ -314,6 +317,90 @@ def probe_auc(Xtr, ytr, Xte, pids_te, y_te_w, seed, mode="supervised",
             best, best_c = s, c
     pr = make_probe(mode, best_c, seed, pair_start=pair_start, pair_width=pair_width)
     pr.fit(Xtr, ytr)
+    return pr, best_c
+
+
+def aggregate_participants(V, pids, tdays, stats=("mean", "sd", "iqr", "trend")):
+    """One feature vector per participant, from all of their window representations.
+
+    WHY. The label is participant-level, so the classifier's unit should be too. The
+    window-level protocol fits on ~3500 windows carrying only 114 distinct labels and then
+    averages the PREDICTED PROBABILITIES per participant -- which collapses every window of
+    a person to a single number and discards their within-person variability entirely.
+    That variability is precisely what RQ2 shows this representation encodes better than
+    its untrained control (C = 0.8868 vs 0.8614, 25/30, significant), so the downstream
+    task was throwing away the one thing the model demonstrably does well.
+
+    The four statistics, per feature, over a participant's windows:
+        mean   what probability-averaging already captured
+        sd     within-person variability -- the discarded quantity
+        iqr    the same, robust to a single anomalous window
+        trend  least-squares slope against elapsed days, i.e. drift over the study
+
+    For the circular readout the mean of (cos, sin) is the resultant vector, so the mean
+    block remains the correct circular statistic; sd/iqr/trend of cos and sin are ordinary
+    features with no circular interpretation, and are treated as such.
+
+    Returns (pids, X, width) where `width` is the per-statistic block width, so a caller
+    can locate the mean block for the isotropic pair scaler.
+    """
+    pu = np.unique(pids)
+    rows = []
+    for p in pu:
+        idx = np.flatnonzero(pids == p)
+        Vp, t = V[idx], np.asarray(tdays, float)[idx]
+        parts = []
+        for s in stats:
+            if s == "mean":
+                parts.append(Vp.mean(0))
+            elif s == "sd":
+                parts.append(Vp.std(0))
+            elif s == "iqr":
+                parts.append(np.subtract(*np.percentile(Vp, [75, 25], axis=0)))
+            elif s == "trend":
+                tc = t - t.mean()
+                den = float((tc ** 2).sum())
+                parts.append((tc[:, None] * (Vp - Vp.mean(0))).sum(0) / den
+                             if den > 0 else np.zeros(Vp.shape[1]))
+            else:
+                raise ValueError(f"unknown statistic: {s!r}")
+        rows.append(np.concatenate(parts))
+    return pu, np.nan_to_num(np.vstack(rows), nan=0.0), V.shape[1]
+
+
+def probe_auc_participants(V, pids, y_by_pid, tr_pids, te_pids, tdays, seed,
+                           mode="supervised", pair_start=None, pair_width=0):
+    """Aggregate to one row per participant, then fit and score at that unit.
+
+    No probability averaging: the classifier sees a participant and predicts a participant,
+    so the fitted unit and the labelled unit finally agree.
+    """
+    pu, X, width = aggregate_participants(V, pids, tdays)
+    idx = {p: i for i, p in enumerate(pu)}
+    tr = np.array([idx[p] for p in tr_pids if p in idx])
+    te = np.array([idx[p] for p in te_pids if p in idx])
+    ytr = np.array([y_by_pid[pu[i]] for i in tr])
+    yte = np.array([y_by_pid[pu[i]] for i in te])
+    if len(np.unique(ytr)) < 2 or not len(te):
+        return float("nan"), PROBE_C[0], {}
+    # The pair block is located inside the MEAN statistic only -- see aggregate_participants.
+    pr, best_c = fit_probe(X[tr], ytr, seed, mode, pair_start, pair_width)
+    sc = pr.predict_proba(X[te])[:, 1]
+    oof = {str(pu[i]): float(v) for i, v in zip(te, sc)}
+    auc = float(roc_auc_score(yte, sc)) if len(np.unique(yte)) > 1 else float("nan")
+    return auc, best_c, oof
+
+
+def probe_auc(Xtr, ytr, Xte, pids_te, y_te_w, seed, mode="supervised",
+              pair_start=None, pair_width=0):
+    """Fit a probe on the training participants, score the held-out ones.
+
+    `C` is chosen on the TRAINING split only, by a small internal grid, and the winning
+    value is applied identically to every arm -- so no arm is granted a probe another was
+    denied. That was measured to matter: the probe family alone was worth nearly half the
+    margin being competed for on the GLOBEM benchmark.
+    """
+    pr, best_c = fit_probe(Xtr, ytr, seed, mode, pair_start, pair_width)
     prob = pr.predict_proba(Xte)[:, 1]
     pu, sc, ys = participant_scores(prob, pids_te, y_te_w)
     # The per-participant OOF scores are returned, not just the fold AUROC. Scoring a fold
@@ -327,33 +414,46 @@ def probe_auc(Xtr, ytr, Xte, pids_te, y_te_w, seed, mode="supervised",
 
 
 def run_rq3(args, coh, plan, fold, recs, device):
-    """The ladder: untrained references first, then the arms, all on identical rows."""
+    """The ladder: untrained references first, then the arms, all on identical rows.
+
+    Every representation is scored TWICE -- window-level (probabilities averaged per
+    participant) and participant-level (representations aggregated first, keeping
+    within-person variability). The aggregation is applied to every rung including the
+    untrained controls, because applying it to the model alone would not be a controlled
+    comparison; it would just be a different protocol for one arm.
+    """
     tr = split_idx(args.run, fold.tag, recs, "probe_train")
     te = split_idx(args.run, fold.tag, recs, "probe_test")
     y_tr = coh.y[tr]
     y_te_w = coh.y[te]
     pids_te = coh.pids[te]
     seed = fold.probe_seed
+    tdays = (window_start_days(coh.window_ids) if coh.window_ids is not None
+             else np.zeros(len(coh.X)))
+    y_by_pid = {p: int(round(float(coh.y[coh.pids == p].mean())))
+                for p in np.unique(coh.pids)}
+    tr_pids, te_pids = list(fold.train_pids), list(fold.test_pids)
     ladder = {}
 
-    flat = coh.X[:, :, :coh.n_sensors].reshape(len(coh.X), -1)
-    flat = np.nan_to_num(flat, nan=0.0)
-    ladder["RF on raw"] = probe_auc(flat[tr], y_tr, flat[te], pids_te, y_te_w,
-                                    seed, mode="forest")
-    proj = raw_projection(coh.X, coh.n_sensors, 512, seed)
-    ladder["Random projection (512)"] = probe_auc(proj[tr], y_tr, proj[te], pids_te, y_te_w, seed)
+    def add(name, V, ps=None, pw=0, mode="supervised"):
+        """Score one representation both ways, under one identical selection rule."""
+        ladder[name] = probe_auc(V[tr], y_tr, V[te], pids_te, y_te_w, seed,
+                                 mode=mode, pair_start=ps, pair_width=pw)
+        ladder[name + " [agg]"] = probe_auc_participants(
+            V, coh.pids, y_by_pid, tr_pids, te_pids, tdays, seed,
+            mode=mode, pair_start=ps, pair_width=pw)
+
+    flat = np.nan_to_num(coh.X[:, :, :coh.n_sensors].reshape(len(coh.X), -1), nan=0.0)
+    add("RF on raw", flat, mode="forest")
+    add("Random projection (512)", raw_projection(coh.X, coh.n_sensors, 512, seed))
     for readout in sorted({r["arm"]["phase_readout"] for r in recs.values()}):
         ctrl = _blank_model(coh, plan, readout, device, seed=fold.model_seed)
-        V = ctrl.encode(coh.X, parts=False)
         ps, pw = _pair_of(recs, readout)
-        ladder[f"Random-init ({readout})"] = probe_auc(V[tr], y_tr, V[te], pids_te, y_te_w, seed,
-                                                       pair_start=ps, pair_width=pw)
+        add(f"Random-init ({readout})", ctrl.encode(coh.X, parts=False), ps, pw)
     for arm_tag, rec in recs.items():
-        z = np.load(Path(args.run) / arm_tag / fold.tag / "repr.npz")
-        V = z["full"]
+        V = np.load(Path(args.run) / arm_tag / fold.tag / "repr.npz")["full"]
         ps, pw = rec["pair_block_full"]
-        ladder[f"DSSL {arm_tag}"] = probe_auc(V[tr], y_tr, V[te], pids_te, y_te_w, seed,
-                                              pair_start=ps, pair_width=pw or 0)
+        add(f"DSSL {arm_tag}", V, ps, pw or 0)
     for k, (auc, c, _) in ladder.items():
         print(f"    [rq3] {k:34s} AUROC={auc:.4f} (C={c})", flush=True)
     _, _, ys = participant_scores(np.zeros(len(te)), pids_te, y_te_w)
@@ -566,7 +666,27 @@ def _collect(per_fold, rq, path, sub=None):
     return tags, series
 
 
-CONTRAST_COLS = ["diff", "margin", "wins", "verdict"]
+CONTRAST_COLS = ["diff", "95% CI", "margin", "wins", "verdict"]
+
+
+def _ci(diff, half):
+    """Interval on a mean difference, given its half-width.
+
+    For a negative result the interval IS the claim. A binary flag discards both the effect
+    size and the precision, and it hides exactly the case this study contains: RF-on-raw
+    sits 0.122 below the best DSSL arm with z of -2.42/-1.97/-1.51, which an
+    all-repeats-must-agree rule reports as "ns" while the interval shows a large, clearly
+    separated effect. The interval also states the useful negative directly -- DSSL is not
+    better than its untrained control by more than the upper bound.
+
+    The HALF-WIDTH is passed in rather than computed here so each test supplies its own,
+    from its own reference distribution: the Nadeau-Bengio contrast passes its t-based
+    `required_margin`, DeLong passes 1.96 * SE from the normal it is asymptotically. That
+    keeps "the interval excludes zero" and "the test is significant" the same statement.
+    Deriving both from one hard-coded 1.96 did not: at diff 0.0265 against a margin of
+    0.0269 the table reported a CI of [+0.0003, +0.0527] beside a verdict of "ns".
+    """
+    return f"[{diff - half:+.4f}, {diff + half:+.4f}]"
 
 
 def _robust(v, n=3):
@@ -602,8 +722,8 @@ def _contrast(t):
     the comparator named beside it.
     """
     verdict = "ns" if not t["significant"] else ("WIN" if t["mean_diff"] > 0 else "LOSS")
-    return [_fmt(t["mean_diff"]), _fmt(t["required_margin"]),
-            f"{t['wins']}/{t['n']}", verdict]
+    return [_fmt(t["mean_diff"]), _ci(t["mean_diff"], t["required_margin"]),
+            _fmt(t["required_margin"]), f"{t['wins']}/{t['n']}", verdict]
 
 
 def _pooled_oof(per_fold):
@@ -738,9 +858,11 @@ projection 0.7198, random-init 0.6874, DSSL 0.679, supervised 0.6609.
         best = max((g for g in rungs if g.startswith("DSSL")),
                    key=lambda g: auc[g].mean(), default=None)
         if best:
-            A(f"\nDeLong vs the best DSSL arm ({best}). Significance is claimed only when")
-            A("all repeats agree -- the repeats share participants, so they are not")
-            A("independent tests and their p-values must not be pooled as if they were.\n")
+            A(f"\nDeLong vs the best DSSL arm ({best}). The 95% interval carries the claim;")
+            A("an interval excluding 0 is a separation, one spanning 0 bounds how large any")
+            A("real difference could be. The three z values are shown so consistency of sign")
+            A("across repeats is visible -- the repeats share participants, so they are not")
+            A("independent tests and must not be combined as if they were.\n")
             rows = []
             for g in sorted(rungs):
                 if g == best:
@@ -749,17 +871,11 @@ projection 0.7198, random-init 0.6874, DSSL 0.679, supervised 0.6609.
                      for r in reps if g in pooled[r] and best in pooled[r]]
                 if not d:
                     continue
-                k = sum(x["p"] < 0.05 for x in d)
-                sgn = {np.sign(x["diff"]) for x in d if x["p"] < 0.05}
-                verdict = ("ns" if k < len(d) or len(sgn) != 1
-                           else ("WIN" if sgn.pop() > 0 else "LOSS"))
-                rows.append([g, _fmt(np.mean([x["diff"] for x in d])),
-                             _fmt(np.mean([x["se"] for x in d])),
-                             " ".join(f"{x['z']:+.2f}" for x in d),
-                             " ".join(f"{x['p']:.3f}" for x in d),
-                             f"{k}/{len(d)}", verdict])
-            A(_table(rows, ["rung", "mean diff", "mean SE", "z per repeat",
-                            "p per repeat", "sig", "verdict"]))
+                md, mse = np.mean([x["diff"] for x in d]), np.mean([x["se"] for x in d])
+                rows.append([g, _fmt(md), _ci(md, 1.96 * mse), _fmt(mse),
+                             " ".join(f"{x['z']:+.2f}" for x in d)])
+            A(_table(rows, ["rung", "mean diff", "95% CI", "mean SE",
+                            "z per repeat"]))
         A("")
 
     # ---- secondary: the fold-averaged estimator, kept for transparency ------------------
