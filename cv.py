@@ -31,7 +31,8 @@ from dataclasses import dataclass, asdict
 
 import numpy as np
 
-__all__ = ["Fold", "make_folds", "nadeau_bengio", "required_margin", "paired_test"]
+__all__ = ["Fold", "make_folds", "nadeau_bengio", "required_margin", "paired_test",
+           "delong_test"]
 
 
 @dataclass(frozen=True)
@@ -185,3 +186,58 @@ def paired_test(a, b, n_folds, n_repeats):
         "significant": bool(abs(mean) > margin),
         "degenerate": False,
     }
+
+
+# --------------------------------------------------------------------------------------
+# Pooled out-of-fold comparison
+# --------------------------------------------------------------------------------------
+def _structural(y, s):
+    """DeLong's structural components (V10 over positives, V01 over negatives).
+
+    psi(x, y) = 1 if x > y, 1/2 if tied, 0 otherwise. The mean of either component is the
+    AUC itself, which is what makes their empirical covariance an estimator of its variance.
+    """
+    pos, neg = s[y == 1], s[y == 0]
+    m, n = len(pos), len(neg)
+    if m == 0 or n == 0:
+        raise ValueError("DeLong needs both classes present")
+    psi = (pos[:, None] > neg[None, :]).astype(float) + 0.5 * (pos[:, None] == neg[None, :])
+    return psi.mean(axis=1), psi.mean(axis=0)          # V10 (len m), V01 (len n)
+
+
+def delong_test(y, s1, s2):
+    """DeLong's test for two AUCs measured on the SAME subjects.
+
+    The right test here for exactly the reason the fold-averaged one was wrong: two arms are
+    scored on identical participants, so their AUCs are strongly positively correlated, and a
+    test that ignores that correlation throws away most of the power. DeLong estimates the
+    covariance directly, so var(AUC1 - AUC2) subtracts 2*cov rather than summing variances.
+
+    Returns both AUCs, their difference, the standard error OF THE DIFFERENCE, z and a
+    two-sided p. `var` is exact-zero when the two score vectors induce identical rankings;
+    that is reported as degenerate rather than as an infinitely significant result.
+    """
+    y = np.asarray(y).astype(int)
+    s1, s2 = np.asarray(s1, dtype=float), np.asarray(s2, dtype=float)
+    if not (len(y) == len(s1) == len(s2)):
+        raise ValueError(f"length mismatch: {len(y)}, {len(s1)}, {len(s2)}")
+    v10_1, v01_1 = _structural(y, s1)
+    v10_2, v01_2 = _structural(y, s2)
+    m, n = len(v10_1), len(v01_1)
+    a1, a2 = float(v10_1.mean()), float(v10_2.mean())
+
+    s10 = np.cov(np.vstack([v10_1, v10_2]), ddof=1)
+    s01 = np.cov(np.vstack([v01_1, v01_2]), ddof=1)
+    var = ((s10[0, 0] + s10[1, 1] - 2 * s10[0, 1]) / m +
+           (s01[0, 0] + s01[1, 1] - 2 * s01[0, 1]) / n)
+    diff = a1 - a2
+    if var <= 0:
+        return {"auc1": a1, "auc2": a2, "diff": diff, "se": 0.0,
+                "z": 0.0 if diff == 0 else float("inf"),
+                "p": 1.0 if diff == 0 else 0.0, "n": len(y), "n_pos": m,
+                "degenerate": True}
+    se = math.sqrt(var)
+    z = diff / se
+    return {"auc1": a1, "auc2": a2, "diff": diff, "se": se, "z": z,
+            "p": math.erfc(abs(z) / math.sqrt(2)), "n": len(y), "n_pos": m,
+            "degenerate": False}

@@ -45,7 +45,8 @@ from sklearn.metrics import roc_auc_score
 
 from baselines.random_projection import raw_projection
 from cost import CoST
-from cv import Fold, nadeau_bengio, paired_test, required_margin
+from cv import (Fold, delong_test, nadeau_bengio, paired_test,
+                required_margin)
 from data_loader import load_npz
 from probe import make_probe
 
@@ -277,13 +278,17 @@ def run_rq2(args, coh, plan, fold, recs, device):
 # RQ3 -- the honest ladder
 # =======================================================================================
 def participant_scores(prob, pids_w, y_w):
-    """Collapse window predictions to one score and one label per participant."""
-    ps, ys = [], []
-    for p in np.unique(pids_w):
-        m = pids_w == p
-        ps.append(float(prob[m].mean()))
-        ys.append(int(round(float(y_w[m].mean()))))
-    return np.array(ps), np.array(ys)
+    """Collapse window predictions to one score and one label per participant.
+
+    NOTE what this discards: a participant's windows are averaged to a single probability,
+    so all WITHIN-person variability is thrown away before the classifier is scored. That is
+    the quantity RQ2 shows the representation encodes best, and Phase 2 step 2 is what stops
+    discarding it. Left as the mean here so the estimator fix (step 1) changes one thing only.
+    """
+    pu = np.unique(pids_w)
+    ps = np.array([float(prob[pids_w == p].mean()) for p in pu])
+    ys = np.array([int(round(float(y_w[pids_w == p].mean()))) for p in pu])
+    return pu, ps, ys
 
 
 def probe_auc(Xtr, ytr, Xte, pids_te, y_te_w, seed, mode="supervised",
@@ -310,10 +315,15 @@ def probe_auc(Xtr, ytr, Xte, pids_te, y_te_w, seed, mode="supervised",
     pr = make_probe(mode, best_c, seed, pair_start=pair_start, pair_width=pair_width)
     pr.fit(Xtr, ytr)
     prob = pr.predict_proba(Xte)[:, 1]
-    sc, ys = participant_scores(prob, pids_te, y_te_w)
-    if len(np.unique(ys)) < 2:
-        return float("nan"), best_c
-    return float(roc_auc_score(ys, sc)), best_c
+    pu, sc, ys = participant_scores(prob, pids_te, y_te_w)
+    # The per-participant OOF scores are returned, not just the fold AUROC. Scoring a fold
+    # of 11-13 participants is 99% sampling noise (observed SD 0.1626 against a
+    # Hanley-McNeil pure-noise SE of 0.1636); pooling every fold of a repeat instead gives
+    # one AUROC over all 114 and cuts that noise 3.3x. The scalar cannot be pooled after
+    # the fact, so the scores have to be kept.
+    oof = {str(p): float(v) for p, v in zip(pu, sc)}
+    auc = float(roc_auc_score(ys, sc)) if len(np.unique(ys)) > 1 else float("nan")
+    return auc, best_c, oof
 
 
 def run_rq3(args, coh, plan, fold, recs, device):
@@ -344,9 +354,12 @@ def run_rq3(args, coh, plan, fold, recs, device):
         ps, pw = rec["pair_block_full"]
         ladder[f"DSSL {arm_tag}"] = probe_auc(V[tr], y_tr, V[te], pids_te, y_te_w, seed,
                                               pair_start=ps, pair_width=pw or 0)
-    for k, (auc, c) in ladder.items():
+    for k, (auc, c, _) in ladder.items():
         print(f"    [rq3] {k:34s} AUROC={auc:.4f} (C={c})", flush=True)
-    return {k: {"auc": a, "probe_C": c} for k, (a, c) in ladder.items()}
+    _, _, ys = participant_scores(np.zeros(len(te)), pids_te, y_te_w)
+    labels = {str(p): int(v) for p, v in zip(np.unique(pids_te), ys)}
+    return {"_labels": labels,
+            **{k: {"auc": a, "probe_C": c, "oof": s} for k, (a, c, s) in ladder.items()}}
 
 
 def split_idx(run, tag, recs, key):
@@ -482,7 +495,18 @@ def eval_fold(args, coh, plan, tag):
     fold = fold_from_plan(plan, tag)
     print(f"[fold] {tag}: {len(recs)} arms, {len(fold.test_pids)} held-out participants")
 
-    res = {"fold": tag, "arms_present": sorted(recs)}
+    # Start from whatever this fold already has, so a targeted re-run keeps the rest.
+    # Without this, `--skip-rq1 --skip-rq2` -- the natural way to redo only the cheap RQ3 --
+    # would write an eval.json containing ONLY rq3 and silently destroy the RQ2 results,
+    # which cost five re-encodes of the whole cohort per arm to produce.
+    out = run / sorted(recs)[0] / tag / "eval.json"
+    res = {}
+    if out.exists():
+        try:
+            res = json.loads(out.read_text(encoding="utf-8"))
+        except json.JSONDecodeError:
+            res = {}
+    res.update({"fold": tag, "arms_present": sorted(recs)})
     if not args.skip_rq1:
         res["rq1"] = run_rq1(args, coh, plan, fold, recs)
     if not args.skip_rq2:
@@ -526,7 +550,7 @@ def _collect(per_fold, rq, path, sub=None):
 
     names = set()
     for t in tags:
-        names |= set(block(t))
+        names |= {k for k in block(t) if not k.startswith("_")}
     series = {}
     for n in sorted(names):
         v = []
@@ -580,6 +604,36 @@ def _contrast(t):
     verdict = "ns" if not t["significant"] else ("WIN" if t["mean_diff"] > 0 else "LOSS")
     return [_fmt(t["mean_diff"]), _fmt(t["required_margin"]),
             f"{t['wins']}/{t['n']}", verdict]
+
+
+def _pooled_oof(per_fold):
+    """{repeat: {rung: (y, scores)}} -- one out-of-fold prediction per participant per repeat.
+
+    Every participant is tested exactly once per repeat, so a repeat's folds concatenate into
+    one score vector over the whole labelled cohort. That is the estimate the power analysis
+    assumed all along; scoring 11-13 participants at a time and averaging the fold AUROCs
+    instead was discarding a 3.3x factor in noise (observed per-fold SD 0.1626 against a
+    Hanley-McNeil pure-noise SE of 0.1636 -- i.e. essentially all of it was sampling).
+    """
+    reps = {}
+    for tag, r in per_fold.items():
+        rq3 = r.get("rq3", {})
+        if "_labels" not in rq3:
+            continue
+        d = reps.setdefault(int(tag[1:tag.index("f")]), {"_y": {}})
+        d["_y"].update(rq3["_labels"])
+        for rung, v in rq3.items():
+            if not rung.startswith("_") and isinstance(v, dict) and "oof" in v:
+                d.setdefault(rung, {}).update(v["oof"])
+    out = {}
+    for rep, d in sorted(reps.items()):
+        y = d.pop("_y")
+        pids = sorted(y)
+        full = {r: sc for r, sc in d.items() if set(sc) >= set(pids)}
+        if full:
+            out[rep] = {r: (np.array([y[q] for q in pids]),
+                            np.array([sc[q] for q in pids])) for r, sc in full.items()}
+    return out
 
 
 def _table(rows, headers):
@@ -666,10 +720,55 @@ supported by an architecture-matched control on every rung, and nothing here is 
 soften it. Prior measurement on the single-holdout protocol: RF-on-raw 0.731, random
 projection 0.7198, random-init 0.6874, DSSL 0.679, supervised 0.6609.
 """)
+    # ---- primary: pooled out-of-fold AUROC + DeLong -----------------------------------
+    pooled = _pooled_oof(per_fold)
+    if pooled:
+        A("PRIMARY ESTIMATOR -- pooled out-of-fold, one AUROC per repeat over the whole")
+        A("labelled cohort, arms compared by DeLong's paired test.\n")
+        reps = sorted(pooled)
+        rungs = sorted(set().union(*(set(pooled[r]) for r in reps)))
+        auc = {g: np.array([roc_auc_score(*pooled[r][g]) for r in reps if g in pooled[r]])
+               for g in rungs}
+        n_sub = len(next(iter(pooled[reps[0]].values()))[0])
+        A(_table([[g] + [_fmt(a) for a in auc[g]] + [_fmt(auc[g].mean())]
+                  for g in sorted(rungs, key=lambda g: -auc[g].mean())],
+                 ["rung"] + [f"repeat {r}" for r in reps] + ["mean"]))
+        A(f"\n  n = {n_sub} participants per repeat, each scored exactly once.")
+
+        best = max((g for g in rungs if g.startswith("DSSL")),
+                   key=lambda g: auc[g].mean(), default=None)
+        if best:
+            A(f"\nDeLong vs the best DSSL arm ({best}). Significance is claimed only when")
+            A("all repeats agree -- the repeats share participants, so they are not")
+            A("independent tests and their p-values must not be pooled as if they were.\n")
+            rows = []
+            for g in sorted(rungs):
+                if g == best:
+                    continue
+                d = [delong_test(pooled[r][g][0], pooled[r][g][1], pooled[r][best][1])
+                     for r in reps if g in pooled[r] and best in pooled[r]]
+                if not d:
+                    continue
+                k = sum(x["p"] < 0.05 for x in d)
+                sgn = {np.sign(x["diff"]) for x in d if x["p"] < 0.05}
+                verdict = ("ns" if k < len(d) or len(sgn) != 1
+                           else ("WIN" if sgn.pop() > 0 else "LOSS"))
+                rows.append([g, _fmt(np.mean([x["diff"] for x in d])),
+                             _fmt(np.mean([x["se"] for x in d])),
+                             " ".join(f"{x['z']:+.2f}" for x in d),
+                             " ".join(f"{x['p']:.3f}" for x in d),
+                             f"{k}/{len(d)}", verdict])
+            A(_table(rows, ["rung", "mean diff", "mean SE", "z per repeat",
+                            "p per repeat", "sig", "verdict"]))
+        A("")
+
+    # ---- secondary: the fold-averaged estimator, kept for transparency ------------------
     tags, series = _collect(per_fold, "rq3", "auc")
     if not series:
         A("(no RQ3 results)")
     else:
+        A("SECONDARY -- fold-averaged AUROC (the previous estimator). Retained so the two")
+        A("can be compared; it scores 11-13 participants at a time and is ~all sampling noise.\n")
         rows = [[n, _fmt(np.nanmean(v)), _fmt(np.nanstd(v, ddof=1)), int(np.isfinite(v).sum())]
                 for n, v in sorted(series.items(), key=lambda kv: -np.nanmean(kv[1]))]
         A(_table(rows, ["rung", "mean AUROC", "SD", "folds"]))
