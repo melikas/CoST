@@ -542,6 +542,28 @@ def _collect(per_fold, rq, path, sub=None):
     return tags, series
 
 
+CONTRAST_COLS = ["diff", "margin", "wins", "verdict"]
+
+
+def _contrast(t):
+    """The four cells every paired contrast prints: effect, margin, wins, verdict.
+
+    The verdict carries the SIGN, which a bare significance flag does not. `paired_test`
+    reports significance as |mean| > margin -- sign-blind by construction, because it asks
+    whether two arms differ, not which is better. Printing "YES" for both therefore reads
+    identically for an arm that beats its control and one that loses to it, and this study
+    contains both: angle_contracted clears random-init by +0.0254 while circular_contracted
+    falls below its own control by -0.0339, and both are significant. Direction is the
+    finding, so it is stated rather than left to be inferred from the sign of `diff`.
+
+    WIN and LOSS are from the perspective of the row's subject -- the first column -- against
+    the comparator named beside it.
+    """
+    verdict = "ns" if not t["significant"] else ("WIN" if t["mean_diff"] > 0 else "LOSS")
+    return [_fmt(t["mean_diff"]), _fmt(t["required_margin"]),
+            f"{t['wins']}/{t['n']}", verdict]
+
+
 def _table(rows, headers):
     w = [max(len(str(r[i])) for r in [headers] + rows) for i in range(len(headers))]
     line = "  ".join("-" * x for x in w)
@@ -603,8 +625,7 @@ held-out participants only: the encoder never saw them, in pretraining or otherw
             if m.sum() < 2:
                 continue
             t = paired_test(series[arm][m], series[ctrl][m], nf, nr)
-            rows.append([arm, f"vs {ctrl}", _fmt(t["mean_diff"]), _fmt(t["required_margin"]),
-                         f"{t['wins']}/{t['n']}", "YES" if t["significant"] else "no"])
+            rows.append([arm, f"vs {ctrl}"] + _contrast(t))
         arms_only = sorted(a for a in series if not a.startswith("random-init"))
         for i in range(len(arms_only)):
             for j in range(i + 1, len(arms_only)):
@@ -613,9 +634,8 @@ held-out participants only: the encoder never saw them, in pretraining or otherw
                 if m.sum() < 2:
                     continue
                 t = paired_test(series[a1][m], series[a2][m], nf, nr)
-                rows.append([a1, f"vs {a2}", _fmt(t["mean_diff"]), _fmt(t["required_margin"]),
-                             f"{t['wins']}/{t['n']}", "YES" if t["significant"] else "no"])
-        A(_table(rows, ["arm", "against", "diff", "margin", "wins", "significant"])
+                rows.append([a1, f"vs {a2}"] + _contrast(t))
+        A(_table(rows, ["arm", "against"] + CONTRAST_COLS)
           if rows else "(no comparable pairs)")
 
     # ---- RQ3 -------------------------------------------------------------------------
@@ -647,10 +667,8 @@ projection 0.7198, random-init 0.6874, DSSL 0.679, supervised 0.6609.
                 if m.sum() < 2:
                     continue
                 t = paired_test(series[n][m], series[best_dssl][m], nf, nr)
-                rows.append([n, _fmt(t["mean_diff"]), _fmt(t["required_margin"]),
-                             f"{t['wins']}/{t['n']}",
-                             "YES" if t["significant"] else "no"])
-            A(_table(rows, ["rung", "diff vs DSSL", "margin", "wins", "significant"]))
+                rows.append([n] + _contrast(t))
+            A(_table(rows, ["rung"] + CONTRAST_COLS))
 
     # ---- RQ1 -------------------------------------------------------------------------
     A("\n" + rule)
