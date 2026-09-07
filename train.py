@@ -299,7 +299,27 @@ def main(argv=None):
     X, n_sensors, bins_per_day = coh.X, coh.n_sensors, coh.bins_per_day
     upids, ulab = coh.participants()
     folds = make_folds(upids, ulab, args.folds, args.repeats, args.master_seed)
-    spec = plan(args, args.arms, folds, X, n_sensors, bins_per_day)
+
+    # plan.json's "arms" must be the UNION of every arm ever requested against this --out
+    # directory, not just this invocation's args.arms. oneshot.sh shards by weighting, so
+    # each of the 60 array tasks calls main() with only 2 of the 4 arms; writing args.arms
+    # straight to plan.json meant every task OVERWROTE the file with its own slice, and
+    # whichever task finished last left plan.json holding only that slice's 2 arms
+    # permanently -- eval.py trusts plan.json to know which arm directories exist, so it
+    # silently stopped evaluating the other 2 even though their fold.json/repr.npz were
+    # sitting right there on disk. Merging with whatever is already recorded means the
+    # field can only grow across concurrent invocations, never shrink.
+    prior = out / "plan.json"
+    seen = {(a.readout, a.weights) for a in args.arms}
+    if prior.exists():
+        try:
+            for a in json.loads(prior.read_text(encoding="utf-8"))["arms"]:
+                seen.add((a["phase_readout"], a["weights"]))
+        except (json.JSONDecodeError, KeyError, OSError):
+            pass          # a torn concurrent write; this invocation's own arms still count
+    plan_arms = [Arm(r, w) for r, w in sorted(seen)]
+
+    spec = plan(args, plan_arms, folds, X, n_sensors, bins_per_day)
     spec["n_participants_total"] = len(set(coh.pids.tolist()))
     spec["n_labelled_participants"] = len(upids)
     spec["prevalence"] = round(float(ulab.mean()), 4)
