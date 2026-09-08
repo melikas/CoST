@@ -375,20 +375,81 @@ def probe_auc_participants(V, pids, y_by_pid, tr_pids, te_pids, tdays, seed,
     No probability averaging: the classifier sees a participant and predicts a participant,
     so the fitted unit and the labelled unit finally agree.
     """
-    pu, X, width = aggregate_participants(V, pids, tdays)
+    # The pair block is located inside the MEAN statistic only -- see aggregate_participants.
+    pu, X, _ = aggregate_participants(V, pids, tdays)
+    return score_participants(pu, X, y_by_pid, tr_pids, te_pids, seed,
+                              mode, pair_start, pair_width)
+
+
+def score_participants(pu, X, y_by_pid, tr_pids, te_pids, seed, mode="supervised",
+                       pair_start=None, pair_width=0):
+    """Fit and score one participant-level feature matrix. Shared by every such path."""
     idx = {p: i for i, p in enumerate(pu)}
-    tr = np.array([idx[p] for p in tr_pids if p in idx])
-    te = np.array([idx[p] for p in te_pids if p in idx])
+    tr = np.array([idx[p] for p in tr_pids if p in idx], dtype=int)
+    te = np.array([idx[p] for p in te_pids if p in idx], dtype=int)
+    if not len(tr) or not len(te):
+        return float("nan"), PROBE_C[0], {}
     ytr = np.array([y_by_pid[pu[i]] for i in tr])
     yte = np.array([y_by_pid[pu[i]] for i in te])
-    if len(np.unique(ytr)) < 2 or not len(te):
+    if len(np.unique(ytr)) < 2:
         return float("nan"), PROBE_C[0], {}
-    # The pair block is located inside the MEAN statistic only -- see aggregate_participants.
     pr, best_c = fit_probe(X[tr], ytr, seed, mode, pair_start, pair_width)
     sc = pr.predict_proba(X[te])[:, 1]
     oof = {str(pu[i]): float(v) for i, v in zip(te, sc)}
     auc = float(roc_auc_score(yte, sc)) if len(np.unique(yte)) > 1 else float("nan")
     return auc, best_c, oof
+
+
+DEV_STATS = ("mean", "sd", "iqr", "trend", "max")
+
+
+def deviation_features(V, pids, tdays, R=BASELINE_R):
+    """The RQ2 BRIDGE: per-participant statistics of the personal-baseline deviation series.
+
+    RQ2 asks whether a window has drifted from that person's own recent rhythm, and scores
+    it with `dscore` against a baseline of their R preceding windows. On that question the
+    trained representation beats its architecture-matched control (C = 0.8868 vs 0.8614,
+    25/30, significant) -- the one place in this study where it does. RQ3 then asked a
+    different question of the same vectors and found nothing. This routes RQ3 THROUGH the
+    quantity RQ2 validated: a participant is described by how unstable their rhythm is over
+    the study, not by what their windows look like.
+
+    It is also a ~1000x dimensionality reduction, which matters here. Generic aggregation
+    took a 1760-dim representation to 7040 features on ~102 training participants (p/n =
+    69) and cost every encoder arm accuracy -- most of all the untrained control, at
+    -0.0614, exactly the signature of fitting noise. Collapsing each window to ONE distance
+    and summarising the trajectory gives 5 features (p/n = 0.05).
+
+    Clinically this is the chronobiological hypothesis stated directly: depression tracks
+    rhythm INSTABILITY over time, not a static rhythm state.
+    """
+    mu, sd_, ok = personal_baseline(V, pids, R, tdays, float(7 * (R - 1)))
+    d = dscore(V, mu, sd_)
+    t = np.asarray(tdays, float)
+    pu, rows = np.unique(pids), []
+    for p in pu:
+        m = (pids == p) & ok
+        dv, tv = d[m], t[m]
+        if len(dv) < 2:
+            # Too few scored windows to describe a trajectory. Zeros rather than NaN: the
+            # probe's scaler needs a finite row, and a participant with no measurable
+            # deviation history genuinely carries no evidence either way.
+            rows.append(np.zeros(len(DEV_STATS)))
+            continue
+        tc = tv - tv.mean()
+        den = float((tc ** 2).sum())
+        rows.append(np.array([
+            dv.mean(), dv.std(), np.subtract(*np.percentile(dv, [75, 25])),
+            float((tc * (dv - dv.mean())).sum() / den) if den > 0 else 0.0,
+            dv.max()]))
+    return pu, np.nan_to_num(np.vstack(rows), nan=0.0)
+
+
+def probe_auc_deviation(V, pids, y_by_pid, tr_pids, te_pids, tdays, seed, mode="supervised"):
+    """Score a representation through its deviation trajectory. No pair block: the features
+    are statistics of a scalar distance, so the circular geometry is already consumed."""
+    pu, X = deviation_features(V, pids, tdays)
+    return score_participants(pu, X, y_by_pid, tr_pids, te_pids, seed, mode)
 
 
 def probe_auc(Xtr, ytr, Xte, pids_te, y_te_w, seed, mode="supervised",
@@ -435,16 +496,19 @@ def run_rq3(args, coh, plan, fold, recs, device):
     tr_pids, te_pids = list(fold.train_pids), list(fold.test_pids)
     ladder = {}
 
-    def add(name, V, ps=None, pw=0, mode="supervised"):
-        """Score one representation both ways, under one identical selection rule."""
+    def add(name, V, ps=None, pw=0, mode="supervised", dev=True):
+        """Score one representation every way, under one identical selection rule."""
         ladder[name] = probe_auc(V[tr], y_tr, V[te], pids_te, y_te_w, seed,
                                  mode=mode, pair_start=ps, pair_width=pw)
         ladder[name + " [agg]"] = probe_auc_participants(
             V, coh.pids, y_by_pid, tr_pids, te_pids, tdays, seed,
             mode=mode, pair_start=ps, pair_width=pw)
+        if dev:
+            ladder[name + " [dev]"] = probe_auc_deviation(
+                V, coh.pids, y_by_pid, tr_pids, te_pids, tdays, seed)
 
     flat = np.nan_to_num(coh.X[:, :, :coh.n_sensors].reshape(len(coh.X), -1), nan=0.0)
-    add("RF on raw", flat, mode="forest")
+    add("RF on raw", flat, mode="forest", dev=False)
     add("Random projection (512)", raw_projection(coh.X, coh.n_sensors, 512, seed))
     for readout in sorted({r["arm"]["phase_readout"] for r in recs.values()}):
         ctrl = _blank_model(coh, plan, readout, device, seed=fold.model_seed)
@@ -454,6 +518,15 @@ def run_rq3(args, coh, plan, fold, recs, device):
         V = np.load(Path(args.run) / arm_tag / fold.tag / "repr.npz")["full"]
         ps, pw = rec["pair_block_full"]
         add(f"DSSL {arm_tag}", V, ps, pw or 0)
+
+    # The control that decides what any [dev] gain MEANS. RQ2's own raw reference: the same
+    # deviation machinery applied to raw 24 h cosinor coefficients instead of a learned
+    # representation. If the learned [dev] arms beat this, the representation is carrying
+    # the signal; if they only match it, the DEVIATION FRAMING is doing the work and the
+    # encoder is incidental. Without it a [dev] gain would be uninterpretable.
+    Z = cosinor_z(coh.X[:, :, :coh.n_sensors], coh.bins_per_day)
+    ladder["Raw cosinor [dev]"] = probe_auc_deviation(
+        np.c_[Z.real, Z.imag], coh.pids, y_by_pid, tr_pids, te_pids, tdays, seed)
     for k, (auc, c, _) in ladder.items():
         print(f"    [rq3] {k:34s} AUROC={auc:.4f} (C={c})", flush=True)
     _, _, ys = participant_scores(np.zeros(len(te)), pids_te, y_te_w)
