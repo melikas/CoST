@@ -73,6 +73,35 @@ class Cohort:
             labs.append(int(v[0]))
         return np.array(ids), np.array(labs)
 
+    def participant_years(self):
+        """{pid: study year} read from the window ids -- the grouping LODO splits on.
+
+        GLOBEM ran over four annual cohorts and the benchmark holds one out at a time. The
+        year is taken from each window's ISO date rather than a separate column, so nothing
+        extra has to survive preprocessing. `rsplit` on the LAST underscore, because GLOBEM
+        pids contain underscores themselves ("INS-W_001_2018-04-09").
+
+        A participant appearing in two years would break the disjointness the split relies
+        on, so that is checked by the caller rather than assumed -- verified on this cohort
+        as 4 years and 0 participants spanning more than one.
+        """
+        if self.window_ids is None:
+            raise ValueError("participant_years needs window_ids")
+        out = {}
+        for w, p in zip(np.asarray(self.window_ids).astype(str),
+                        np.asarray(self.pids).astype(str)):
+            y = w.rsplit("_", 1)[1][:4]
+            if not (len(y) == 4 and y.isdigit()):
+                raise ValueError(f"window id {w!r} does not end in an ISO date")
+            out.setdefault(p, {}).setdefault(y, 0)
+            out[p][y] += 1
+        mixed = {p: sorted(c) for p, c in out.items() if len(c) > 1}
+        if mixed:
+            raise ValueError(f"{len(mixed)} participants span more than one study year, so a "
+                             f"year split would not be participant-disjoint: "
+                             f"{dict(list(mixed.items())[:3])}")
+        return {p: next(iter(c)) for p, c in out.items()}
+
     def fold_data(self, fold):
         """Index arrays for one `cv.Fold`.
 

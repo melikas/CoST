@@ -37,7 +37,7 @@ import numpy as np
 
 import objective as O
 from cost import CoST
-from cv import make_folds, nadeau_bengio, required_margin
+from cv import make_folds, make_lodo_folds, nadeau_bengio, required_margin
 from data_loader import load_npz
 from model import CoSTEncoder, depth_for_window, receptive_field
 from probe import phase_block_layout
@@ -99,7 +99,7 @@ def build_encoder(args, X, n_sensors, bins_per_day, seed):
         seasonal_frac=args.seasonal_frac)
 
 
-def plan(args, arms, folds, X, n_sensors, bins_per_day):
+def plan(args, arms, folds, X, n_sensors, bins_per_day, n_folds_eff=None):
     """The run matrix and its geometry, resolved before a single GPU-hour is spent."""
     T = X.shape[1]
     depth = args.depth if args.depth is not None else depth_for_window(T)
@@ -107,6 +107,7 @@ def plan(args, arms, folds, X, n_sensors, bins_per_day):
     n_par = sum(p.numel() for p in enc.parameters())
     pair_start, pair_width = phase_block_layout(
         "circular", enc.seasonal_dims, T, bins_per_day)
+    nf = n_folds_eff if n_folds_eff is not None else args.folds
     return {
         "dataset": args.dataset,
         "windows": list(X.shape),
@@ -124,12 +125,13 @@ def plan(args, arms, folds, X, n_sensors, bins_per_day):
         "circular_pair_block": [pair_start, pair_width],
         "arms": [a.as_dict() for a in arms],
         "protocol": {
-            "n_folds": args.folds, "n_repeats": args.repeats,
+            "name": args.protocol,
+            "n_folds": nf, "n_repeats": args.repeats,
             "n_arm_fold_results": len(arms) * len(folds),
             "n_encoder_fits": len({a.weights for a in arms}) * len(folds),
-            "nadeau_bengio_factor": round(nadeau_bengio(args.folds, args.repeats), 4),
+            "nadeau_bengio_factor": round(nadeau_bengio(nf, args.repeats), 4),
             "required_margin_at_sd_0.042": round(
-                required_margin(0.042, args.folds, args.repeats), 4),
+                required_margin(0.042, nf, args.repeats), 4),
         },
     }
 
@@ -229,6 +231,10 @@ def parse_args(argv=None):
                    help="'all' for the 2x2, or e.g. 'angle:paper,circular:contracted'")
     g.add_argument("--folds", type=int, default=10)
     g.add_argument("--repeats", type=int, default=3)
+    g.add_argument("--protocol", choices=["kfold", "lodo"], default="kfold",
+                   help="kfold = repeated grouped K-fold over all labelled participants. "
+                        "lodo = leave-one-study-year-out, the GLOBEM benchmark's own split, "
+                        "which is what makes our numbers comparable to their 0.547")
     g.add_argument("--master-seed", type=int, default=20260906,
                    help="the ONE seed; split/model/probe seeds are spawned from it and are "
                         "guaranteed distinct")
@@ -298,7 +304,14 @@ def main(argv=None):
     coh = load_npz(args.npz)
     X, n_sensors, bins_per_day = coh.X, coh.n_sensors, coh.bins_per_day
     upids, ulab = coh.participants()
-    folds = make_folds(upids, ulab, args.folds, args.repeats, args.master_seed)
+    if args.protocol == "lodo":
+        yr = coh.participant_years()
+        folds = make_lodo_folds(upids, ulab, [yr[p] for p in upids],
+                                args.repeats, args.master_seed)
+        n_folds_eff = len({f.fold for f in folds})
+    else:
+        folds = make_folds(upids, ulab, args.folds, args.repeats, args.master_seed)
+        n_folds_eff = args.folds
 
     # plan.json's "arms" must be the UNION of every arm ever requested against this --out
     # directory, not just this invocation's args.arms. oneshot.sh shards by weighting, so
@@ -319,7 +332,7 @@ def main(argv=None):
             pass          # a torn concurrent write; this invocation's own arms still count
     plan_arms = [Arm(r, w) for r, w in sorted(seen)]
 
-    spec = plan(args, plan_arms, folds, X, n_sensors, bins_per_day)
+    spec = plan(args, plan_arms, folds, X, n_sensors, bins_per_day, n_folds_eff)
     spec["n_participants_total"] = len(set(coh.pids.tolist()))
     spec["n_labelled_participants"] = len(upids)
     spec["prevalence"] = round(float(ulab.mean()), 4)
@@ -336,7 +349,8 @@ def main(argv=None):
           f"({spec['rf_over_window']}x window)  bands {spec['bands']}")
     print(f"[arch] trend kernels {spec['trend_kernels']} -> "
           f"{spec['n_params']:,} params  (V^T {spec['trend_dims']} / V^S {spec['seasonal_dims']})")
-    print(f"[prot] {pr['n_folds']}-fold x {pr['n_repeats']}, {len(args.arms)} arms "
+    print(f"[prot] {args.protocol}: {pr['n_folds']}-fold x {pr['n_repeats']}, "
+          f"{len(args.arms)} arms "
           f"-> {pr['n_encoder_fits']} encoder fits / "
           f"{pr['n_arm_fold_results']} results; NB factor {pr['nadeau_bengio_factor']}, "
           f"margin ~{pr['required_margin_at_sd_0.042']}")

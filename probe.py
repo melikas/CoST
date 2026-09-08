@@ -39,7 +39,44 @@ from sklearn.linear_model import LogisticRegression
 from sklearn.pipeline import make_pipeline
 from sklearn.preprocessing import StandardScaler
 
-__all__ = ["IsotropicPairScaler", "phase_block_layout", "make_probe"]
+__all__ = ["IsotropicPairScaler", "phase_block_layout", "make_probe",
+           "best_threshold", "balanced_accuracy"]
+
+
+def balanced_accuracy(y, pred):
+    """(sensitivity + specificity) / 2. Chance is exactly 0.5 at any prevalence."""
+    y, pred = np.asarray(y).astype(int), np.asarray(pred).astype(int)
+    p, n = (y == 1), (y == 0)
+    if not p.any() or not n.any():
+        return float("nan")
+    return float(((pred[p] == 1).mean() + (pred[n] == 0).mean()) / 2)
+
+
+def best_threshold(y, prob):
+    """Threshold maximising balanced accuracy, to be chosen on the TRAINING split ONLY.
+
+    Balanced accuracy needs an operating point, and picking it on the test split would be
+    fitting the metric to the answer -- the single easiest way to manufacture a benchmark
+    win. Selected here on training predictions and then applied unchanged to the test set.
+
+    Computed by sweeping every distinct score with cumulative sums rather than looping, so
+    it stays O(n log n) and can run per fold per rung without being noticed.
+    """
+    y = np.asarray(y).astype(int)
+    prob = np.asarray(prob, dtype=float)
+    P, N = int((y == 1).sum()), int((y == 0).sum())
+    if P == 0 or N == 0:
+        return 0.5
+    o = np.argsort(-prob, kind="mergesort")
+    ys = y[o]
+    tp = np.cumsum(ys == 1)                      # predicted positive = the top k scores
+    fp = np.cumsum(ys == 0)
+    bacc = (tp / P + (N - fp) / N) / 2.0
+    k = int(np.argmax(bacc))
+    ps = prob[o]
+    # Sit strictly below the last included score so the comparison `prob >= thr` reproduces
+    # exactly the top-k split that was scored.
+    return float(ps[k] - 1e-12 if k + 1 >= len(ps) else (ps[k] + ps[k + 1]) / 2.0)
 
 
 class IsotropicPairScaler(BaseEstimator, TransformerMixin):

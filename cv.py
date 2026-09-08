@@ -32,7 +32,7 @@ from dataclasses import dataclass, asdict
 import numpy as np
 
 __all__ = ["Fold", "make_folds", "nadeau_bengio", "required_margin", "paired_test",
-           "delong_test"]
+           "delong_test", "make_lodo_folds"]
 
 
 @dataclass(frozen=True)
@@ -241,3 +241,45 @@ def delong_test(y, s1, s2):
     return {"auc1": a1, "auc2": a2, "diff": diff, "se": se, "z": z,
             "p": math.erfc(abs(z) / math.sqrt(2)), "n": len(y), "n_pos": m,
             "degenerate": False}
+
+
+def make_lodo_folds(pids, labels, years, n_repeats=3, master_seed=20260906):
+    """Leave-one-study-year-out -- the GLOBEM benchmark's own split.
+
+    Xu et al. evaluate cross-dataset generalisation by holding out one of the four GLOBEM
+    study years and training on the other three, and report balanced accuracy at the WINDOW
+    unit. Reproducing that split is what makes our numbers comparable to their 0.547; their
+    within-dataset setup instead takes the first 80% of every user's data for training and
+    the last 20% for test, so the same people sit on both sides and a model can score by
+    remembering a personal baseline. Only the cross-dataset number is a fair target.
+
+    The partition is DETERMINISTIC -- it is the calendar, not a sample -- so `split_seed` is
+    inert here and carried only so one Fold type serves both protocols. `n_repeats` varies
+    the model and probe seeds alone, which averages optimisation variance without pretending
+    the data split was resampled. Verified on this cohort: 4 years, 0 participants spanning
+    more than one, so the split is participant-disjoint by construction.
+    """
+    pids, labels, years = np.asarray(pids), np.asarray(labels), np.asarray(years).astype(str)
+    if not (len(pids) == len(labels) == len(years)):
+        raise ValueError("pids, labels and years must be parallel, one row per participant")
+    uy = sorted(set(years.tolist()))
+    if len(uy) < 2:
+        raise ValueError(f"leave-one-year-out needs >=2 years, found {uy}")
+
+    rng_split, rng_model, rng_probe = _streams(master_seed)
+    out = []
+    for rep in range(n_repeats):
+        split_seed = int(rng_split.integers(1, 2 ** 31 - 1))     # inert; see docstring
+        for f, y in enumerate(uy):
+            te = np.flatnonzero(years == y)
+            tr = np.flatnonzero(years != y)
+            if len(np.unique(labels[tr])) < 2 or len(np.unique(labels[te])) < 2:
+                raise ValueError(f"year {y} leaves a single-class split; LODO needs both "
+                                 "classes on each side")
+            out.append(Fold(
+                repeat=rep, fold=f, split_seed=split_seed,
+                model_seed=int(rng_model.integers(1, 2 ** 31 - 1)),
+                probe_seed=int(rng_probe.integers(1, 2 ** 31 - 1)),
+                test_pids=tuple(pids[te].tolist()), train_pids=tuple(pids[tr].tolist())))
+    _assert_decoupled(out)
+    return out

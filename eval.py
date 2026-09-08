@@ -48,7 +48,7 @@ from cost import CoST
 from cv import (Fold, delong_test, nadeau_bengio, paired_test,
                 required_margin)
 from data_loader import load_npz
-from probe import make_probe
+from probe import balanced_accuracy, best_threshold, make_probe
 
 PHASE_LEVELS = (0.5, 1.0, 2.0, 3.0, 4.0)
 BASELINE_R = 4                      # personal reference = 4 preceding windows = 28 days
@@ -387,17 +387,23 @@ def score_participants(pu, X, y_by_pid, tr_pids, te_pids, seed, mode="supervised
     idx = {p: i for i, p in enumerate(pu)}
     tr = np.array([idx[p] for p in tr_pids if p in idx], dtype=int)
     te = np.array([idx[p] for p in te_pids if p in idx], dtype=int)
+    blank = {"auc": float("nan"), "probe_C": PROBE_C[0], "oof": {},
+             "bacc": float("nan"), "unit": "participant"}
     if not len(tr) or not len(te):
-        return float("nan"), PROBE_C[0], {}
+        return blank
     ytr = np.array([y_by_pid[pu[i]] for i in tr])
     yte = np.array([y_by_pid[pu[i]] for i in te])
     if len(np.unique(ytr)) < 2:
-        return float("nan"), PROBE_C[0], {}
+        return blank
     pr, best_c = fit_probe(X[tr], ytr, seed, mode, pair_start, pair_width)
     sc = pr.predict_proba(X[te])[:, 1]
-    oof = {str(pu[i]): float(v) for i, v in zip(te, sc)}
-    auc = float(roc_auc_score(yte, sc)) if len(np.unique(yte)) > 1 else float("nan")
-    return auc, best_c, oof
+    # Balanced accuracy here is at the PARTICIPANT unit, so it is recorded but is NOT
+    # comparable to the benchmark's 0.547, which is a window-unit number. The report shows
+    # only window-unit rungs in the benchmark table for that reason.
+    thr = best_threshold(ytr, pr.predict_proba(X[tr])[:, 1])
+    return {"auc": float(roc_auc_score(yte, sc)) if len(np.unique(yte)) > 1 else float("nan"),
+            "probe_C": best_c, "oof": {str(pu[i]): float(v) for i, v in zip(te, sc)},
+            "bacc": balanced_accuracy(yte, (sc >= thr).astype(int)), "unit": "participant"}
 
 
 DEV_STATS = ("mean", "sd", "iqr", "trend", "max")
@@ -463,15 +469,23 @@ def probe_auc(Xtr, ytr, Xte, pids_te, y_te_w, seed, mode="supervised",
     """
     pr, best_c = fit_probe(Xtr, ytr, seed, mode, pair_start, pair_width)
     prob = pr.predict_proba(Xte)[:, 1]
+    # WINDOW-unit balanced accuracy, for the head-to-head against the GLOBEM benchmark.
+    # Xu et al. report 0.547 at the window unit under leave-one-study-year-out, so matching
+    # their number requires matching their unit -- our participant-level AUROC is a
+    # different quantity and comparing the two would be the apples-to-oranges objection.
+    # The operating point is chosen on the TRAINING windows and applied unchanged: picking
+    # it on the test split would be fitting the metric to the answer.
+    thr = best_threshold(ytr, pr.predict_proba(Xtr)[:, 1])
+    bacc = balanced_accuracy(y_te_w, (prob >= thr).astype(int))
     pu, sc, ys = participant_scores(prob, pids_te, y_te_w)
     # The per-participant OOF scores are returned, not just the fold AUROC. Scoring a fold
     # of 11-13 participants is 99% sampling noise (observed SD 0.1626 against a
     # Hanley-McNeil pure-noise SE of 0.1636); pooling every fold of a repeat instead gives
     # one AUROC over all 114 and cuts that noise 3.3x. The scalar cannot be pooled after
     # the fact, so the scores have to be kept.
-    oof = {str(p): float(v) for p, v in zip(pu, sc)}
-    auc = float(roc_auc_score(ys, sc)) if len(np.unique(ys)) > 1 else float("nan")
-    return auc, best_c, oof
+    return {"auc": float(roc_auc_score(ys, sc)) if len(np.unique(ys)) > 1 else float("nan"),
+            "probe_C": best_c, "oof": {str(p): float(v) for p, v in zip(pu, sc)},
+            "bacc": bacc, "unit": "window"}
 
 
 def run_rq3(args, coh, plan, fold, recs, device):
@@ -527,12 +541,12 @@ def run_rq3(args, coh, plan, fold, recs, device):
     Z = cosinor_z(coh.X[:, :, :coh.n_sensors], coh.bins_per_day)
     ladder["Raw cosinor [dev]"] = probe_auc_deviation(
         np.c_[Z.real, Z.imag], coh.pids, y_by_pid, tr_pids, te_pids, tdays, seed)
-    for k, (auc, c, _) in ladder.items():
-        print(f"    [rq3] {k:34s} AUROC={auc:.4f} (C={c})", flush=True)
+    for k, r in ladder.items():
+        bb = "" if not np.isfinite(r["bacc"]) else f" bacc={r['bacc']:.4f}[{r['unit'][:4]}]"
+        print(f"    [rq3] {k:34s} AUROC={r['auc']:.4f} (C={r['probe_C']}){bb}", flush=True)
     _, _, ys = participant_scores(np.zeros(len(te)), pids_te, y_te_w)
     labels = {str(p): int(v) for p, v in zip(np.unique(pids_te), ys)}
-    return {"_labels": labels,
-            **{k: {"auc": a, "probe_C": c, "oof": s} for k, (a, c, s) in ladder.items()}}
+    return {"_labels": labels, **ladder}
 
 
 def split_idx(run, tag, recs, key):
@@ -829,6 +843,18 @@ def _pooled_oof(per_fold):
     return out
 
 
+def _collect_str(per_fold, rq, path):
+    """Like _collect but for a categorical field that is constant per rung (e.g. the unit
+    a rung was scored in). Returns the single value, or None if a rung disagrees with
+    itself across folds -- which would mean the ladder is not measuring one thing."""
+    vals = {}
+    for t in per_fold:
+        for n, d in per_fold[t].get(rq, {}).items():
+            if not n.startswith("_") and isinstance(d, dict) and path in d:
+                vals.setdefault(n, set()).add(d[path])
+    return sorted(vals), {n: (v.pop() if len(v) == 1 else None) for n, v in vals.items()}
+
+
 def _table(rows, headers):
     w = [max(len(str(r[i])) for r in [headers] + rows) for i in range(len(headers))]
     line = "  ".join("-" * x for x in w)
@@ -913,6 +939,28 @@ supported by an architecture-matched control on every rung, and nothing here is 
 soften it. Prior measurement on the single-holdout protocol: RF-on-raw 0.731, random
 projection 0.7198, random-init 0.6874, DSSL 0.679, supervised 0.6609.
 """)
+    # ---- head-to-head against the published benchmark ---------------------------------
+    if plan.get("protocol", {}).get("name") == "lodo":
+        A("HEAD-TO-HEAD vs the GLOBEM benchmark")
+        A("Xu et al. (Reorder) report balanced accuracy 0.547 +/- 0.008 under")
+        A("leave-one-study-year-out at the WINDOW unit; Chikersal et al. 0.536; majority 0.500.")
+        A("Only rungs measured in that same unit appear here -- [agg] and [dev] score whole")
+        A("participants and are a different quantity, however tempting the comparison.")
+        A("The operating point for each rung is chosen on its TRAINING windows and applied")
+        A("unchanged to the held-out year.\n")
+        tags, bac = _collect(per_fold, "rq3", "bacc")
+        _, unit = _collect_str(per_fold, "rq3", "unit")
+        rows = []
+        for n in sorted(bac, key=lambda k: -np.nanmean(bac[k])):
+            if unit.get(n) != "window" or not np.isfinite(bac[n]).any():
+                continue
+            v = bac[n][np.isfinite(bac[n])]
+            rows.append([n, _fmt(v.mean()), _fmt(v.std(ddof=1)) if len(v) > 1 else "-",
+                         _fmt(v.mean() - 0.547), len(v)])
+        A(_table(rows, ["rung", "balanced acc", "SD", "vs Reorder 0.547", "folds"])
+          if rows else "(no window-unit results)")
+        A("")
+
     # ---- primary: pooled out-of-fold AUROC + DeLong -----------------------------------
     pooled = _pooled_oof(per_fold)
     if pooled:
