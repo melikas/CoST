@@ -39,7 +39,8 @@ from torch.utils.data import DataLoader, Dataset
 import objective as O
 from model import CoSTEncoder
 
-__all__ = ["PretrainDataset", "CoSTModel", "CoST"]
+__all__ = ["PretrainDataset", "CoSTModel", "CoST", "WindowClassifier", "finetune",
+           "predict_windows", "spectral_readout", "readout_width"]
 
 
 # --------------------------------------------------------------------------------------
@@ -115,6 +116,32 @@ class PretrainDataset(Dataset):
 
 
 # --------------------------------------------------------------------------------------
+def spectral_readout(z, bins_per_day, phase_readout, eps=1e-6):
+    """Frequency-domain readout of the seasonal branch -- (amplitude, phase) blocks.
+
+    Shared by the frozen path and the fine-tuning head so both read the representation the
+    SAME way. Every operation is differentiable, which is what lets a classification head
+    train through it: rfft, and a sqrt whose argument is kept strictly positive by `eps` so
+    its gradient stays finite at the origin.
+    """
+    T = z.size(1)
+    D = max(1, T // int(bins_per_day))
+    f = [i for i in (1, D, 2 * D, 3 * D, 4 * D) if 0 < i <= T // 2]
+    Z = fft.rfft(F.normalize(z.float(), dim=-1), dim=1)[:, f]
+    amp = torch.sqrt((Z.real + eps).pow(2) + (Z.imag + eps).pow(2))
+    ang = torch.atan2(Z.imag, Z.real + eps)
+    pha = (torch.cos(ang), torch.sin(ang)) if phase_readout == "circular" else (ang,)
+    flat = lambda p: p.reshape(p.size(0), -1)
+    return flat(amp), torch.cat([flat(p) for p in pha], dim=-1)
+
+
+def readout_width(seq_len, bins_per_day, phase_readout, trend_dims, seasonal_dims):
+    """Width of [trend | amp | phase] -- what the classification head receives."""
+    D = max(1, seq_len // int(bins_per_day))
+    nf = len([i for i in (1, D, 2 * D, 3 * D, 4 * D) if 0 < i <= seq_len // 2])
+    return trend_dims + nf * seasonal_dims * (1 + (2 if phase_readout == "circular" else 1))
+
+
 class CoSTModel(nn.Module):
     """MoCo on the trend branch, within-batch instance discrimination on the seasonal one."""
 
@@ -337,15 +364,7 @@ class CoST:
         angles. probe.IsotropicPairScaler is what keeps the (cos, sin) pair from being
         sheared by per-column standardisation downstream.
         """
-        T, eps = z.size(1), 1e-6
-        D = max(1, T // int(self.bins_per_day))
-        f = [i for i in (1, D, 2 * D, 3 * D, 4 * D) if 0 < i <= T // 2]
-        Z = fft.rfft(F.normalize(z.float(), dim=-1), dim=1)[:, f]
-        amp = torch.sqrt((Z.real + eps).pow(2) + (Z.imag + eps).pow(2))
-        ang = torch.atan2(Z.imag, Z.real + eps)
-        pha = (torch.cos(ang), torch.sin(ang)) if self.phase_readout == "circular" else (ang,)
-        flat = lambda p: p.reshape(p.size(0), -1)
-        return flat(amp), torch.cat([flat(p) for p in pha], dim=-1)
+        return spectral_readout(z, self.bins_per_day, self.phase_readout)
 
     @torch.no_grad()
     def encode(self, data, batch_size=256, pool="mean", parts=False):
@@ -407,3 +426,101 @@ class CoST:
         self.net.load_state_dict(ck["net"])
         self.n_iters = ck.get("n_iters", 0)
         return self
+
+
+# --------------------------------------------------------------------------------------
+# Step C: end-to-end fine-tuning
+# --------------------------------------------------------------------------------------
+class WindowClassifier(nn.Module):
+    """Encoder + the frozen path's own readout + a linear head, trained end to end.
+
+    The head sits on `spectral_readout`, NOT on a time-mean of the representation. Mean
+    pooling would destroy the seasonal branch by construction -- its output is an irFFT, so
+    its mean over the window is exactly the f=0 coefficient and every oscillation integrates
+    to zero. Reading it the same way the frozen probe does is also what makes the two
+    directly comparable: the only thing that changes between them is whether the backbone
+    receives gradient.
+    """
+
+    def __init__(self, encoder, seq_len, bins_per_day, phase_readout, dropout=0.5):
+        super().__init__()
+        self.encoder = encoder
+        self.bins_per_day, self.phase_readout = bins_per_day, phase_readout
+        w = readout_width(seq_len, bins_per_day, phase_readout,
+                          encoder.trend_dims, encoder.seasonal_dims)
+        self.norm = nn.LayerNorm(w)
+        self.drop = nn.Dropout(dropout)
+        self.head = nn.Linear(w, 1)
+
+    def forward(self, x):
+        t, s = self.encoder(x)
+        if s is None:
+            feat = t.mean(dim=1)
+        else:
+            amp, pha = spectral_readout(s, self.bins_per_day, self.phase_readout)
+            feat = torch.cat([t.mean(dim=1), amp, pha], dim=-1)
+        return self.head(self.drop(self.norm(feat))).squeeze(-1)
+
+
+def finetune(clf, Xtr, ytr, Xva, yva, *, device="cuda", epochs=40, batch_size=64,
+             lr=1e-4, weight_decay=1e-4, patience=8, verbose=False):
+    """Fine-tune end to end, early-stopping on a PARTICIPANT-DISJOINT validation split.
+
+    The validation windows must come from participants held out of the training set and
+    absent from the test fold. Splitting windows at random instead would put the same person
+    on both sides, and early stopping would then select the epoch that best memorised those
+    people -- the exact leak the whole protocol exists to prevent, arriving through the back
+    door of model selection.
+
+    `pos_weight` handles the class imbalance so the loss does not simply learn the majority.
+    The best validation AUROC is restored at the end, so what is scored is the selected
+    model rather than whatever the last epoch happened to produce.
+    """
+    from sklearn.metrics import roc_auc_score
+    clf = clf.to(device)
+    Xtr_t = torch.as_tensor(Xtr, dtype=torch.float)
+    ytr_t = torch.as_tensor(ytr, dtype=torch.float)
+    Xva_t = torch.as_tensor(Xva, dtype=torch.float).to(device)
+    npos, nneg = float((ytr_t == 1).sum()), float((ytr_t == 0).sum())
+    pos_weight = torch.tensor([nneg / max(npos, 1.0)], device=device)
+    lossf = nn.BCEWithLogitsLoss(pos_weight=pos_weight)
+    opt = torch.optim.AdamW(clf.parameters(), lr=lr, weight_decay=weight_decay)
+
+    best, best_state, bad = -np.inf, None, 0
+    n = len(Xtr_t)
+    for ep in range(epochs):
+        clf.train()
+        perm = torch.randperm(n)
+        for i in range(0, n - batch_size + 1, batch_size):
+            b = perm[i:i + batch_size]
+            loss = lossf(clf(Xtr_t[b].to(device)), ytr_t[b].to(device))
+            opt.zero_grad(set_to_none=True)
+            loss.backward()
+            opt.step()
+        clf.eval()
+        with torch.no_grad():
+            pv = torch.cat([clf(Xva_t[i:i + 256]) for i in range(0, len(Xva_t), 256)]).cpu().numpy()
+        auc = (roc_auc_score(yva, pv) if len(np.unique(yva)) > 1 else float("nan"))
+        if np.isfinite(auc) and auc > best:
+            best, bad = auc, 0
+            best_state = {k: v.detach().clone() for k, v in clf.state_dict().items()}
+        else:
+            bad += 1
+        if verbose:
+            print(f"      ep {ep:3d} val AUROC {auc:.4f}{'  *' if bad == 0 else ''}", flush=True)
+        if bad >= patience:
+            break
+    if best_state is not None:
+        clf.load_state_dict(best_state)
+    clf.eval()
+    return clf, float(best), ep + 1
+
+
+@torch.no_grad()
+def predict_windows(clf, X, device="cuda", batch_size=256):
+    """Sigmoid scores, one per window."""
+    clf.eval()
+    X = torch.as_tensor(X, dtype=torch.float)
+    out = [torch.sigmoid(clf(X[i:i + batch_size].to(device))).cpu()
+           for i in range(0, len(X), batch_size)]
+    return torch.cat(out).numpy()

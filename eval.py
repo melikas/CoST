@@ -44,7 +44,7 @@ from sklearn.linear_model import RidgeCV
 from sklearn.metrics import roc_auc_score
 
 from baselines.random_projection import raw_projection
-from cost import CoST
+from cost import CoST, WindowClassifier, finetune, predict_windows
 from cv import (Fold, delong_test, nadeau_bengio, paired_test,
                 required_margin)
 from data_loader import load_npz
@@ -571,6 +571,56 @@ def run_rq3(args, coh, plan, fold, recs, device):
         V = np.load(Path(args.run) / arm_tag / fold.tag / "repr.npz")["full"]
         ps, pw = rec["pair_block_full"]
         add(f"DSSL {arm_tag}", V, ps, pw or 0)
+
+    # ---- STEP C: end-to-end fine-tuning ------------------------------------------------
+    # The control is supervised-from-scratch, NOT the frozen probe. Both arms get the same
+    # architecture, head, schedule, early-stopping rule and validation split, and differ in
+    # exactly one thing: whether the backbone starts from pretrained weights. Without the
+    # scratch arm a good fine-tuned number would only say "supervised learning works at
+    # n=669", which is a fact about the cohort, not about the pretraining.
+    if args.finetune:
+        va_n = max(1, int(len(tr_pids) * args.finetune_val_frac))
+        rs = np.random.default_rng(fold.model_seed)
+        shuffled = list(tr_pids)
+        rs.shuffle(shuffled)
+        va_pids, fit_pids = set(shuffled[:va_n]), set(shuffled[va_n:])
+        # Validation participants are held out of FITTING and are disjoint from the test
+        # fold, so early stopping cannot select the epoch that best memorised them.
+        fit = np.flatnonzero(np.isin(coh.pids, list(fit_pids)))
+        va = np.flatnonzero(np.isin(coh.pids, list(va_pids)))
+        print(f"    [ft ] fit {len(fit)} windows / {len(fit_pids)} pids | "
+              f"val {len(va)} / {len(va_pids)} | test {len(te)} / {len(fold.test_pids)}",
+              flush=True)
+
+        def run_ft(name, encoder):
+            clf = WindowClassifier(encoder, coh.seq_len, coh.bins_per_day,
+                                   args.ft_readout, dropout=args.ft_dropout)
+            clf, best_va, n_ep = finetune(
+                clf, coh.X[fit], coh.y[fit], coh.X[va], coh.y[va], device=device,
+                epochs=args.ft_epochs, batch_size=args.ft_batch, lr=args.ft_lr,
+                weight_decay=args.ft_wd, patience=args.ft_patience)
+            prob = predict_windows(clf, coh.X[te], device=device)
+            pu, sc, ys = participant_scores(prob, pids_te, y_te_w)
+            thr = best_threshold(coh.y[fit],
+                                 predict_windows(clf, coh.X[fit], device=device))
+            ladder[name] = {
+                "auc": float(roc_auc_score(ys, sc)) if len(np.unique(ys)) > 1 else float("nan"),
+                "probe_C": f"ep{n_ep}", "oof": {str(p): float(v) for p, v in zip(pu, sc)},
+                "bacc": balanced_accuracy(y_te_w, (prob >= thr).astype(int)),
+                "unit": "window", "val_auc": best_va}
+
+        # Deduplicated on purpose. `phase_readout` is an ENCODE-time choice and the head
+        # here reads through --ft-readout regardless, while encoders are saved per
+        # (weights, fold) -- so angle_paper and circular_paper would fine-tune identical
+        # starting weights through an identical head and produce identical rows at double
+        # the GPU cost. One scratch arm and one fine-tuned arm per weighting is the whole
+        # distinct matrix: 3 runs per fold rather than 6.
+        run_ft("Supervised scratch",
+               _blank_model(coh, plan, args.ft_readout, device, seed=fold.model_seed).net)
+        for w in sorted({r["arm"]["weights"] for r in recs.values()}):
+            enc = load_encoder(args.run, w, fold.tag, coh, plan,
+                               args.ft_readout, device).net
+            run_ft(f"Fine-tuned DSSL ({w})", enc)
 
     # ---- STEP B: fusion. Does the representation add what raw statistics miss? ----------
     # Every fused arm pairs the SAME raw block with a different second block, so the only
@@ -1122,6 +1172,21 @@ def parse_args(argv=None):
     p.add_argument("--only-fold", default=None, help="evaluate one fold, e.g. r0f3")
     p.add_argument("--aggregate", action="store_true", help="combine eval.json into the report")
     p.add_argument("--device", default="cuda")
+    g = p.add_argument_group("step C: end-to-end fine-tuning")
+    g.add_argument("--finetune", action="store_true",
+                   help="add the fine-tuned and supervised-from-scratch arms. Costs a full "
+                        "training run per arm per fold, so it is opt-in")
+    g.add_argument("--ft-readout", choices=["angle", "circular"], default="angle",
+                   help="readout the classification head sits on; identical for both arms")
+    g.add_argument("--ft-epochs", type=int, default=40)
+    g.add_argument("--ft-batch", type=int, default=64)
+    g.add_argument("--ft-lr", type=float, default=1e-4)
+    g.add_argument("--ft-wd", type=float, default=1e-4)
+    g.add_argument("--ft-dropout", type=float, default=0.5)
+    g.add_argument("--ft-patience", type=int, default=8)
+    g.add_argument("--finetune-val-frac", type=float, default=0.2,
+                   help="share of TRAINING participants held out for early stopping; they "
+                        "are disjoint from both the fit set and the test fold")
     p.add_argument("--skip-rq1", action="store_true")
     p.add_argument("--skip-rq2", action="store_true", help="skip if encoders were not saved")
     p.add_argument("--skip-rq3", action="store_true")
