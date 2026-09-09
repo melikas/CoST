@@ -451,6 +451,42 @@ def deviation_features(V, pids, tdays, R=BASELINE_R):
     return pu, np.nan_to_num(np.vstack(rows), nan=0.0)
 
 
+def probe_auc_fusion(blocks, pids, y_by_pid, tr_pids, te_pids, tdays, seed,
+                     mode="supervised", pair_start=None, pair_width=0):
+    """Aggregate several representations to the participant unit and CONCATENATE them.
+
+    THE QUESTION THIS ANSWERS IS COMPLEMENTARITY, NOT SUPERIORITY. Four protocols have now
+    shown the learned representation does not BEAT handcrafted raw statistics. Whether it
+    adds information they miss is a different question, never directly tested, and a
+    legitimate contribution if the answer is yes.
+
+    It is also why the control matters more than the treatment here. Fusing raw statistics
+    with anything and then beating raw statistics alone would prove nothing if the same gain
+    appears when the second block is an UNTRAINED encoder -- that would be architecture, or
+    simply extra columns, not learning. The comparison that carries the claim is
+    `raw + DSSL` against `raw + random-init`, on identical rows.
+
+    `pair_start` is offset by the widths of the preceding blocks so the isotropic pair
+    scaler still lands on the (cos, sin) columns after concatenation.
+    """
+    mats, pu, offset, ps = [], None, 0, None
+    for i, V in enumerate(blocks):
+        if len(V) != len(pids):
+            raise ValueError(f"fusion block {i} has {len(V)} rows for {len(pids)} windows; "
+                             "every block must be one row per window of the same cohort")
+        p_, X_, _ = aggregate_participants(V, pids, tdays)
+        if pu is None:
+            pu = p_
+        elif not np.array_equal(pu, p_):
+            raise AssertionError("fusion blocks disagree on the participant index")
+        if i == 1 and pair_start is not None:      # the pair block lives in the 2nd block
+            ps = offset + int(pair_start)
+        offset += X_.shape[1]
+        mats.append(X_)
+    return score_participants(pu, np.hstack(mats), y_by_pid, tr_pids, te_pids, seed,
+                              mode, ps, pair_width if ps is not None else 0)
+
+
 def probe_auc_deviation(V, pids, y_by_pid, tr_pids, te_pids, tdays, seed, mode="supervised"):
     """Score a representation through its deviation trajectory. No pair block: the features
     are statistics of a scalar distance, so the circular geometry is already consumed."""
@@ -523,6 +559,9 @@ def run_rq3(args, coh, plan, fold, recs, device):
 
     flat = np.nan_to_num(coh.X[:, :, :coh.n_sensors].reshape(len(coh.X), -1), nan=0.0)
     add("RF on raw", flat, mode="forest", dev=False)
+    # LR on the aggregated raw window. RF-on-raw uses a different probe family, so it is
+    # not the right baseline for a fused arm that is itself fit by LR -- this is.
+    add("Raw window", flat, dev=False)
     add("Random projection (512)", raw_projection(coh.X, coh.n_sensors, 512, seed))
     for readout in sorted({r["arm"]["phase_readout"] for r in recs.values()}):
         ctrl = _blank_model(coh, plan, readout, device, seed=fold.model_seed)
@@ -532,6 +571,24 @@ def run_rq3(args, coh, plan, fold, recs, device):
         V = np.load(Path(args.run) / arm_tag / fold.tag / "repr.npz")["full"]
         ps, pw = rec["pair_block_full"]
         add(f"DSSL {arm_tag}", V, ps, pw or 0)
+
+    # ---- STEP B: fusion. Does the representation add what raw statistics miss? ----------
+    # Every fused arm pairs the SAME raw block with a different second block, so the only
+    # thing varying is what is being fused in. `raw + random-init` is the control: if it
+    # gains as much as `raw + DSSL`, the gain is architecture or extra columns, not
+    # learning, and there is no complementarity to claim.
+    for readout in sorted({r["arm"]["phase_readout"] for r in recs.values()}):
+        ctrl = _blank_model(coh, plan, readout, device, seed=fold.model_seed)
+        ps, pw = _pair_of(recs, readout)
+        ladder[f"Raw + Random-init ({readout}) [fusion]"] = probe_auc_fusion(
+            [flat, ctrl.encode(coh.X, parts=False)], coh.pids, y_by_pid,
+            tr_pids, te_pids, tdays, seed, pair_start=ps, pair_width=pw)
+    for arm_tag, rec in recs.items():
+        V = np.load(Path(args.run) / arm_tag / fold.tag / "repr.npz")["full"]
+        ps, pw = rec["pair_block_full"]
+        ladder[f"Raw + DSSL {arm_tag} [fusion]"] = probe_auc_fusion(
+            [flat, V], coh.pids, y_by_pid, tr_pids, te_pids, tdays, seed,
+            pair_start=ps, pair_width=pw or 0)
 
     # The control that decides what any [dev] gain MEANS. RQ2's own raw reference: the same
     # deviation machinery applied to raw 24 h cosinor coefficients instead of a learned
