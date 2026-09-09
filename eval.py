@@ -60,6 +60,13 @@ RIDGE_ALPHAS = (0.1, 1.0, 10.0, 100.0, 1000.0)
 # another was denied -- but window-level numbers can shift slightly against the previous run
 # because the grid they select from has changed too.
 PROBE_C = (0.001, 0.01, 0.1, 1.0)
+# The forest's own grid. `C` maps to min_samples_leaf, so the linear grid's 0.001 would mean
+# a leaf of 1000 rows -- a stump on these cohorts -- and every forest fit costs far more than
+# a logistic one. Three values keep the search honest without making selection the bottleneck.
+PROBE_C_FOREST = (0.01, 0.1, 1.0)
+# Both families are offered to EVERY arm and chosen on training rows. Hard-coding the family
+# per arm is what let "RF on raw" be the only rung with a forest.
+PROBE_FAMILIES = ("supervised", "forest")
 
 
 # =======================================================================================
@@ -297,27 +304,70 @@ def participant_scores(prob, pids_w, y_w):
     return pu, ps, ys
 
 
-def fit_probe(Xtr, ytr, seed, mode="supervised", pair_start=None, pair_width=0):
-    """Fit a probe, choosing C on the TRAINING rows only.
+def selection_split(y, groups, seed, frac=0.25):
+    """Inner split for model selection: participant-disjoint AND stratified.
 
-    The same grid and the same selection rule are applied to every arm, so no arm is
-    granted a probe another was denied -- measured to matter, since the probe family alone
-    was worth nearly half the margin being competed for on the GLOBEM benchmark.
+    Both properties are load-bearing here, and the previous positional `Xtr[:cut]` had
+    neither.
+
+    PARTICIPANT-DISJOINT, because selection now chooses the probe FAMILY. A forest scored
+    on an inner split that shares participants with its own fit rows can win that split by
+    memorising them -- the exact artifact measured at +0.171 on HRD -- and would then be
+    selected for a test fold where the trick does not transfer. Selecting on a disjoint
+    split makes the family choice reflect generalisation rather than recall.
+
+    STRATIFIED, because a positional cut through participant-ordered rows can hand the
+    selection split a single class, in which case AUROC is undefined and every candidate
+    ties at the fallback.
     """
-    best, best_c = -np.inf, PROBE_C[0]
-    cut = max(1, int(len(Xtr) * 0.75))
-    for c in PROBE_C:
-        try:
-            pr = make_probe(mode, c, seed, pair_start=pair_start, pair_width=pair_width)
-            pr.fit(Xtr[:cut], ytr[:cut])
-            s = roc_auc_score(ytr[cut:], pr.predict_proba(Xtr[cut:])[:, 1])
-        except (ValueError, IndexError):
-            continue
-        if s > best:
-            best, best_c = s, c
-    pr = make_probe(mode, best_c, seed, pair_start=pair_start, pair_width=pair_width)
+    y = np.asarray(y)
+    g = np.arange(len(y)) if groups is None else np.asarray(groups)
+    rng = np.random.default_rng(seed)
+    uq = np.unique(g)
+    gl = np.array([int(round(float(y[g == u].mean()))) for u in uq])
+    held = []
+    for cls in np.unique(gl):
+        idx = uq[gl == cls].copy()
+        rng.shuffle(idx)
+        held.extend(idx[:max(1, int(len(idx) * frac))].tolist())
+    sel = np.isin(g, held)
+    if not sel.any() or sel.all():
+        cut = max(1, int(len(y) * (1 - frac)))
+        sel = np.zeros(len(y), bool)
+        sel[cut:] = True
+    return ~sel, sel
+
+
+def fit_probe(Xtr, ytr, seed, families=PROBE_FAMILIES, groups=None,
+              pair_start=None, pair_width=0):
+    """Fit a probe, selecting the FAMILY and its penalty on the training rows only.
+
+    PHASE 0. The family used to be hard-coded per arm: `RF on raw` was the only rung ever
+    given a random forest and every learned representation was restricted to logistic
+    regression. On identical features that was worth +0.0525 (GLOBEM k-fold) and +0.0238
+    (LODO) -- against a DSSL-to-champion gap of 0.0283. The docstring already claimed "no
+    arm is granted a probe another was denied"; this makes it true.
+
+    The forest gets its own, shorter grid: `C` maps to min_samples_leaf, where the linear
+    grid's 0.001 would mean a leaf of 1000 rows -- a stump on these cohorts -- and each
+    forest fit is far more expensive than a logistic one.
+    """
+    fit_m, sel_m = selection_split(ytr, groups, seed)
+    best, choice = -np.inf, (families[0], PROBE_C[0])
+    for fam in families:
+        for c in (PROBE_C_FOREST if fam == "forest" else PROBE_C):
+            try:
+                pr = make_probe(fam, c, seed, pair_start=pair_start, pair_width=pair_width)
+                pr.fit(Xtr[fit_m], ytr[fit_m])
+                s = roc_auc_score(ytr[sel_m], pr.predict_proba(Xtr[sel_m])[:, 1])
+            except (ValueError, IndexError):
+                continue
+            if s > best:
+                best, choice = s, (fam, c)
+    fam, c = choice
+    pr = make_probe(fam, c, seed, pair_start=pair_start, pair_width=pair_width)
     pr.fit(Xtr, ytr)
-    return pr, best_c
+    return pr, f"{fam[:3]}:{c}"
 
 
 def aggregate_participants(V, pids, tdays, stats=("mean", "sd", "iqr", "trend")):
@@ -369,7 +419,7 @@ def aggregate_participants(V, pids, tdays, stats=("mean", "sd", "iqr", "trend"))
 
 
 def probe_auc_participants(V, pids, y_by_pid, tr_pids, te_pids, tdays, seed,
-                           mode="supervised", pair_start=None, pair_width=0):
+                           pair_start=None, pair_width=0):
     """Aggregate to one row per participant, then fit and score at that unit.
 
     No probability averaging: the classifier sees a participant and predicts a participant,
@@ -378,10 +428,10 @@ def probe_auc_participants(V, pids, y_by_pid, tr_pids, te_pids, tdays, seed,
     # The pair block is located inside the MEAN statistic only -- see aggregate_participants.
     pu, X, _ = aggregate_participants(V, pids, tdays)
     return score_participants(pu, X, y_by_pid, tr_pids, te_pids, seed,
-                              mode, pair_start, pair_width)
+                              pair_start, pair_width)
 
 
-def score_participants(pu, X, y_by_pid, tr_pids, te_pids, seed, mode="supervised",
+def score_participants(pu, X, y_by_pid, tr_pids, te_pids, seed,
                        pair_start=None, pair_width=0):
     """Fit and score one participant-level feature matrix. Shared by every such path."""
     idx = {p: i for i, p in enumerate(pu)}
@@ -395,7 +445,8 @@ def score_participants(pu, X, y_by_pid, tr_pids, te_pids, seed, mode="supervised
     yte = np.array([y_by_pid[pu[i]] for i in te])
     if len(np.unique(ytr)) < 2:
         return blank
-    pr, best_c = fit_probe(X[tr], ytr, seed, mode, pair_start, pair_width)
+    pr, best_c = fit_probe(X[tr], ytr, seed, pair_start=pair_start,
+                           pair_width=pair_width)   # rows ARE participants
     sc = pr.predict_proba(X[te])[:, 1]
     # Balanced accuracy here is at the PARTICIPANT unit, so it is recorded but is NOT
     # comparable to the benchmark's 0.547, which is a window-unit number. The report shows
@@ -452,7 +503,7 @@ def deviation_features(V, pids, tdays, R=BASELINE_R):
 
 
 def probe_auc_fusion(blocks, pids, y_by_pid, tr_pids, te_pids, tdays, seed,
-                     mode="supervised", pair_start=None, pair_width=0):
+                     pair_start=None, pair_width=0):
     """Aggregate several representations to the participant unit and CONCATENATE them.
 
     THE QUESTION THIS ANSWERS IS COMPLEMENTARITY, NOT SUPERIORITY. Four protocols have now
@@ -484,17 +535,17 @@ def probe_auc_fusion(blocks, pids, y_by_pid, tr_pids, te_pids, tdays, seed,
         offset += X_.shape[1]
         mats.append(X_)
     return score_participants(pu, np.hstack(mats), y_by_pid, tr_pids, te_pids, seed,
-                              mode, ps, pair_width if ps is not None else 0)
+                              ps, pair_width if ps is not None else 0)
 
 
-def probe_auc_deviation(V, pids, y_by_pid, tr_pids, te_pids, tdays, seed, mode="supervised"):
+def probe_auc_deviation(V, pids, y_by_pid, tr_pids, te_pids, tdays, seed):
     """Score a representation through its deviation trajectory. No pair block: the features
     are statistics of a scalar distance, so the circular geometry is already consumed."""
     pu, X = deviation_features(V, pids, tdays)
-    return score_participants(pu, X, y_by_pid, tr_pids, te_pids, seed, mode)
+    return score_participants(pu, X, y_by_pid, tr_pids, te_pids, seed)
 
 
-def probe_auc(Xtr, ytr, Xte, pids_te, y_te_w, seed, mode="supervised",
+def probe_auc(Xtr, ytr, Xte, pids_te, y_te_w, seed, groups=None,
               pair_start=None, pair_width=0):
     """Fit a probe on the training participants, score the held-out ones.
 
@@ -503,7 +554,8 @@ def probe_auc(Xtr, ytr, Xte, pids_te, y_te_w, seed, mode="supervised",
     denied. That was measured to matter: the probe family alone was worth nearly half the
     margin being competed for on the GLOBEM benchmark.
     """
-    pr, best_c = fit_probe(Xtr, ytr, seed, mode, pair_start, pair_width)
+    pr, best_c = fit_probe(Xtr, ytr, seed, groups=groups,
+                           pair_start=pair_start, pair_width=pair_width)
     prob = pr.predict_proba(Xte)[:, 1]
     # WINDOW-unit balanced accuracy, for the head-to-head against the GLOBEM benchmark.
     # Xu et al. report 0.547 at the window unit under leave-one-study-year-out, so matching
@@ -546,21 +598,26 @@ def run_rq3(args, coh, plan, fold, recs, device):
     tr_pids, te_pids = list(fold.train_pids), list(fold.test_pids)
     ladder = {}
 
-    def add(name, V, ps=None, pw=0, mode="supervised", dev=True):
-        """Score one representation every way, under one identical selection rule."""
+    def add(name, V, ps=None, pw=0, dev=True):
+        """Score one representation every way, under one identical selection rule.
+
+        `groups` carries the training windows' participants so the family is selected on a
+        participant-disjoint inner split -- without it a forest can win selection by
+        memorising the people it was fit on.
+        """
         ladder[name] = probe_auc(V[tr], y_tr, V[te], pids_te, y_te_w, seed,
-                                 mode=mode, pair_start=ps, pair_width=pw)
+                                 groups=coh.pids[tr], pair_start=ps, pair_width=pw)
         ladder[name + " [agg]"] = probe_auc_participants(
             V, coh.pids, y_by_pid, tr_pids, te_pids, tdays, seed,
-            mode=mode, pair_start=ps, pair_width=pw)
+            pair_start=ps, pair_width=pw)
         if dev:
             ladder[name + " [dev]"] = probe_auc_deviation(
                 V, coh.pids, y_by_pid, tr_pids, te_pids, tdays, seed)
 
     flat = np.nan_to_num(coh.X[:, :, :coh.n_sensors].reshape(len(coh.X), -1), nan=0.0)
-    add("RF on raw", flat, mode="forest", dev=False)
-    # LR on the aggregated raw window. RF-on-raw uses a different probe family, so it is
-    # not the right baseline for a fused arm that is itself fit by LR -- this is.
+    # One raw arm now, not two. "RF on raw" and "Raw window" were the same features under
+    # two hard-coded families; with the family selected they collapse into a single honest
+    # rung, and the chosen family is recorded in probe_C ("for:1.0" / "sup:0.01").
     add("Raw window", flat, dev=False)
     add("Random projection (512)", raw_projection(coh.X, coh.n_sensors, 512, seed))
     for readout in sorted({r["arm"]["phase_readout"] for r in recs.values()}):
