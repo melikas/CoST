@@ -52,6 +52,15 @@ from probe import balanced_accuracy, best_threshold, make_probe
 
 PHASE_LEVELS = (0.5, 1.0, 2.0, 3.0, 4.0)
 BASELINE_R = 4                      # personal reference = 4 preceding windows = 28 days
+# RQ2's measurability boundary. A fold's C is a claim about held-out PARTICIPANTS -- one
+# person's strata across shift levels are not independent -- so it is reported only when
+# enough participants contribute a stratum holding both signs of dg. The floor is the smallest
+# n at which even unanimous agreement could reject C = 0.5 under an exact two-sided sign test,
+# 2 * 0.5**n < alpha: n = 6 at 0.05 (n = 5 reaches only p = 0.0625). Measured: every HRD fold
+# has 9-12 contributing participants; GLOBEM's 6-h bins give 0-1, because its smallest
+# expressible shift (one bin, 90 deg) pushes every window further from its reference.
+RQ2_ALPHA = 0.05
+RQ2_MIN_PARTICIPANTS = next(n for n in range(1, 64) if 2 * 0.5 ** n < RQ2_ALPHA)
 RIDGE_ALPHAS = (0.1, 1.0, 10.0, 100.0, 1000.0)
 # 0.001 is here for the participant-level arms: aggregation makes the feature block four
 # times wider while cutting the rows from ~3500 windows to ~102 participants, so the useful
@@ -267,9 +276,37 @@ def rq2_arm(model, X, pids, tdays, coh, levels, test_mask):
     keys, pid_of_row = np.concatenate(key_all), np.concatenate(pid_all)
     m = np.tile(scored, len(levels))
     per = stratum_pairs(np.where(m, dd, np.nan), np.where(m, dg, np.nan), keys)
+    # Strata are keyed "pid|level", so the contributing participants are the distinct pids.
     return {"C": concordance(per), "n_strata": len(per),
+            "n_participants": len({k.rsplit("|", 1)[0] for k in per}),
             "n_pairs": float(sum(v[1] for v in per.values())),
             "n_scored_windows": int(scored.sum())}
+
+
+def rq2_verdict(rec, n_levels):
+    """'measurable', 'unmeasurable' or 'unverified' -- the one place the boundary is applied.
+
+    Records written before `n_participants` existed carry only `n_strata`. Each contributing
+    participant adds between 1 and `n_levels` strata, so the count is bracketed by
+    ceil(n_strata / n_levels) and n_strata, and the verdict is certain unless the floor falls
+    inside that bracket. That case is 'unverified' and is excluded, not guessed: re-running the
+    fold's RQ2 records the exact count.
+    """
+    n = rec.get("n_participants")
+    if n is not None:
+        return "measurable" if n >= RQ2_MIN_PARTICIPANTS else "unmeasurable"
+    s = rec.get("n_strata", 0)
+    if s < RQ2_MIN_PARTICIPANTS:
+        return "unmeasurable"
+    return "measurable" if -(-s // max(n_levels, 1)) >= RQ2_MIN_PARTICIPANTS else "unverified"
+
+
+def _rq2_line(tag, rec, n_levels):
+    v = rq2_verdict(rec, n_levels)
+    shown = f"C={rec['C']:.4f}" if v == "measurable" else f"{v.upper()}, C not reported"
+    print(f"    [rq2] {tag:22s} {shown}  ({rec['n_participants']} participants, "
+          f"{rec['n_strata']} strata, {rec['n_pairs']:.0f} pairs; "
+          f"floor {RQ2_MIN_PARTICIPANTS})", flush=True)
 
 
 def run_rq2(args, coh, plan, fold, recs, device):
@@ -283,15 +320,14 @@ def run_rq2(args, coh, plan, fold, recs, device):
         te = np.isin(coh.pids, list(rec["fold"]["test_pids"]))
         model = load_encoder(args.run, w, fold.tag, coh, plan, readout, device)
         out["arms"][arm_tag] = rq2_arm(model, coh.X, coh.pids, tdays, coh, levels, te)
-        print(f"    [rq2] {arm_tag:22s} C={out['arms'][arm_tag]['C']:.4f} "
-              f"({out['arms'][arm_tag]['n_pairs']:.0f} pairs)", flush=True)
+        _rq2_line(arm_tag, out["arms"][arm_tag], len(levels))
 
     for readout in sorted({r["arm"]["phase_readout"] for r in recs.values()}):
         te = np.isin(coh.pids, list(fold.test_pids))
         ctrl = _blank_model(coh, plan, readout, device, seed=fold.model_seed)
         tag = f"random-init_{readout}"
         out["arms"][tag] = rq2_arm(ctrl, coh.X, coh.pids, tdays, coh, levels, te)
-        print(f"    [rq2] {tag:22s} C={out['arms'][tag]['C']:.4f}", flush=True)
+        _rq2_line(tag, out["arms"][tag], len(levels))
     return out
 
 
@@ -1071,8 +1107,32 @@ pushed closer, within a (participant, shift level) stratum. Null is exactly 0.5.
 held-out participants only: the encoder never saw them, in pretraining or otherwise.
 """)
     tags, series = _collect(per_fold, "rq2", "C", sub="arms")
+    if series:
+        # The boundary is applied to the C values themselves, so the table, its fold counts
+        # and BOTH sides of every paired contrast drop an excluded fold together.
+        excluded = {"unmeasurable": 0, "unverified": 0}
+        for i, t in enumerate(tags):
+            r = per_fold[t].get("rq2", {})
+            for arm, v in series.items():
+                rec = r.get("arms", {}).get(arm)
+                if rec is None:
+                    continue
+                verdict = rq2_verdict(rec, len(r.get("levels", ())))
+                if verdict != "measurable":
+                    excluded[verdict] += 1
+                    v[i] = np.nan
+        A(f"Boundary: a fold's C counts only if at least {RQ2_MIN_PARTICIPANTS} held-out "
+          f"participants contribute a\nstratum holding both signs of dg. Below that, even "
+          f"unanimous agreement cannot reject\nC = 0.5 (exact two-sided sign test, alpha "
+          f"{RQ2_ALPHA}). Arm-folds excluded: {excluded['unmeasurable']} unmeasurable, "
+          f"{excluded['unverified']}\nunverified (a legacy record whose strata do not settle "
+          f"the count; re-running that\nfold's RQ2 records it).\n")
+        series = {n: v for n, v in series.items() if np.isfinite(v).any()}
+        empty = "(RQ2 unmeasurable on every fold -- no C is reported)"
+    else:
+        empty = "(no RQ2 results)"
     if not series:
-        A("(no RQ2 results)")
+        A(empty)
     else:
         rows = [[n, _fmt(np.nanmean(v)), _fmt(np.nanstd(v, ddof=1)), int(np.isfinite(v).sum())]
                 for n, v in sorted(series.items(), key=lambda kv: -np.nanmean(kv[1]))]
