@@ -34,13 +34,14 @@ import numpy as np
 import torch
 import torch.nn.functional as F
 from torch import fft, nn
-from torch.utils.data import DataLoader, Dataset
+from torch.utils.data import DataLoader, Dataset, TensorDataset
 
 import objective as O
-from model import CoSTEncoder
+from model import CoSTEncoder, rhythm_bands
 
 __all__ = ["PretrainDataset", "CoSTModel", "CoST", "WindowClassifier", "finetune",
-           "predict_windows", "spectral_readout", "readout_width"]
+           "predict_windows", "spectral_readout", "readout_width",
+           "MaskedReconstruction", "day_span_mask"]
 
 
 # --------------------------------------------------------------------------------------
@@ -135,11 +136,17 @@ def spectral_readout(z, bins_per_day, phase_readout, eps=1e-6):
     return flat(amp), torch.cat([flat(p) for p in pha], dim=-1)
 
 
-def readout_width(seq_len, bins_per_day, phase_readout, trend_dims, seasonal_dims):
-    """Width of [trend | amp | phase] -- what the classification head receives."""
+def readout_width(seq_len, bins_per_day, phase_readout, trend_dims, seasonal_dims,
+                  residual_dims=0):
+    """Width of [trend | amp | phase | resid] -- what the classification head receives.
+
+    `residual_dims` defaults to 0, so every arm without the V^N branch keeps exactly the
+    width it had before that branch existed.
+    """
     D = max(1, seq_len // int(bins_per_day))
     nf = len([i for i in (1, D, 2 * D, 3 * D, 4 * D) if 0 < i <= seq_len // 2])
-    return trend_dims + nf * seasonal_dims * (1 + (2 if phase_readout == "circular" else 1))
+    return (trend_dims + nf * seasonal_dims * (1 + (2 if phase_readout == "circular" else 1))
+            + residual_dims)
 
 
 class CoSTModel(nn.Module):
@@ -195,7 +202,7 @@ class CoSTModel(nn.Module):
     # -- objective --------------------------------------------------------------------
     def forward(self, x_q, x_k, update=True, return_parts=False):
         idx = np.random.randint(0, x_q.shape[1])
-        q_t, q_s = self.encoder_q(x_q)
+        q_t, q_s, q_n = self.encoder_q(x_q)
 
         if not self.disentangle:
             # Plain-SSL control: one representation, one MoCo, no seasonal term at all.
@@ -203,7 +210,7 @@ class CoSTModel(nn.Module):
             with torch.no_grad():
                 if update:
                     self._momentum_update()
-                k_t, _ = self.encoder_k(x_k)
+                k_t, _, _ = self.encoder_k(x_k)
                 k = F.normalize(self.head_k(self._trend_view(k_t, idx)), dim=-1)
             loss, self.last_top1 = O.moco_ce_loss(q, k, self.queue.clone().detach(), self.T)
             if update:
@@ -215,7 +222,7 @@ class CoSTModel(nn.Module):
         with torch.no_grad():
             if update:
                 self._momentum_update()
-            k_t, _ = self.encoder_k(x_k)
+            k_t, _, _ = self.encoder_k(x_k)
             k_t = F.normalize(self.head_k(self._trend_view(k_t, idx)), dim=-1)
         trend, self.last_top1 = O.moco_ce_loss(q_t, k_t, self.queue.clone().detach(), self.T)
         if update:
@@ -226,7 +233,7 @@ class CoSTModel(nn.Module):
         # is symmetric -- detaching one side behind an EMA copy would zero half its gradient
         # path. The key therefore comes from encoder_q, with gradients, at the cost of a
         # third encoder pass. Do not "fix" this to encoder_k.
-        _, k_s = self.encoder_q(x_k)
+        _, k_s, _ = self.encoder_q(x_k)
         amp, pha = O.seasonal_loss(q_s, k_s, self.weights, self.phase_mode)
         total = O.total_loss(trend, amp, pha, self.weights, self.alpha)
         return (total, trend, amp + pha) if return_parts else total
@@ -247,6 +254,8 @@ class CoST:
     def __init__(self, input_dims, seq_len, bins_per_day, *, output_dims=320, hidden_dims=64,
                  depth=None, n_time_features=0, seasonal_bands="harmonics", disentangle=True,
                  mask_mode="none", trend_kernel_cap=None, seasonal_frac=0.5,
+                 residual_dims=0, objective="contrastive", n_sensors=None,
+                 mask_frac=0.25, w_cosinor=0.3, w_spectral=0.1,
                  phase_readout="circular", phase_mode="circular_amp", trend_pool="random",
                  weights: O.TermWeights = O.PAPER, alpha=0.005, moco_k=4096,
                  jitter_sigma=0.1, shift_sigma=0.5, smooth_bins=5,
@@ -254,6 +263,11 @@ class CoST:
                  model_seed=None):
         if phase_readout not in ("angle", "circular"):
             raise ValueError(f"phase_readout must be 'angle' or 'circular', got {phase_readout!r}")
+        if objective not in ("contrastive", "mae"):
+            raise ValueError(f"objective must be 'contrastive' or 'mae', got {objective!r}")
+        if objective == "mae" and not disentangle:
+            raise ValueError("objective='mae' needs the disentangled encoder; --plain has no "
+                             "trend/seasonal split for the two decoders to reconstruct")
         if model_seed is not None:
             torch.manual_seed(model_seed)
             np.random.seed(model_seed % (2 ** 31))
@@ -266,40 +280,44 @@ class CoST:
         self.max_train_length = max_train_length
         self.jitter_sigma, self.shift_sigma, self.smooth_bins = jitter_sigma, shift_sigma, smooth_bins
         self.disentangle = disentangle
+        self.objective = objective
 
         enc = dict(input_dims=input_dims, output_dims=output_dims, seq_len=seq_len,
                    bins_per_day=bins_per_day, hidden_dims=hidden_dims, depth=depth,
                    n_time_features=n_time_features, seasonal_bands=seasonal_bands,
                    disentangle=disentangle, mask_mode=mask_mode,
-                   trend_kernel_cap=trend_kernel_cap, seasonal_frac=seasonal_frac)
+                   trend_kernel_cap=trend_kernel_cap, seasonal_frac=seasonal_frac,
+                   residual_dims=residual_dims)
         self.net = CoSTEncoder(**enc).to(device)
-        encoder_k = CoSTEncoder(**enc).to(device)
         self.component_dims = self.net.seasonal_dims if disentangle else output_dims
 
-        self.cost = CoSTModel(
-            self.net, encoder_k, dim=(self.net.trend_dims if disentangle else output_dims),
-            alpha=alpha, K=moco_k, disentangle=disentangle, phase_mode=phase_mode,
-            trend_pool=trend_pool, weights=weights, device=device).to(device)
+        if objective == "mae":
+            # No momentum encoder and no queue: reconstruction needs neither. `n_sensors`
+            # defaults to every channel, which is right whenever no calendar features are
+            # appended; with them, only the sensor block is a reconstruction target.
+            self.cost = MaskedReconstruction(
+                self.net, n_sensors if n_sensors is not None else input_dims,
+                seq_len, bins_per_day, mask_frac=mask_frac, w_cosinor=w_cosinor,
+                w_spectral=w_spectral, device=device).to(device)
+        else:
+            encoder_k = CoSTEncoder(**enc).to(device)
+            self.cost = CoSTModel(
+                self.net, encoder_k, dim=(self.net.trend_dims if disentangle else output_dims),
+                alpha=alpha, K=moco_k, disentangle=disentangle, phase_mode=phase_mode,
+                trend_pool=trend_pool, weights=weights, device=device).to(device)
         self.n_iters = 0
 
     # -- training ---------------------------------------------------------------------
     def fit(self, train_data, n_iters=1000, val_data=None, log_every=100, verbose=True):
         """Pretrain. `train_data` is (N, T, D) float32; no labels are used anywhere here."""
-        ds = PretrainDataset(torch.as_tensor(train_data, dtype=torch.float),
-                             jitter_sigma=self.jitter_sigma, shift_sigma=self.shift_sigma,
-                             smooth_bins=self.smooth_bins)
-        if len(ds) < self.batch_size:
-            raise ValueError(f"{len(ds)} augmented windows is fewer than one batch "
+        loader = self._loader(train_data, shuffle=True)
+        if len(loader.dataset) < self.batch_size:
+            raise ValueError(f"{len(loader.dataset)} windows is fewer than one batch "
                              f"({self.batch_size}); lower --batch-size or widen the fold")
-        loader = DataLoader(ds, batch_size=self.batch_size, shuffle=True, drop_last=True)
 
         val_loader = None
         if val_data is not None and len(val_data) >= self.batch_size:
-            vds = PretrainDataset(torch.as_tensor(val_data, dtype=torch.float),
-                                  jitter_sigma=self.jitter_sigma, shift_sigma=self.shift_sigma,
-                                  multiplier=1, smooth_bins=self.smooth_bins)
-            val_loader = DataLoader(vds, batch_size=self.batch_size, shuffle=False,
-                                    drop_last=True)
+            val_loader = self._loader(val_data, shuffle=False, multiplier=1)
 
         params = [p for p in self.cost.parameters() if p.requires_grad]
         opt = torch.optim.SGD(params, lr=self.lr, momentum=0.9, weight_decay=1e-4)
@@ -308,18 +326,12 @@ class CoST:
         self.cost.train()
         done = False
         while not done:
-            for x_q, x_k in loader:
+            for batch in loader:
                 if self.n_iters >= n_iters:
                     done = True
                     break
                 adjust_learning_rate(opt, self.lr, self.n_iters, n_iters)
-                x_q, x_k = x_q.to(self.device), x_k.to(self.device)
-                if self.max_train_length and x_q.size(1) > self.max_train_length:
-                    off = np.random.randint(x_q.size(1) - self.max_train_length + 1)
-                    sl = slice(off, off + self.max_train_length)
-                    x_q, x_k = x_q[:, sl], x_k[:, sl]
-
-                loss = self.cost(x_q, x_k)
+                loss = self._loss(batch)
                 opt.zero_grad(set_to_none=True)
                 loss.backward()
                 opt.step()
@@ -330,20 +342,53 @@ class CoST:
                     hist["iters"].append(self.n_iters)
                     hist["train"].append(float(loss.item()))
                     hist["val"].append(v)
-                    hist["top1"].append(self.cost.last_top1)
+                    # top-1 is the contrastive retrieval accuracy; reconstruction has no
+                    # such notion, so it logs None -- not NaN, which json.dumps would emit
+                    # as the non-standard literal `NaN` into every fold.json.
+                    top1 = getattr(self.cost, "last_top1", None)
+                    hist["top1"].append(top1)
                     if verbose:
+                        shown = "n/a" if top1 is None else f"{top1:.4f}"
                         print(f"    iter {self.n_iters:>6}  loss {loss.item():.4f}  "
-                              f"val {v:.4f}  top1 {self.cost.last_top1:.4f}", flush=True)
+                              f"val {v:.4f}  top1 {shown}", flush=True)
         self.cost.eval()
         return hist
+
+    def _loader(self, data, *, shuffle, multiplier=None):
+        """One batch source per objective.
+
+        Contrastive needs two augmented VIEWS of each window. Reconstruction needs the window
+        itself: the day-span mask is the corruption, and augmenting the target as well would
+        make the model fit jitter rather than rhythm.
+        """
+        X = torch.as_tensor(data, dtype=torch.float)
+        if self.objective == "mae":
+            ds = TensorDataset(X)
+        else:
+            kw = {} if multiplier is None else {"multiplier": multiplier}
+            ds = PretrainDataset(X, jitter_sigma=self.jitter_sigma,
+                                 shift_sigma=self.shift_sigma,
+                                 smooth_bins=self.smooth_bins, **kw)
+        return DataLoader(ds, batch_size=self.batch_size, shuffle=shuffle, drop_last=True)
+
+    def _loss(self, batch, update=True):
+        """Dispatch one batch to whichever pretext objective is active."""
+        if self.objective == "mae":
+            return self.cost(batch[0].to(self.device))
+        x_q, x_k = batch[0].to(self.device), batch[1].to(self.device)
+        if self.max_train_length and x_q.size(1) > self.max_train_length:
+            off = np.random.randint(x_q.size(1) - self.max_train_length + 1)
+            sl = slice(off, off + self.max_train_length)
+            x_q, x_k = x_q[:, sl], x_k[:, sl]
+        return self.cost(x_q, x_k, update=update)
 
     @torch.no_grad()
     def _validation_loss(self, loader):
         """Held-out pretext loss. `update=False` so monitoring never mutates MoCo state."""
         self.cost.eval()
         tot = n = 0
-        for x_q, x_k in loader:
-            tot += float(self.cost(x_q.to(self.device), x_k.to(self.device), update=False))
+        for batch in loader:
+            tot += float(self._loss(batch, update=False))
             n += 1
         self.cost.train()
         return tot / max(n, 1)
@@ -375,9 +420,9 @@ class CoST:
         """
         self.net.eval()
         X = torch.as_tensor(data, dtype=torch.float)
-        outs = {"trend": [], "amp": [], "phase": [], "plain": []}
+        outs = {"trend": [], "amp": [], "phase": [], "resid": [], "plain": []}
         for i in range(0, len(X), batch_size):
-            t, s = self.net(X[i:i + batch_size].to(self.device))
+            t, s, r = self.net(X[i:i + batch_size].to(self.device))
             if s is None:
                 outs["plain"].append(self._pool(t, pool).cpu())
                 continue
@@ -385,13 +430,19 @@ class CoST:
             a, p = self._spectral(s)
             outs["amp"].append(a.cpu())
             outs["phase"].append(p.cpu())
+            if r is not None:
+                # Time-domain like the trend branch, so it is pooled the same way. The
+                # residual is emitted as its own block because the archive scores it alone
+                # (0.7117) far above trend and seasonal together (0.6228).
+                outs["resid"].append(self._pool(r, pool).cpu())
         cat = {k: torch.cat(v).numpy() for k, v in outs.items() if v}
         if "plain" in cat:
             return {"full": cat["plain"]} if parts else cat["plain"]
-        full = np.concatenate([cat["trend"], cat["amp"], cat["phase"]], axis=-1)
+        blocks = ["trend", "amp", "phase"] + (["resid"] if "resid" in cat else [])
+        full = np.concatenate([cat[k] for k in blocks], axis=-1)
         if not parts:
             return full
-        return {"full": full, "trend": cat["trend"], "amp": cat["amp"], "phase": cat["phase"]}
+        return {"full": full, **{k: cat[k] for k in blocks}}
 
     @staticmethod
     def _pool(z, how):
@@ -410,6 +461,8 @@ class CoST:
         # never enters training -- so a checkpoint cannot own one. It is recorded under a
         # name that cannot be mistaken for a setting.
         torch.save({"net": self.net.state_dict(), "n_iters": self.n_iters,
+                    "objective": self.objective,
+                    "residual_dims": self.net.residual_dims,
                     "phase_readout_at_construction": self.phase_readout}, path)
 
     def load(self, path):
@@ -447,18 +500,20 @@ class WindowClassifier(nn.Module):
         self.encoder = encoder
         self.bins_per_day, self.phase_readout = bins_per_day, phase_readout
         w = readout_width(seq_len, bins_per_day, phase_readout,
-                          encoder.trend_dims, encoder.seasonal_dims)
+                          encoder.trend_dims, encoder.seasonal_dims, encoder.residual_dims)
         self.norm = nn.LayerNorm(w)
         self.drop = nn.Dropout(dropout)
         self.head = nn.Linear(w, 1)
 
     def forward(self, x):
-        t, s = self.encoder(x)
+        t, s, r = self.encoder(x)
         if s is None:
             feat = t.mean(dim=1)
         else:
             amp, pha = spectral_readout(s, self.bins_per_day, self.phase_readout)
             feat = torch.cat([t.mean(dim=1), amp, pha], dim=-1)
+            if r is not None:
+                feat = torch.cat([feat, r.mean(dim=1)], dim=-1)
         return self.head(self.drop(self.norm(feat))).squeeze(-1)
 
 
@@ -524,3 +579,132 @@ def predict_windows(clf, X, device="cuda", batch_size=256):
     out = [torch.sigmoid(clf(X[i:i + batch_size].to(device))).cpu()
            for i in range(0, len(X), batch_size)]
     return torch.cat(out).numpy()
+
+
+# --------------------------------------------------------------------------------------
+# Phase 1: masked reconstruction (sufficiency) instead of contrastive (invariance)
+# --------------------------------------------------------------------------------------
+def day_span_mask(B, T, bins_per_day, frac, device, generator=None):
+    """Mask whole DAYS, not scattered timesteps.
+
+    Scattered masking is trivially filled from neighbouring bins and teaches interpolation,
+    not rhythm. Removing a whole day forces the reconstruction to come from the person's
+    OTHER days, so the model has to encode where their rhythm sits and how it is drifting --
+    which is exactly the structure the label is supposed to live in.
+    """
+    n_days = max(1, T // int(bins_per_day))
+    k = max(1, int(round(n_days * frac)))
+    m = torch.zeros(B, n_days, device=device, dtype=torch.bool)
+    for b in range(B):
+        idx = torch.randperm(n_days, generator=generator, device=device)[:k]
+        m[b, idx] = True
+    m = m.repeat_interleave(int(bins_per_day), dim=1)
+    if m.size(1) < T:                       # tail bins that do not fill a whole day
+        m = torch.cat([m, m.new_zeros(B, T - m.size(1))], dim=1)
+    return m[:, :T]
+
+
+class MaskedReconstruction(nn.Module):
+    """x_hat = tau_hat + sigma_hat + eps_hat, trained on masked day-spans.
+
+    WHY THIS REPLACES THE CONTRASTIVE OBJECTIVE. A contrastive loss optimises INVARIANCE, so
+    its information content is upper-bounded by whatever survives the augmentation -- and
+    every such ceiling was measured below an untrained random projection (best 0.7151
+    against 0.7221). Reconstruction optimises SUFFICIENCY: the code must retain enough to
+    rebuild the input, which is a lower bound rather than an upper one.
+
+    WHY THE RESIDUAL IS RECONSTRUCTED RATHER THAN SUPPRESSED. The original decomposition
+    treated epsilon as noise to become invariant to. Measured, that was backwards: the
+    residual probed alone scores 0.7117 against 0.6228 for trend and seasonal together, and
+    its ceiling of 0.7202 is the only figure in this project above the raw-statistics
+    champion. So epsilon gets a branch and a decoder.
+
+    WHY MASKING DOES NOT MEMORISE NOISE. The target spans are hidden from the encoder, and
+    noise is by definition the part not predictable from elsewhere -- so its MSE-optimal
+    prediction is its conditional mean. A plain autoencoder memorises noise because the
+    realisation sits in its input; a masked one cannot, because it does not.
+    """
+
+    def __init__(self, encoder, n_sensors, seq_len, bins_per_day, *, mask_frac=0.25,
+                 w_recon=1.0, w_cosinor=0.3, w_spectral=0.1, device="cuda"):
+        super().__init__()
+        self.encoder = encoder
+        self.n_sensors, self.seq_len = n_sensors, seq_len
+        self.bins_per_day, self.mask_frac = bins_per_day, mask_frac
+        self.w_recon, self.w_cosinor, self.w_spectral = w_recon, w_cosinor, w_spectral
+        self.device = device
+
+        # Deliberately LINEAR decoders. A weak decoder cannot express detail it was not
+        # given, which keeps the burden on the representation instead of letting a deep
+        # decoder reconstruct a lot from very little.
+        self.dec_t = nn.Linear(encoder.trend_dims, n_sensors)
+        self.dec_s = nn.Linear(encoder.seasonal_dims, n_sensors)
+        self.dec_n = (nn.Linear(encoder.residual_dims, n_sensors)
+                      if encoder.residual_dims > 0 else None)
+
+        # Auxiliary chronobiology heads -- the MAE-native replacement for the phase
+        # contraction that produced the RQ2 win. MSE weights content by its variance
+        # contribution, so without an explicit phase target amplitude would take the
+        # capacity budget. Acrophase is supervised as (cos, sin), never as a raw angle.
+        self.head_cos = nn.Linear(encoder.seasonal_dims, 2 * n_sensors)
+        self.head_amp = nn.Linear(encoder.seasonal_dims, n_sensors)
+        self.head_mesor = nn.Linear(encoder.trend_dims, n_sensors)
+
+        keep = torch.zeros(seq_len // 2 + 1, dtype=torch.bool)
+        for lo, hi in rhythm_bands(seq_len, bins_per_day):
+            keep[lo:hi] = True
+        self.register_buffer("band_mask", keep)
+
+    def cosinor_targets(self, x):
+        """MESOR, amplitude and (cos, sin) of acrophase per channel, from the RAW window."""
+        xs = x[..., :self.n_sensors]
+        t = 2 * math.pi * torch.arange(xs.size(1), device=xs.device) / self.bins_per_day
+        z = xs - xs.mean(1, keepdim=True)
+        a = 2 * (z * torch.cos(t)[None, :, None]).mean(1)
+        b = 2 * (z * torch.sin(t)[None, :, None]).mean(1)
+        amp = torch.sqrt(a ** 2 + b ** 2 + 1e-8)
+        return xs.mean(1), amp, torch.cat([a / amp, b / amp], dim=-1)
+
+    def spectral_penalty(self, tau, sigma):
+        """tau OUT of the rhythm bands, sigma INSIDE them.
+
+        This is what makes the disentanglement exact rather than emergent. Without it the
+        two decoders are free to split the signal any way that lowers MSE, and nothing
+        stops the trend branch from carrying the circadian cycle itself.
+        """
+        Ft = fft.rfft(tau.float(), dim=1).abs().pow(2)
+        Fs = fft.rfft(sigma.float(), dim=1).abs().pow(2)
+        m = self.band_mask.to(Ft.device)
+        leak_t = Ft[:, m].sum() / (Ft.sum() + 1e-8)          # trend inside the bands
+        leak_s = Fs[:, ~m].sum() / (Fs.sum() + 1e-8)         # seasonal outside them
+        return leak_t + leak_s
+
+    def forward(self, x, return_parts=False):
+        xs = x[..., :self.n_sensors]
+        m = day_span_mask(x.size(0), x.size(1), self.bins_per_day, self.mask_frac, x.device)
+        xin = x.clone()
+        xin[..., :self.n_sensors] = torch.where(m.unsqueeze(-1), torch.zeros_like(xs), xs)
+
+        tau_z, sig_z, res_z = self.encoder(xin)
+        tau, sigma = self.dec_t(tau_z), self.dec_s(sig_z)
+        recon = tau + sigma
+        if self.dec_n is not None and res_z is not None:
+            recon = recon + self.dec_n(res_z)
+
+        # Scored on the MASKED bins only. Scoring everywhere lets the model win by copying
+        # the visible input, which teaches nothing.
+        mm = m.unsqueeze(-1).expand_as(xs)
+        recon_loss = (((recon - xs) ** 2) * mm).sum() / mm.sum().clamp_min(1.0)
+
+        mesor, amp, cs = self.cosinor_targets(x)
+        pooled_s, pooled_t = sig_z.mean(1), tau_z.mean(1)
+        cos_loss = (F.mse_loss(self.head_amp(pooled_s), amp)
+                    + F.mse_loss(self.head_cos(pooled_s), cs)
+                    + F.mse_loss(self.head_mesor(pooled_t), mesor))
+        spec = self.spectral_penalty(tau, sigma)
+
+        total = (self.w_recon * recon_loss + self.w_cosinor * cos_loss
+                 + self.w_spectral * spec)
+        if return_parts:
+            return total, recon_loss.detach(), cos_loss.detach(), spec.detach()
+        return total

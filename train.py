@@ -96,7 +96,7 @@ def build_encoder(args, X, n_sensors, bins_per_day, seed):
         n_time_features=X.shape[-1] - n_sensors,
         seasonal_bands=args.seasonal_bands, disentangle=not args.plain,
         mask_mode=args.mask_mode, trend_kernel_cap=args.trend_kernel_cap,
-        seasonal_frac=args.seasonal_frac)
+        seasonal_frac=args.seasonal_frac, residual_dims=args.residual_dims)
 
 
 def plan(args, arms, folds, X, n_sensors, bins_per_day, n_folds_eff=None):
@@ -121,6 +121,8 @@ def plan(args, arms, folds, X, n_sensors, bins_per_day, n_folds_eff=None):
         "trend_kernels": enc.kernels,
         "trend_dims": enc.trend_dims,
         "seasonal_dims": enc.seasonal_dims,
+        "residual_dims": enc.residual_dims,
+        "objective": args.objective,
         "n_params": n_par,
         "circular_pair_block": [pair_start, pair_width],
         "arms": [a.as_dict() for a in arms],
@@ -169,6 +171,9 @@ def run_fold(args, weights_name, readouts, coh, fold, out_dir):
         n_time_features=coh.n_features - coh.n_sensors, seasonal_bands=args.seasonal_bands,
         disentangle=not args.plain, mask_mode=args.mask_mode,
         trend_kernel_cap=args.trend_kernel_cap, seasonal_frac=args.seasonal_frac,
+        residual_dims=args.residual_dims, objective=args.objective,
+        n_sensors=coh.n_sensors, mask_frac=args.mask_frac, w_cosinor=args.w_cosinor,
+        w_spectral=args.w_spectral,
         phase_readout=readouts[0], weights=WEIGHTS[weights_name], alpha=args.alpha,
         moco_k=args.moco_k, jitter_sigma=args.jitter_sigma, shift_sigma=args.shift_sigma,
         smooth_bins=args.smooth_bins, lr=args.lr, batch_size=args.batch_size,
@@ -199,7 +204,8 @@ def run_fold(args, weights_name, readouts, coh, fold, out_dir):
         trend_w = reps["trend"].shape[1] if "trend" in reps else 0
         rec = {"arm": arm.as_dict(), "fold": fold.as_dict(), "split": fd.summary(),
                "n_pretrain_train": int(len(tr)), "n_pretrain_val": int(len(val)),
-               "iters": model.n_iters,
+               "iters": model.n_iters, "objective": args.objective,
+               "residual_dims": int(args.residual_dims),
                "final_top1": hist["top1"][-1] if hist["top1"] else None,
                "loss": hist,
                "repr_dims": {k: list(v.shape) for k, v in reps.items()},
@@ -249,10 +255,27 @@ def parse_args(argv=None):
     g.add_argument("--seasonal-frac", type=float, default=0.5,
                    help="share of repr-dims given to V^S; 0.5 is upstream. Raising it is a "
                         "FIFTH arm, not a default -- see model.py")
+    g.add_argument("--residual-dims", type=int, default=0,
+                   help="width of the V^N branch; 0 leaves it unbuilt (archive: the residual "
+                        "alone probes 0.7117 against 0.6228 for trend+seasonal together)")
     g.add_argument("--seasonal-bands", choices=["harmonics", "single"], default="harmonics")
     g.add_argument("--mask-mode", choices=["none", "binomial"], default="none")
     g.add_argument("--plain", action="store_true",
                    help="plain-SSL control: no trend/seasonal split")
+
+    g = p.add_argument_group("objective")
+    g.add_argument("--objective", choices=["contrastive", "mae"], default="contrastive",
+                   help="'contrastive' optimises INVARIANCE, whose ceiling is whatever "
+                        "survives the augmentation and was measured below an untrained "
+                        "random projection; 'mae' optimises SUFFICIENCY by reconstructing "
+                        "masked day-spans from tau + sigma + eps")
+    g.add_argument("--mask-frac", type=float, default=0.25,
+                   help="fraction of whole DAYS hidden from the encoder (mae only)")
+    g.add_argument("--w-cosinor", type=float, default=0.3,
+                   help="weight on the auxiliary MESOR/amplitude/acrophase heads (mae only)")
+    g.add_argument("--w-spectral", type=float, default=0.1,
+                   help="weight on the penalty keeping tau out of the rhythm bands and "
+                        "sigma inside them -- what makes the disentanglement exact (mae only)")
 
     g = p.add_argument_group("optimisation")
     g.add_argument("--iters", type=int, default=6000)
@@ -301,6 +324,13 @@ def main(argv=None):
     if not args.npz:
         raise SystemExit("--npz is required: the raw-CSV path still goes through the "
                          "pre-cleanup data_processing/ loader and is not wired here.")
+    if args.objective == "mae" and len({a.weights for a in args.arms}) > 1:
+        # The weights axis scales the three CONTRASTIVE terms and reaches nothing in the
+        # reconstruction path, so the two weightings would fit bit-identical encoders. Left
+        # unchecked that silently doubles the GPU bill and manufactures a "difference"
+        # between arms that is exactly zero by construction.
+        raise SystemExit("--objective mae leaves the weights axis inert; request one "
+                         "weighting, e.g. --arms angle:paper,circular:paper")
     coh = load_npz(args.npz)
     X, n_sensors, bins_per_day = coh.X, coh.n_sensors, coh.bins_per_day
     upids, ulab = coh.participants()

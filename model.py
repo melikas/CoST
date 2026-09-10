@@ -198,7 +198,7 @@ class CoSTEncoder(nn.Module):
                  hidden_dims=64, depth=None, kernels=None, n_time_features=0,
                  seasonal_bands="harmonics", disentangle=True, mask_mode="none",
                  mask_prob=0.5, trend_causal=True, max_harmonics=4,
-                 trend_kernel_cap=None, seasonal_frac=0.5):
+                 trend_kernel_cap=None, seasonal_frac=0.5, residual_dims=0):
         super().__init__()
         if depth is None:
             depth = depth_for_window(seq_len)
@@ -223,7 +223,8 @@ class CoSTEncoder(nn.Module):
             # zero for the trend side -- so callers that report the split (train.plan) do
             # not have to special-case the control they exist to compare against.
             self.component_dims = self.seasonal_dims = output_dims
-            self.trend_dims = 0
+            self.trend_dims = self.residual_dims = 0
+            self.nfd = None
             self.kernels, self.tfd, self.sfd, self.bands = [], None, None, []
             return
 
@@ -270,6 +271,18 @@ class CoSTEncoder(nn.Module):
         self.sfd = nn.ModuleList(
             [BandedFourierLayer(output_dims, w, b, seq_len) for w, b in zip(widths, self.bands)])
 
+        # V^N -- the residual branch, and the reason it is back. Probed alone the residual
+        # scores 0.7117 against 0.6228 for trend and seasonal TOGETHER, and its measured
+        # ceiling of 0.7202 is the only number in this project above the raw-statistics
+        # champion. The contrastive objective treated it as noise to be invariant to, which
+        # is what discarded it; a reconstruction objective has to model it, because
+        # x = tau + sigma + epsilon and epsilon is where the label measurably is.
+        # residual_dims=0 leaves the branch unbuilt, so nothing changes for the
+        # contrastive runs already measured.
+        self.residual_dims = int(residual_dims)
+        self.nfd = (nn.Conv1d(output_dims, self.residual_dims, 3, padding=1)
+                    if self.residual_dims > 0 else None)
+
     def forward(self, x, tcn_output=False, mask=None):      # x: B x T x input_dims
         x_time = None
         if self.n_time_features:
@@ -297,7 +310,7 @@ class CoSTEncoder(nn.Module):
         if tcn_output:
             return x.transpose(1, 2)
         if not self.disentangle:
-            return self.repr_dropout(x.transpose(1, 2)), None
+            return self.repr_dropout(x.transpose(1, 2)), None, None
 
         trend = []
         for k, mod in zip(self.kernels, self.tfd):
@@ -308,6 +321,7 @@ class CoSTEncoder(nn.Module):
             trend.append(out.transpose(1, 2))
         trend = torch.stack(trend, dim=0).mean(dim=0)       # B x T x component_dims
 
+        resid = (self.nfd(x).transpose(1, 2) if self.nfd is not None else None)
         x = x.transpose(1, 2)                               # B x T x C
         season = torch.cat([mod(x) for mod in self.sfd], dim=-1)
-        return trend, self.repr_dropout(season)
+        return trend, self.repr_dropout(season), resid
