@@ -274,11 +274,11 @@ class CoSTEncoder(nn.Module):
         # V^N -- the residual branch, and the reason it is back. Probed alone the residual
         # scores 0.7117 against 0.6228 for trend and seasonal TOGETHER, and its measured
         # ceiling of 0.7202 is the only number in this project above the raw-statistics
-        # champion. The contrastive objective treated it as noise to be invariant to, which
-        # is what discarded it; a reconstruction objective has to model it, because
-        # x = tau + sigma + epsilon and epsilon is where the label measurably is.
-        # residual_dims=0 leaves the branch unbuilt, so nothing changes for the
-        # contrastive runs already measured.
+        # champion. The masked-reconstruction objective built to train it was removed after
+        # its full sweep came out negative on RQ1-RQ3. Under the contrastive objective this
+        # branch receives NO gradient -- CoSTModel never reads it -- so it is trained only
+        # by end-to-end fine-tuning. It stays so the residual_dims>0 encoders already on
+        # disk still load; residual_dims=0 (the default) leaves it unbuilt.
         self.residual_dims = int(residual_dims)
         self.nfd = (nn.Conv1d(output_dims, self.residual_dims, 3, padding=1)
                     if self.residual_dims > 0 else None)

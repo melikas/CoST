@@ -1091,6 +1091,11 @@ def report(plan, per_fold, nf, nr):
       f"({plan['rf_over_window']}x window), bands {plan['bands']},")
     A(f"           trend kernels {plan['trend_kernels']}, V^T {plan['trend_dims']} / "
       f"V^S {plan['seasonal_dims']}, {plan['n_params']:,} params.")
+    if plan.get("w_supcon"):
+        A(f"Objective  contrastive + supervised-contrastive (w={plan['w_supcon']:g}), "
+          f"training-fold labels only.")
+        A("           Every DSSL row below is LABEL-SUPERVISED, not self-supervised; the "
+          "control\n           that decides whether pretraining helped is Supervised scratch.")
     A(f"Inference  Nadeau-Bengio corrected: variance inflation 1/K + 1/(F-1) = "
       f"{nadeau_bengio(nf, nr):.4f}.")
     A("           A difference is significant only if it exceeds the margin printed beside")
