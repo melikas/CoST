@@ -36,7 +36,7 @@ from pathlib import Path
 import numpy as np
 
 import objective as O
-from cost import CoST
+from cost import CoST, smooth_bins_for
 from cv import make_folds, make_lodo_folds, nadeau_bengio, required_margin
 from data_loader import load_npz
 from model import CoSTEncoder, depth_for_window, receptive_field
@@ -121,6 +121,7 @@ def plan(args, arms, folds, X, n_sensors, bins_per_day, n_folds_eff=None):
         "trend_kernels": enc.kernels,
         "trend_dims": enc.trend_dims,
         "seasonal_dims": enc.seasonal_dims,
+        "smooth_bins": smooth_bins_for(args.smooth_minutes, bins_per_day),
         "residual_dims": enc.residual_dims,
         "objective": args.objective,
         "n_params": n_par,
@@ -176,7 +177,7 @@ def run_fold(args, weights_name, readouts, coh, fold, out_dir):
         w_spectral=args.w_spectral,
         phase_readout=readouts[0], weights=WEIGHTS[weights_name], alpha=args.alpha,
         moco_k=args.moco_k, jitter_sigma=args.jitter_sigma, shift_sigma=args.shift_sigma,
-        smooth_bins=args.smooth_bins, lr=args.lr, batch_size=args.batch_size,
+        smooth_minutes=args.smooth_minutes, lr=args.lr, batch_size=args.batch_size,
         device=args.device, model_seed=fold.model_seed)
 
     hist = model.fit(tr, n_iters=args.iters, val_data=val if len(val) else None,
@@ -286,8 +287,11 @@ def parse_args(argv=None):
     g.add_argument("--moco-k", type=int, default=4096, help="MoCo queue size")
     g.add_argument("--jitter-sigma", type=float, default=0.1)
     g.add_argument("--shift-sigma", type=float, default=0.5)
-    g.add_argument("--smooth-bins", type=int, default=5,
-                   help="widest box filter for the smoothing augmentation; 0 disables it")
+    g.add_argument("--smooth-minutes", type=float, default=75.0,
+                   help="widest box filter for the smoothing augmentation, in MINUTES, "
+                        "converted per cohort: 75 = 5 bins on HRD (the old --smooth-bins "
+                        "default, so HRD runs through this script are unchanged), and off "
+                        "on GLOBEM, whose 6-h bins cannot hold a sub-day box; 0 disables it")
     g.add_argument("--val-frac", type=float, default=0.10,
                    help="share of pretrain windows held out to monitor the pretext loss")
     g.add_argument("--pool", choices=["mean", "last", "max"], default="mean")
@@ -380,6 +384,11 @@ def main(argv=None):
           f"({spec['rf_over_window']}x window)  bands {spec['bands']}")
     print(f"[arch] trend kernels {spec['trend_kernels']} -> "
           f"{spec['n_params']:,} params  (V^T {spec['trend_dims']} / V^S {spec['seasonal_dims']})")
+    sb, bin_min = spec["smooth_bins"], 1440 // spec["bins_per_day"]
+    print(f"[aug ] smoothing " + (f"up to {sb} bins ({sb * bin_min} min)" if sb >= 3 else
+          f"OFF ({args.smooth_minutes:g} min is under 3 bins at {bin_min} min/bin)")
+          + ("  -- unused: --objective mae takes no augmentation"
+             if args.objective == "mae" else ""))
     print(f"[prot] {args.protocol}: {pr['n_folds']}-fold x {pr['n_repeats']}, "
           f"{len(args.arms)} arms "
           f"-> {pr['n_encoder_fits']} encoder fits / "

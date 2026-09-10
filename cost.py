@@ -41,10 +41,26 @@ from model import CoSTEncoder, rhythm_bands
 
 __all__ = ["PretrainDataset", "CoSTModel", "CoST", "WindowClassifier", "finetune",
            "predict_windows", "spectral_readout", "readout_width",
-           "MaskedReconstruction", "day_span_mask"]
+           "MaskedReconstruction", "day_span_mask", "smooth_bins_for"]
 
 
 # --------------------------------------------------------------------------------------
+def smooth_bins_for(minutes, bins_per_day):
+    """Widest smoothing box, in bins, for a width given in MINUTES.
+
+    The augmentation is defined physically -- detail finer than `minutes` is declared noise --
+    so its width in bins must follow the cohort's resolution. It used to be given in bins,
+    where the same 5 meant 1.25 h on HRD (15-min bins) but 30 h on GLOBEM (6-h bins).
+    Measured on a pure 24 h cosine through `PretrainDataset.smooth`: GLOBEM kept 33% of the
+    daily amplitude at width 3 and 20%, phase-INVERTED, at width 5, against >= 99.6% and no
+    phase change on HRD. Every GLOBEM contrastive run at train.py's old default (5 bins) was
+    therefore trained to treat the daily rhythm itself as noise. Below 3 bins no odd box
+    wider than one bin fits, and the augmentation switches off -- which is exactly GLOBEM's
+    case at any sub-day width.
+    """
+    return int(minutes * bins_per_day // 1440)
+
+
 class PretrainDataset(Dataset):
     """Two independently augmented views of the same window.
 
@@ -73,8 +89,11 @@ class PretrainDataset(Dataset):
         return self.jitter(self.shift(self.smooth(x)))
 
     def smooth(self, x):
-        """Circular box filter of a random sub-hour width -- what declares sub-hour detail
-        to be noise.
+        """Circular box filter of random odd width up to `smooth_bins` -- what declares
+        detail finer than that width to be noise.
+
+        `smooth_bins` must come from `smooth_bins_for`, never be set in bins directly: the
+        same bin count is 1.25 h on HRD and 30 h on GLOBEM, where it erased the daily rhythm.
 
         In a contrastive objective the augmentation IS the definition of noise: whatever it
         destroys, the representation learns to ignore. Each candidate therefore carries a
@@ -258,7 +277,7 @@ class CoST:
                  mask_frac=0.25, w_mesor=0.3, w_spectral=0.1,
                  phase_readout="circular", phase_mode="circular_amp", trend_pool="random",
                  weights: O.TermWeights = O.PAPER, alpha=0.005, moco_k=4096,
-                 jitter_sigma=0.1, shift_sigma=0.5, smooth_bins=5,
+                 jitter_sigma=0.1, shift_sigma=0.5, smooth_minutes=75.0,
                  lr=5e-4, batch_size=64, max_train_length=None, device="cuda",
                  model_seed=None):
         if phase_readout not in ("angle", "circular"):
@@ -278,7 +297,8 @@ class CoST:
         self.phase_readout = phase_readout
         self.batch_size, self.lr = batch_size, lr
         self.max_train_length = max_train_length
-        self.jitter_sigma, self.shift_sigma, self.smooth_bins = jitter_sigma, shift_sigma, smooth_bins
+        self.jitter_sigma, self.shift_sigma = jitter_sigma, shift_sigma
+        self.smooth_bins = smooth_bins_for(smooth_minutes, bins_per_day)
         self.disentangle = disentangle
         self.objective = objective
 
