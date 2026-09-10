@@ -206,13 +206,21 @@ def load_encoder(run, weights_name, fold_tag, coh, plan, readout, device):
 
 def _blank_model(coh, plan, readout, device, seed):
     """An untrained CoST with the run's exact geometry -- the random-init control, and the
-    shell RQ2 loads trained weights into."""
+    shell RQ2 loads trained weights into.
+
+    `residual_dims` must come from the plan like every other width. Omitting it built the
+    shell without the V^N branch, so loading an MAE encoder failed on strict state_dict
+    keys, and every random-init control silently ran 64 columns narrower than the arm it
+    controls. It defaults to 0 because plans written before the branch existed describe
+    runs that never had one.
+    """
     return CoST(input_dims=coh.n_features, seq_len=coh.seq_len, bins_per_day=coh.bins_per_day,
                 output_dims=plan["trend_dims"] + plan["seasonal_dims"],
                 hidden_dims=plan.get("hidden_dims", 64), depth=plan["depth"],
                 n_time_features=coh.n_features - coh.n_sensors,
                 trend_kernel_cap=max(plan["trend_kernels"]) if plan["trend_kernels"] else None,
                 seasonal_frac=plan["seasonal_dims"] / (plan["trend_dims"] + plan["seasonal_dims"]),
+                residual_dims=plan.get("residual_dims", 0),
                 phase_readout=readout, device=device, model_seed=seed)
 
 

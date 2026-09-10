@@ -255,7 +255,7 @@ class CoST:
                  depth=None, n_time_features=0, seasonal_bands="harmonics", disentangle=True,
                  mask_mode="none", trend_kernel_cap=None, seasonal_frac=0.5,
                  residual_dims=0, objective="contrastive", n_sensors=None,
-                 mask_frac=0.25, w_cosinor=0.3, w_spectral=0.1,
+                 mask_frac=0.25, w_mesor=0.3, w_spectral=0.1,
                  phase_readout="circular", phase_mode="circular_amp", trend_pool="random",
                  weights: O.TermWeights = O.PAPER, alpha=0.005, moco_k=4096,
                  jitter_sigma=0.1, shift_sigma=0.5, smooth_bins=5,
@@ -297,7 +297,7 @@ class CoST:
             # appended; with them, only the sensor block is a reconstruction target.
             self.cost = MaskedReconstruction(
                 self.net, n_sensors if n_sensors is not None else input_dims,
-                seq_len, bins_per_day, mask_frac=mask_frac, w_cosinor=w_cosinor,
+                seq_len, bins_per_day, mask_frac=mask_frac, w_mesor=w_mesor,
                 w_spectral=w_spectral, device=device).to(device)
         else:
             encoder_k = CoSTEncoder(**enc).to(device)
@@ -626,12 +626,12 @@ class MaskedReconstruction(nn.Module):
     """
 
     def __init__(self, encoder, n_sensors, seq_len, bins_per_day, *, mask_frac=0.25,
-                 w_recon=1.0, w_cosinor=0.3, w_spectral=0.1, device="cuda"):
+                 w_recon=1.0, w_mesor=0.3, w_spectral=0.1, device="cuda"):
         super().__init__()
         self.encoder = encoder
         self.n_sensors, self.seq_len = n_sensors, seq_len
         self.bins_per_day, self.mask_frac = bins_per_day, mask_frac
-        self.w_recon, self.w_cosinor, self.w_spectral = w_recon, w_cosinor, w_spectral
+        self.w_recon, self.w_mesor, self.w_spectral = w_recon, w_mesor, w_spectral
         self.device = device
 
         # Deliberately LINEAR decoders. A weak decoder cannot express detail it was not
@@ -642,28 +642,20 @@ class MaskedReconstruction(nn.Module):
         self.dec_n = (nn.Linear(encoder.residual_dims, n_sensors)
                       if encoder.residual_dims > 0 else None)
 
-        # Auxiliary chronobiology heads -- the MAE-native replacement for the phase
-        # contraction that produced the RQ2 win. MSE weights content by its variance
-        # contribution, so without an explicit phase target amplitude would take the
-        # capacity budget. Acrophase is supervised as (cos, sin), never as a raw angle.
-        self.head_cos = nn.Linear(encoder.seasonal_dims, 2 * n_sensors)
-        self.head_amp = nn.Linear(encoder.seasonal_dims, n_sensors)
+        # MESOR is the only auxiliary target, read off the trend branch's time-mean, which
+        # carries the window's level. Amplitude and acrophase heads were REMOVED: they read
+        # the SEASONAL branch's time-mean, which is its f=0 coefficient, and every rhythm
+        # band starts at f >= 1 -- so that input is identically zero (measured 2.7e-9 in
+        # eval mode, and nothing but dropout noise in train mode). They could learn only a
+        # bias. On GLOBEM r0f0 the encoder reached acrophase parity with PCA (+0.01 h) while
+        # they were inert, so the phase structure they were meant to protect survived
+        # without them.
         self.head_mesor = nn.Linear(encoder.trend_dims, n_sensors)
 
         keep = torch.zeros(seq_len // 2 + 1, dtype=torch.bool)
         for lo, hi in rhythm_bands(seq_len, bins_per_day):
             keep[lo:hi] = True
         self.register_buffer("band_mask", keep)
-
-    def cosinor_targets(self, x):
-        """MESOR, amplitude and (cos, sin) of acrophase per channel, from the RAW window."""
-        xs = x[..., :self.n_sensors]
-        t = 2 * math.pi * torch.arange(xs.size(1), device=xs.device) / self.bins_per_day
-        z = xs - xs.mean(1, keepdim=True)
-        a = 2 * (z * torch.cos(t)[None, :, None]).mean(1)
-        b = 2 * (z * torch.sin(t)[None, :, None]).mean(1)
-        amp = torch.sqrt(a ** 2 + b ** 2 + 1e-8)
-        return xs.mean(1), amp, torch.cat([a / amp, b / amp], dim=-1)
 
     def spectral_penalty(self, tau, sigma):
         """tau OUT of the rhythm bands, sigma INSIDE them.
@@ -696,15 +688,12 @@ class MaskedReconstruction(nn.Module):
         mm = m.unsqueeze(-1).expand_as(xs)
         recon_loss = (((recon - xs) ** 2) * mm).sum() / mm.sum().clamp_min(1.0)
 
-        mesor, amp, cs = self.cosinor_targets(x)
-        pooled_s, pooled_t = sig_z.mean(1), tau_z.mean(1)
-        cos_loss = (F.mse_loss(self.head_amp(pooled_s), amp)
-                    + F.mse_loss(self.head_cos(pooled_s), cs)
-                    + F.mse_loss(self.head_mesor(pooled_t), mesor))
+        # Target from the UNMASKED window: the level is a property of the whole window.
+        mesor_loss = F.mse_loss(self.head_mesor(tau_z.mean(1)), xs.mean(1))
         spec = self.spectral_penalty(tau, sigma)
 
-        total = (self.w_recon * recon_loss + self.w_cosinor * cos_loss
+        total = (self.w_recon * recon_loss + self.w_mesor * mesor_loss
                  + self.w_spectral * spec)
         if return_parts:
-            return total, recon_loss.detach(), cos_loss.detach(), spec.detach()
+            return total, recon_loss.detach(), mesor_loss.detach(), spec.detach()
         return total

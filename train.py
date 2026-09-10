@@ -172,7 +172,7 @@ def run_fold(args, weights_name, readouts, coh, fold, out_dir):
         disentangle=not args.plain, mask_mode=args.mask_mode,
         trend_kernel_cap=args.trend_kernel_cap, seasonal_frac=args.seasonal_frac,
         residual_dims=args.residual_dims, objective=args.objective,
-        n_sensors=coh.n_sensors, mask_frac=args.mask_frac, w_cosinor=args.w_cosinor,
+        n_sensors=coh.n_sensors, mask_frac=args.mask_frac, w_mesor=args.w_mesor,
         w_spectral=args.w_spectral,
         phase_readout=readouts[0], weights=WEIGHTS[weights_name], alpha=args.alpha,
         moco_k=args.moco_k, jitter_sigma=args.jitter_sigma, shift_sigma=args.shift_sigma,
@@ -271,8 +271,9 @@ def parse_args(argv=None):
                         "masked day-spans from tau + sigma + eps")
     g.add_argument("--mask-frac", type=float, default=0.25,
                    help="fraction of whole DAYS hidden from the encoder (mae only)")
-    g.add_argument("--w-cosinor", type=float, default=0.3,
-                   help="weight on the auxiliary MESOR/amplitude/acrophase heads (mae only)")
+    g.add_argument("--w-mesor", type=float, default=0.3,
+                   help="weight on the auxiliary MESOR head, read off the trend branch "
+                        "(mae only)")
     g.add_argument("--w-spectral", type=float, default=0.1,
                    help="weight on the penalty keeping tau out of the rhythm bands and "
                         "sigma inside them -- what makes the disentanglement exact (mae only)")
