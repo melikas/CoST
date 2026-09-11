@@ -121,6 +121,9 @@ def plan(args, arms, folds, X, n_sensors, bins_per_day, n_folds_eff=None):
         "trend_kernels": enc.kernels,
         "trend_dims": enc.trend_dims,
         "seasonal_dims": enc.seasonal_dims,
+        # eval._blank_model rebuilds the encoder from this plan; without the hidden width it
+        # assumed 64, and loading any run trained at another width failed on shape mismatch.
+        "hidden_dims": args.hidden_dims,
         "smooth_bins": smooth_bins_for(args.smooth_minutes, bins_per_day),
         "residual_dims": enc.residual_dims,
         "n_params": n_par,

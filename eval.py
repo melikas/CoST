@@ -5,6 +5,11 @@ Two modes, so the expensive part shards across a SLURM array exactly like traini
     python eval.py --run runs/oneshot --npz hrd_2224103.npz --only-fold r0f0   # one fold
     python eval.py --run runs/oneshot --npz hrd_2224103.npz --aggregate        # the report
 
+The RQ3 super learner merges into an evaluated run without redoing anything else:
+
+    python eval.py --run runs/oneshot --npz hrd_2224103.npz --only-fold r0f0 --stack-only \
+        --raw-scale hrd_2224103_scale.npz
+
 Per-fold work writes `<arm>/<fold>/eval.json`; `--aggregate` reads all of them, applies the
 Nadeau-Bengio correction across folds, and writes `results_summary.txt`.
 
@@ -38,13 +43,17 @@ from pathlib import Path
 
 import numpy as np
 import pandas as pd
+import torch
+from scipy.optimize import nnls
 from scipy.stats import rankdata
 from sklearn.decomposition import PCA
 from sklearn.linear_model import RidgeCV
 from sklearn.metrics import roc_auc_score
+from sklearn.model_selection import StratifiedKFold
 
+from baselines.cosinor import _start_bins, paper_cosinor_features
 from baselines.random_projection import raw_projection
-from cost import CoST, WindowClassifier, finetune, predict_windows
+from cost import CoST, WindowClassifier, finetune, predict_windows, spectral_readout
 from cv import (Fold, delong_test, nadeau_bengio, paired_test,
                 required_margin)
 from data_loader import load_npz
@@ -749,12 +758,279 @@ def run_rq3(args, coh, plan, fold, recs, device):
     Z = cosinor_z(coh.X[:, :, :coh.n_sensors], coh.bins_per_day)
     ladder["Raw cosinor [dev]"] = probe_auc_deviation(
         np.c_[Z.real, Z.imag], coh.pids, y_by_pid, tr_pids, te_pids, tdays, seed)
-    for k, r in ladder.items():
-        bb = "" if not np.isfinite(r["bacc"]) else f" bacc={r['bacc']:.4f}[{r['unit'][:4]}]"
-        print(f"    [rq3] {k:34s} AUROC={r['auc']:.4f} (C={r['probe_C']}){bb}", flush=True)
+    if args.stack:
+        ladder.update({k: v for k, v in run_stack(args, coh, plan, fold, recs, device).items()
+                       if not k.startswith("_")})
+    print_rq3(ladder)
     _, _, ys = participant_scores(np.zeros(len(te)), pids_te, y_te_w)
     labels = {str(p): int(v) for p, v in zip(np.unique(pids_te), ys)}
     return {"_labels": labels, **ladder}
+
+
+def print_rq3(ladder):
+    for k, r in ladder.items():
+        if k.startswith("_"):
+            continue
+        bb = "" if not np.isfinite(r["bacc"]) else f" bacc={r['bacc']:.4f}[{r['unit'][:4]}]"
+        print(f"    [rq3] {k:34s} AUROC={r['auc']:.4f} (C={r['probe_C']}){bb}", flush=True)
+
+
+# =======================================================================================
+# RQ3 -- the five-block super learner (--stack)
+# =======================================================================================
+BLOCKS = {"A": "raw distribution (quantiles, level, weekly spread)",
+          "B": "non-parametric circadian (IS, IV, RA, L5, M10)",
+          "C": "paper cosinor (Yan et al. 2022)",
+          "D": "random-init encoder, distribution-pooled",
+          "E": "trained encoder, distribution-pooled"}
+BLOCK_RUNGS = {"A": "SL-A raw distribution", "B": "SL-B NPCRA", "C": "Cosinor (paper)",
+               "D": "SL-D Random-init distribution", "E": "SL-E DSSL distribution"}
+# Every stack is fit from ONE out-of-fold matrix and differs only in the columns the
+# meta-learner may use, so the differences between stacks are paired by construction.
+STACKS = ("ABCDE", "ABCD", "ABCE", "ABC")
+STACK_PRIMARY = "Stack ABCDE"
+# Fixed BEFORE the run, subject first. The report prints every one, whatever it shows.
+STACK_CONTRASTS = (
+    (STACK_PRIMARY, "Raw + Random-init (angle) [fusion]"),        # the ladder's ceiling
+    ("SL-E DSSL distribution", "SL-D Random-init distribution"),  # training, pooling fixed
+    ("Stack ABCE", "Stack ABCD"),                                 # the same, inside a stack
+    (STACK_PRIMARY, "Stack ABCD"),                                # what E adds to the rest
+    (STACK_PRIMARY, "Cosinor (paper)"),                           # the original work
+)
+RAW_QUANTILES = (5, 25, 50, 75, 95)
+ENC_QUANTILES = (0.1, 0.5, 0.9)
+
+
+def sensor_windows(coh, scale_path):
+    """(sensor windows, unit tag), in physical units when a scale sidecar is given.
+
+    The cache is z-scored within participant, so without the sidecar every participant's
+    channels have mean ~0 and SD ~0.93, and the level differences between people -- how high
+    their heart rate runs, how much they sleep -- are gone before any block sees them. The
+    encoder blocks never use this: they read `coh.X`, exactly as the encoders were trained.
+    """
+    Xs = coh.X[:, :, :coh.n_sensors]
+    if not scale_path:
+        return Xs, "z"
+    z = np.load(scale_path, allow_pickle=False)
+    if not np.array_equal(z["window_ids"], np.asarray(coh.window_ids).astype(str)):
+        raise SystemExit(f"{scale_path} was built from a different window cache")
+    row = {p: i for i, p in enumerate(z["pids"])}
+    i = np.array([row[p] for p in np.asarray(coh.pids).astype(str)])
+    return (Xs * z["sd"][i][:, None] + z["mu"][i][:, None]).astype(np.float32), "raw"
+
+
+def block_distribution(Xs, pids):
+    """A: every channel's distribution over all of a participant's bins, and how far their
+    weekly level moves. Quantiles rather than a mean alone: sleep and screen use are
+    zero-inflated, and a mean cannot tell 'rarely, heavily' from 'often, lightly'."""
+    pu, rows = np.unique(pids), []
+    for p in pu:
+        x = Xs[pids == p]
+        flat = x.reshape(-1, x.shape[-1])
+        rows.append(np.concatenate([np.percentile(flat, RAW_QUANTILES, axis=0).ravel(),
+                                    flat.mean(0), flat.std(0), x.mean(1).std(0)]))
+    return pu, np.vstack(rows)
+
+
+def npcra_window(x, start_bin, bin_minutes):
+    """(9, C) non-parametric circadian metrics of one (T, C) window (Witting et al. 1990;
+    Van Someren et al. 1999): IS, IV, RA, L5, M10, then the L5 and M10 onsets as clock
+    angles (cos, sin). Computed on clock-aligned hours -- native bins when those are longer
+    -- so the 24 h profile means the same hour for everyone.
+
+    RA is (M10 - L5) / (M10 + L5) and presumes non-negative data. The denominator is taken in
+    absolute value so it stays finite on z-scored input, where the value is a contrast rather
+    than the textbook RA; with --raw-scale the channels are non-negative and it is the RA.
+    """
+    unit = max(60, bin_minutes)
+    k, upd = unit // bin_minutes, 1440 // unit
+    off = (-start_bin) % k
+    n = (len(x) - off) // k
+    h = x[off:off + n * k].reshape(n, k, -1).mean(1)
+    hod = ((start_bin + off) // k + np.arange(n)) % upd
+    grand = h.mean(0)
+    ss = ((h - grand) ** 2).sum(0)
+    prof = np.stack([h[hod == j].mean(0) if (hod == j).any() else grand for j in range(upd)])
+    IS = n * ((prof - grand) ** 2).sum(0) / (upd * ss)
+    IV = n * (np.diff(h, axis=0) ** 2).sum(0) / ((n - 1) * ss)
+
+    def run(hours):                         # circular running mean over the 24 h profile
+        w = max(1, int(round(hours * 60 / unit)))
+        ext = np.concatenate([prof, prof[:w - 1]])
+        return np.stack([ext[j:j + w].mean(0) for j in range(upd)])
+
+    l5, m10 = run(5), run(10)
+    L5, M10 = l5.min(0), m10.max(0)
+    a5, a10 = 2 * np.pi * l5.argmin(0) / upd, 2 * np.pi * m10.argmax(0) / upd
+    RA = (M10 - L5) / (np.abs(M10) + np.abs(L5) + 1e-9)
+    return np.stack([IS, IV, RA, L5, M10, np.cos(a5), np.sin(a5), np.cos(a10), np.sin(a10)])
+
+
+def block_npcra(Xs, pids, window_ids, bin_minutes):
+    """B: per-window NPCRA, summarised per participant by the mean over windows (the onset
+    angles thereby become resultant vectors) and the week-to-week SD of IS, IV and RA --
+    rhythm INSTABILITY, which a single pooled profile cannot express."""
+    start = _start_bins(window_ids, bin_minutes, len(Xs))
+    with np.errstate(invalid="ignore", divide="ignore"):
+        W = np.nan_to_num(np.stack([npcra_window(Xs[i], start[i], bin_minutes)
+                                    for i in range(len(Xs))]))
+    pu = np.unique(pids)
+    return pu, np.vstack([np.concatenate([W[pids == p].mean(0).ravel(),
+                                          W[pids == p][:, :3].std(0).ravel()]) for p in pu])
+
+
+def block_cosinor(Xs, coh, cache_path):
+    """C: the original work's baseline -- the CosinorPy clone of Yan et al. 2022, top-2
+    periods x 12 parameters per channel, aggregated to the subject by the clone itself.
+    Its cache is keyed by window id, not content, so physical-unit and z-scored fits must
+    live in different files; the caller names the file by unit for that reason."""
+    F = paper_cosinor_features(Xs, coh.bin_minutes, window_ids=coh.window_ids,
+                               pids=coh.pids, cache_path=str(cache_path))
+    pu = np.unique(coh.pids)
+    return pu, F[[int(np.flatnonzero(coh.pids == p)[0]) for p in pu]]
+
+
+@torch.no_grad()
+def block_encoder(model, X, pids, bins_per_day, batch_size=64):
+    """D and E: an encoder's time-resolved outputs, pooled by distribution, not by mean.
+
+    Per window, every trend and seasonal channel is summarised by its temporal quantiles and
+    its proportion of positive values (PPV, as in ROCKET). The frozen readout's time-mean of
+    the seasonal branch is exactly its f=0 coefficient -- every oscillation integrates to
+    zero -- so it cannot see how an activation is distributed in time.
+
+    Per participant, the seasonal phase at the 24 h and 12 h harmonics is summarised ACROSS
+    windows by circular statistics: the resultant vector (mean phase weighted by coherence),
+    its length R (week-to-week phase coherence) and log(1 + circular dispersion), with
+    dispersion = (1 - R2) / (2 R^2) (Fisher 1993). The phase comes from `spectral_readout`,
+    the function the probes and the fine-tuning head read through.
+
+    Applied identically to the random-init control and the trained encoder, so a difference
+    between blocks D and E is the training and nothing else.
+    """
+    net = model.net.eval()
+    stats, phase = [], []
+    for i in range(0, len(X), batch_size):
+        t, s, _ = net(torch.as_tensor(X[i:i + batch_size], dtype=torch.float,
+                                      device=model.device))
+        if s is None:
+            raise ValueError("the stack's encoder blocks need the disentangled encoder")
+        z = torch.cat([t, s], dim=-1).float()
+        at = [int(round(q * (z.size(1) - 1))) for q in ENC_QUANTILES]
+        qs = z.sort(dim=1).values[:, at]                         # (B, quantiles, channels)
+        stats.append(torch.cat([qs.reshape(len(z), -1), (z > 0).float().mean(1)], -1).cpu())
+        _, ang = spectral_readout(s, bins_per_day, "angle")
+        phase.append(ang.reshape(len(s), -1, s.size(-1))[:, 1:3].reshape(len(s), -1).cpu())
+    S, P = torch.cat(stats).numpy(), torch.cat(phase).numpy().astype(np.float64)
+    pu, rows = np.unique(pids), []
+    for p in pu:
+        m = pids == p
+        r1, r2 = np.exp(1j * P[m]).mean(0), np.exp(2j * P[m]).mean(0)
+        R = np.abs(r1)
+        disp = (1 - np.abs(r2)) / (2 * np.maximum(R, 1e-3) ** 2)
+        rows.append(np.concatenate([S[m].mean(0), r1.real, r1.imag, R, np.log1p(disp)]))
+    return pu, np.vstack(rows)
+
+
+def super_learner(mats, y_by_pid, pu, tr_pids, te_pids, seed, n_inner=5, n_rep=2):
+    """Leak-free super learner (van der Laan, Polley & Hubbard 2007) over participant blocks.
+
+    Returns (P, Pte, ytr, fams). P is each block's OUT-OF-FOLD probability for every
+    training participant, from `n_rep` stratified `n_inner`-fold partitions of the TRAINING
+    participants, averaged. Pte is each block refit on all training participants and applied
+    to the held-out fold. Averaging partitions matters for what the meta-learner can
+    resolve: at ~100 participants one partition's noise can zero a weaker block that carries
+    unique signal -- a block subsumed by chance rather than by redundancy.
+
+    The held-out participants' labels are never read here, and their features only at the
+    end, to be scored.
+    """
+    idx = {p: i for i, p in enumerate(pu)}
+    tr = np.array([idx[p] for p in tr_pids])
+    te = np.array([idx[p] for p in te_pids])
+    ytr = np.array([y_by_pid[p] for p in tr_pids])
+    P = np.zeros((len(tr), len(mats)))
+    for r in range(n_rep):
+        split = StratifiedKFold(n_inner, shuffle=True, random_state=(seed + r) % 2 ** 32)
+        for a, b in split.split(tr, ytr):
+            for j, X in enumerate(mats.values()):
+                pr, _ = fit_probe(X[tr[a]], ytr[a], seed)
+                P[b, j] += pr.predict_proba(X[tr[b]])[:, 1] / n_rep
+    Pte, fams = np.zeros((len(te), len(mats))), {}
+    for j, (k, X) in enumerate(mats.items()):
+        pr, fams[k] = fit_probe(X[tr], ytr, seed)
+        Pte[:, j] = pr.predict_proba(X[te])[:, 1]
+    return P, Pte, ytr, fams
+
+
+def nnls_weights(P, y):
+    """Convex non-negative least-squares weights on STANDARDISED out-of-fold probabilities.
+
+    Standardising changes no prediction -- NNLS is equivariant to positive column scaling --
+    but it makes the weights comparable across blocks: a heavily regularised block whose
+    probabilities hug 0.5 would otherwise need a large raw weight to say the same thing, and
+    would read as dominant when it is not. Centring gives the fit a free intercept. Returns
+    (w, mu, sd) so held-out scores are standardised with the TRAINING statistics.
+    """
+    mu, sd = P.mean(0), P.std(0) + 1e-12
+    w, _ = nnls((P - mu) / sd, y - y.mean())
+    if w.sum() <= 0:
+        w = np.ones(P.shape[1])             # no block predicts out of fold: equal weights
+    return w / w.sum(), mu, sd
+
+
+def run_stack(args, coh, plan, fold, recs, device):
+    """Blocks A-E and the stacks over them, as RQ3 rungs.
+
+    Each block is one row per participant, built from that participant's own windows and no
+    label. The encoders are the fold's, trained without its held-out participants
+    (train.run_fold asserts it), and D is the same random-init control the ladder uses.
+    """
+    if args.stack_arm not in recs:
+        raise SystemExit(f"--stack-arm {args.stack_arm} has no results at {fold.tag}")
+    tr_pids, te_pids = list(fold.train_pids), list(fold.test_pids)
+    if not set(tr_pids + te_pids) <= set(coh.labelled):
+        raise AssertionError(f"{fold.tag}: an unlabelled participant is in the probe split")
+    y_by_pid = {p: int(round(float(coh.y[coh.pids == p].mean()))) for p in tr_pids + te_pids}
+    Xs, unit = sensor_windows(coh, args.raw_scale)
+    arm = recs[args.stack_arm]["arm"]
+    enc = {"D": _blank_model(coh, plan, arm["phase_readout"], device, seed=fold.model_seed),
+           "E": load_encoder(args.run, arm["weights"], fold.tag, coh, plan,
+                             arm["phase_readout"], device)}
+    blocks = {"A": block_distribution(Xs, coh.pids),
+              "B": block_npcra(Xs, coh.pids, coh.window_ids, coh.bin_minutes),
+              "C": block_cosinor(Xs, coh, Path(args.run) / f"stack_cosinor_{unit}.npz"),
+              **{k: block_encoder(m, coh.X, coh.pids, coh.bins_per_day) for k, m in enc.items()}}
+    pu = blocks["A"][0]
+    if any(not np.array_equal(b[0], pu) for b in blocks.values()):
+        raise AssertionError("stack blocks disagree on the participant index")
+    mats = {k: np.nan_to_num(b[1]).astype(np.float64) for k, b in blocks.items()}
+    P, Pte, ytr, fams = super_learner(mats, y_by_pid, pu, tr_pids, te_pids,
+                                      fold.probe_seed, args.stack_inner)
+    yte = np.array([y_by_pid[p] for p in te_pids])
+
+    def rung(s_te, s_tr, probe_c, **extra):
+        thr = best_threshold(ytr, s_tr)         # operating point from TRAINING scores only
+        return {"auc": (float(roc_auc_score(yte, s_te)) if len(np.unique(yte)) > 1
+                        else float("nan")),
+                "probe_C": probe_c, "oof": {str(p): float(v) for p, v in zip(te_pids, s_te)},
+                "bacc": balanced_accuracy(yte, (s_te >= thr).astype(int)),
+                "unit": "participant", **extra}
+
+    keys = list(mats)
+    out = {"_labels": {str(p): int(v) for p, v in zip(te_pids, yte)}}
+    for j, k in enumerate(keys):
+        out[BLOCK_RUNGS[k]] = rung(Pte[:, j], P[:, j], fams[k], width=int(mats[k].shape[1]))
+    for s in STACKS:
+        cols = [keys.index(k) for k in s]
+        w, mu, sd = nnls_weights(P[:, cols], ytr)
+        out[f"Stack {s}"] = rung(((Pte[:, cols] - mu) / sd) @ w, ((P[:, cols] - mu) / sd) @ w,
+                                 "nnls " + " ".join(f"{k}{x:.2f}" for k, x in zip(s, w)),
+                                 weights={k: float(x) for k, x in zip(s, w)})
+    out[STACK_PRIMARY].update(units=unit, arm=args.stack_arm,
+                              oof_corr=np.corrcoef(P.T).round(4).tolist())
+    return out
 
 
 def split_idx(run, tag, recs, key):
@@ -906,7 +1182,18 @@ def eval_fold(args, coh, plan, tag):
         res["rq1"] = run_rq1(args, coh, plan, fold, recs)
     if not args.skip_rq2:
         res["rq2"] = run_rq2(args, coh, plan, fold, recs, args.device)
-    if not args.skip_rq3:
+    if not args.skip_rq3 and args.stack_only:
+        # Merge, never replace: the stack's rungs join the fold's stored ladder, which its
+        # pre-registered contrasts are made against. The held-out labels must agree with the
+        # stored ones, or the two were not scored on the same fold.
+        new = run_stack(args, coh, plan, fold, recs, args.device)
+        old = res.get("rq3", {})
+        if "_labels" in old and old["_labels"] != new["_labels"]:
+            raise AssertionError(f"{tag}: the stack's held-out labels disagree with the "
+                                 "stored ladder's")
+        print_rq3(new)
+        res["rq3"] = {**old, **new}
+    elif not args.skip_rq3:
         res["rq3"] = run_rq3(args, coh, plan, fold, recs, args.device)
     for a in recs:
         (run / a / tag / "eval.json").write_text(json.dumps(res, indent=2), encoding="utf-8")
@@ -1049,6 +1336,37 @@ def _pooled_oof(per_fold):
             out[rep] = {r: (np.array([y[q] for q in pids]),
                             np.array([sc[q] for q in pids])) for r, sc in full.items()}
     return out
+
+
+def stack_report(pooled, per_fold):
+    """The super learner's pre-registered contrasts and block weights; "" when absent."""
+    reps = sorted(pooled)
+    rows = []
+    for a, b in STACK_CONTRASTS:
+        d = [delong_test(pooled[r][a][0], pooled[r][a][1], pooled[r][b][1])
+             for r in reps if a in pooled[r] and b in pooled[r]]
+        if d:
+            md, mse = np.mean([x["diff"] for x in d]), np.mean([x["se"] for x in d])
+            rows.append([a, f"vs {b}", _fmt(md), _ci(md, 1.96 * mse), _fmt(mse),
+                         " ".join(f"{x['z']:+.2f}" for x in d)])
+    if not rows:
+        return ""
+    L = ["\nSUPER LEARNER -- pre-registered contrasts, fixed before the run and printed",
+         "whatever they show. Row 1 is the primary endpoint. Rows 2-3 decide whether the",
+         "pretraining, rather than the pooling, carries a gain: D and E are pooled identically.",
+         "Row 4 is what E adds beyond every other block.\n",
+         _table(rows, ["rung", "against", "mean diff", "95% CI", "mean SE", "z per repeat"])]
+    W = [r["rq3"][STACK_PRIMARY]["weights"] for r in per_fold.values()
+         if STACK_PRIMARY in r.get("rq3", {})]
+    if W:
+        L += [f"\nNNLS weights of {STACK_PRIMARY} on standardised out-of-fold probabilities, "
+              f"over {len(W)} folds:\n",
+              _table([[k, BLOCKS[k], _fmt(float(np.mean([w[k] for w in W])), 3),
+                       _fmt(float(np.std([w[k] for w in W], ddof=1)) if len(W) > 1
+                            else float("nan"), 3),
+                       f"{sum(w[k] > 0 for w in W)}/{len(W)}"] for k in W[0]],
+                     ["block", "content", "mean w", "SD", "folds w>0"])]
+    return "\n".join(L)
 
 
 def _collect_str(per_fold, rq, path):
@@ -1234,6 +1552,7 @@ projection 0.7198, random-init 0.6874, DSSL 0.679, supervised 0.6609.
                              " ".join(f"{x['z']:+.2f}" for x in d)])
             A(_table(rows, ["rung", "mean diff", "95% CI", "mean SE",
                             "z per repeat"]))
+        A(stack_report(pooled, per_fold))
         A("")
 
     # ---- secondary: the fold-averaged estimator, kept for transparency ------------------
@@ -1317,6 +1636,20 @@ def parse_args(argv=None):
     g.add_argument("--finetune-val-frac", type=float, default=0.2,
                    help="share of TRAINING participants held out for early stopping; they "
                         "are disjoint from both the fit set and the test fold")
+    g = p.add_argument_group("RQ3 super learner")
+    g.add_argument("--stack", action="store_true",
+                   help="add the five-block super learner (raw distribution, NPCRA, paper "
+                        "cosinor, random-init and trained encoders) to the RQ3 ladder")
+    g.add_argument("--stack-only", action="store_true",
+                   help="compute ONLY the super learner and merge its rungs into the fold's "
+                        "stored rq3; implies --stack --skip-rq1 --skip-rq2")
+    g.add_argument("--stack-arm", default="angle_contracted",
+                   help="the trained arm whose frozen encoder is block E")
+    g.add_argument("--raw-scale", default=None,
+                   help="per-participant sensor scale from scripts/build_raw_scale.py; blocks "
+                        "A-C then read physical units instead of within-person z-scores")
+    g.add_argument("--stack-inner", type=int, default=5,
+                   help="inner folds for the out-of-fold block predictions")
     p.add_argument("--skip-rq1", action="store_true")
     p.add_argument("--skip-rq2", action="store_true", help="skip if encoders were not saved")
     p.add_argument("--skip-rq3", action="store_true")
@@ -1330,7 +1663,12 @@ def main(argv=None):
         return aggregate(args, plan)
     if not args.npz:
         raise SystemExit("--npz is required for the per-fold pass")
+    if args.stack_only:
+        args.stack, args.skip_rq1, args.skip_rq2 = True, True, True
     coh = load_npz(args.npz)
+    if coh.window_ids is None and args.stack:
+        raise SystemExit("the super learner needs window_ids to anchor blocks B and C to "
+                         "clock time")
     if coh.window_ids is None and not args.skip_rq2:
         raise SystemExit("RQ2 needs window_ids (for contiguous personal baselines) and the "
                          "cache has none; pass --skip-rq2 or use a cache that carries them")
