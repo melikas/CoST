@@ -6125,5 +6125,87 @@ created virtual environment CPython3.11.5.final.0-64 in 1350ms
 
 
 ====================================================================================================
+12. ATTENTION-MIL MULTI-TASK HEAD ON DENSE LABELS (HRD) -- 2026-09-11
+====================================================================================================
+
+Source: results_con_h_ctrl/results_summary.txt (cluster, aggregated 2026-09-11) and
+logs/dense-<jobid>.out. Code: commit 130d97c (eval.py --mil, scripts/build_hrd_dense_labels.py),
+removed from the working pipeline in the commit that follows this archive entry -- recoverable
+from 130d97c.
+
+SETUP
+    encoder      results_con_h_ctrl: HRD, CONTRACTED weights, pure contrastive (w_supcon=0),
+                 depth 7, RF 1021, trend kernels [1..64], V^T 160 / V^S 160, 7,451,984 params,
+                 10-fold x 3 repeats, master seed 20260906, 6000 iterations. FROZEN: RQ1 and RQ2
+                 in the same report are unchanged by construction.
+    dense labels hrd_dense_labels.npz, aligned to hrd_2224103.npz window_ids
+                 window emotional energy = mean of daily survey values in [start, start + 7 d)
+                 3,766 / 3,890 windows carry an energy target (98.7% of labelled participants')
+                 114 / 114 labelled participants carry a CES-D endpoint score
+                 CSV endpoint status == cache label for all 114 (builder asserts this)
+    head         gated-attention MIL (Ilse et al. 2018) over a participant's windows
+                 h_i = Dropout(GELU(W x_i)); e_i = w'(tanh(V h_i) * sigmoid(U h_i));
+                 a = softmax_i(e); z = sum_i a_i h_i
+                 L = BCE_pos-weighted(w_y'z, y) + 1.0*MSE(w_c'z, CES-D_z) + 1.0*MSE(w_e'h_i, EE_z)
+                 hidden 64, attention 32, dropout 0.3, AdamW lr 1e-3 wd 1e-2, <= 300 epochs,
+                 patience 30 on a participant-disjoint stratified inner split (frac 0.25), refit
+                 on all training participants, 5 seeds averaged. Applied to EVERY rung.
+    leakage      scaler, target z-scoring, head, epoch count and threshold fit on training
+                 participants only; test participants' CES-D and energy never read (verified by
+                 poisoning them: out-of-fold predictions bit-identical).
+
+POOLED OUT-OF-FOLD AUROC (114 participants per repeat)
+rung                                     repeat 0  repeat 1  repeat 2  mean
+---------------------------------------  --------  --------  --------  ------
+Raw + Random-init (angle) [fusion]       0.7390    0.6935    0.7246    0.7190
+Random-init (angle) [mil]                0.7112    0.7292    0.7143    0.7183
+Raw window [agg]                         0.7260    0.6647    0.7295    0.7067
+Random-init (circular) [mil]             0.6926    0.6982    0.7181    0.7030
+Random-init (angle)                      0.7097    0.7004    0.6935    0.7012
+DSSL angle_contracted [mil]              0.7162    0.6917    0.6799    0.6959
+DSSL circular_contracted [mil]           0.6945    0.7013    0.6802    0.6920
+Supervised scratch                       0.6945    0.7106    0.6697    0.6916
+Raw window [mil]                         0.6932    0.6960    0.6731    0.6874
+Random projection (512) [mil]            0.7115    0.6746    0.6718    0.6860
+DSSL angle_contracted                    0.6858    0.7118    0.6597    0.6858
+Fine-tuned DSSL (contracted)             0.6870    0.6929    0.6529    0.6776
+
+PRE-REGISTERED COMPARISON -- DeLong vs DSSL angle_contracted [mil] (rung minus reference)
+rung                                     mean diff  95% CI              verdict
+---------------------------------------  ---------  ------------------  -------
+Random-init (angle) [mil]                +0.0223    [-0.0270, +0.0717]  ns
+Raw + Random-init (angle) [fusion]       +0.0231    [-0.0451, +0.0913]  ns
+Raw window [agg]                         +0.0108    [-0.0649, +0.0865]  ns
+Random-init (circular) [mil]             +0.0070    [-0.0495, +0.0635]  ns
+DSSL circular_contracted [mil]           -0.0039    [-0.0505, +0.0426]  ns
+Supervised scratch                       -0.0043    [-0.0822, +0.0735]  ns
+Raw window [mil]                         -0.0085    [-0.0728, +0.0558]  ns
+Random projection (512) [mil]            -0.0099    [-0.0822, +0.0623]  ns
+Fine-tuned DSSL (contracted)             -0.0183    [-0.0974, +0.0608]  ns
+
+    verdict: no separation. The MIL head lifts encoder features by +0.008 to +0.016 over
+    their window/[agg] scores, but lifts the UNTRAINED encoder most; on the raw window it
+    loses 0.019 against [agg].
+
+TRADE-OFF MECHANISM HYPOTHESIS (for the thesis)
+    The contrastive pretext enforces invariance to augmentation-level, within-window change
+    and rewards discriminating one window from another. That sharpens the within-person
+    rhythm representation RQ2 scores, and removes between-person information the depression
+    label depends on. Evidence, same folds, same architecture:
+        RQ2  trained angle_contracted vs random-init  +0.0254  [+0.0054, +0.0454]  25/30 WIN
+             (replicated exactly in an independent re-run, results_con_h_ctrl)
+        RQ3  trained vs its own untrained encoder, under every head:
+             window 0.6858 vs 0.7012 | [agg] 0.6867 vs 0.7024 | [mil] 0.6959 vs 0.7183
+    Consistent with archived measurements: participant-invariant pairing ceiling 0.6658 and
+    participant-invariant residual 0.5856, both below the 0.7198 untrained random projection.
+
+RELATED SWEEPS SINCE THE RESET (full reports in final_results.txt and the run directories)
+    MAE (masked day-span reconstruction)  removed d8c95dd: lost to contrastive on GLOBEM RQ1,
+                                          RQ2 ns on HRD, no RQ3 gain
+    SupCon (w_supcon=1, participant-masked) removed after 130d97c: fine-tuned ~= scratch on
+                                          both cohorts; cost the HRD RQ2 win (+0.0184 ns)
+
+
+====================================================================================================
 END OF ARCHIVE
 ====================================================================================================
