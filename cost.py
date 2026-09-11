@@ -69,20 +69,13 @@ class PretrainDataset(Dataset):
     """
 
     def __init__(self, data, jitter_sigma=0.1, shift_sigma=0.5, p=0.5, multiplier=10,
-                 smooth_bins=0, labels=None, groups=None):
+                 smooth_bins=0):
         super().__init__()
         self.data = data
         self.p, self.multiplier = p, multiplier
         self.jitter_sigma, self.shift_sigma = jitter_sigma, shift_sigma
         self.smooth_bins = int(smooth_bins)
         self.N, self.T, self.D = data.shape
-        # Per-window label and participant index, read only by the supervised term.
-        # Unlabelled windows carry -1. Without labels every window is unlabelled and its own
-        # group, so the supervised term sees nothing and the views are drawn exactly as before.
-        self.labels = (torch.full((self.N,), -1, dtype=torch.long) if labels is None
-                       else torch.as_tensor(labels, dtype=torch.long))
-        self.groups = (torch.arange(self.N) if groups is None
-                       else torch.as_tensor(groups, dtype=torch.long))
 
     def __len__(self):
         return self.N * self.multiplier
@@ -90,7 +83,7 @@ class PretrainDataset(Dataset):
     def __getitem__(self, item):
         i = item % self.N
         x = self.data[i]
-        return self.transform(x), self.transform(x), self.labels[i], self.groups[i]
+        return self.transform(x), self.transform(x)
 
     def transform(self, x):
         return self.jitter(self.shift(self.smooth(x)))
@@ -180,8 +173,7 @@ class CoSTModel(nn.Module):
 
     def __init__(self, encoder_q, encoder_k, *, dim=128, alpha=0.005, K=4096, m=0.999,
                  T=0.07, disentangle=True, phase_mode="circular_amp", trend_pool="random",
-                 weights: O.TermWeights = O.PAPER, w_supcon=0.0, supcon_temp=0.1,
-                 supcon_dims=0, bins_per_day=None, device="cuda"):
+                 weights: O.TermWeights = O.PAPER, device="cuda"):
         super().__init__()
         if trend_pool not in ("random", "mean"):
             raise ValueError(f"trend_pool must be 'random' or 'mean', got {trend_pool!r}")
@@ -200,21 +192,6 @@ class CoSTModel(nn.Module):
         self.register_buffer("queue", F.normalize(torch.randn(dim, K), dim=0))
         self.register_buffer("queue_ptr", torch.zeros(1, dtype=torch.long))
         self.last_top1 = float("nan")
-
-        # Supervised-contrastive term. Its projection head reads the SAME vector the probes
-        # and the fine-tuning head read -- [trend mean | seasonal amp | seasonal (cos, sin)] --
-        # so the label signal is pushed into the representation that is actually scored, not
-        # into a pooled vector nothing downstream uses. The circular form is fixed here
-        # whatever the encode-time readout, so one encoder still serves both readouts.
-        # Built AFTER the queue: at w_supcon=0 it does not exist and draws no random numbers,
-        # which keeps the pure self-supervised run bit-identical to the pre-SupCon code.
-        self.w_supcon, self.supcon_temp, self.bins_per_day = w_supcon, supcon_temp, bins_per_day
-        self.head_sup = (nn.Sequential(nn.Linear(supcon_dims, 256), nn.ReLU(),
-                                       nn.Linear(256, 128)) if w_supcon > 0 else None)
-
-    def _sup_features(self, trend, season):
-        amp, pha = spectral_readout(season, self.bins_per_day, "circular")
-        return torch.cat([trend.mean(dim=1), amp, pha], dim=-1)
 
     # -- MoCo state -------------------------------------------------------------------
     @torch.no_grad()
@@ -242,10 +219,9 @@ class CoSTModel(nn.Module):
         return z.mean(1) if self.trend_pool == "mean" else z[:, idx]
 
     # -- objective --------------------------------------------------------------------
-    def forward(self, x_q, x_k, labels=None, groups=None, update=True, return_parts=False):
+    def forward(self, x_q, x_k, update=True, return_parts=False):
         idx = np.random.randint(0, x_q.shape[1])
         q_t, q_s, q_n = self.encoder_q(x_q)
-        q_tr = q_t                                   # un-projected trend, for the SupCon term
 
         if not self.disentangle:
             # Plain-SSL control: one representation, one MoCo, no seasonal term at all.
@@ -276,18 +252,9 @@ class CoSTModel(nn.Module):
         # is symmetric -- detaching one side behind an EMA copy would zero half its gradient
         # path. The key therefore comes from encoder_q, with gradients, at the cost of a
         # third encoder pass. Do not "fix" this to encoder_k.
-        k_tr, k_s, _ = self.encoder_q(x_k)
+        _, k_s, _ = self.encoder_q(x_k)
         amp, pha = O.seasonal_loss(q_s, k_s, self.weights, self.phase_mode)
         total = O.total_loss(trend, amp, pha, self.weights, self.alpha)
-        if self.head_sup is not None:
-            # Both views of every window, read out exactly as the probes read them. Reuses
-            # the two encoder_q passes above, so the supervised term costs no extra forward.
-            if labels is None:
-                raise ValueError("w_supcon > 0 but the batch carries no labels")
-            z = self.head_sup(torch.cat([self._sup_features(q_tr, q_s),
-                                         self._sup_features(k_tr, k_s)]))
-            total = total + self.w_supcon * O.supcon_loss(
-                z, torch.cat([labels, labels]), torch.cat([groups, groups]), self.supcon_temp)
         return (total, trend, amp + pha) if return_parts else total
 
 
@@ -306,7 +273,7 @@ class CoST:
     def __init__(self, input_dims, seq_len, bins_per_day, *, output_dims=320, hidden_dims=64,
                  depth=None, n_time_features=0, seasonal_bands="harmonics", disentangle=True,
                  mask_mode="none", trend_kernel_cap=None, seasonal_frac=0.5,
-                 residual_dims=0, w_supcon=0.0, supcon_temp=0.1,
+                 residual_dims=0,
                  phase_readout="circular", phase_mode="circular_amp", trend_pool="random",
                  weights: O.TermWeights = O.PAPER, alpha=0.005, moco_k=4096,
                  jitter_sigma=0.1, shift_sigma=0.5, smooth_minutes=75.0,
@@ -314,9 +281,6 @@ class CoST:
                  model_seed=None):
         if phase_readout not in ("angle", "circular"):
             raise ValueError(f"phase_readout must be 'angle' or 'circular', got {phase_readout!r}")
-        if w_supcon and not disentangle:
-            raise ValueError("w_supcon needs the disentangled encoder: the supervised term "
-                             "reads the trend/seasonal readout, which --plain does not have")
         if model_seed is not None:
             torch.manual_seed(model_seed)
             np.random.seed(model_seed % (2 ** 31))
@@ -329,7 +293,7 @@ class CoST:
         self.max_train_length = max_train_length
         self.jitter_sigma, self.shift_sigma = jitter_sigma, shift_sigma
         self.smooth_bins = smooth_bins_for(smooth_minutes, bins_per_day)
-        self.disentangle, self.w_supcon = disentangle, w_supcon
+        self.disentangle = disentangle
 
         enc = dict(input_dims=input_dims, output_dims=output_dims, seq_len=seq_len,
                    bins_per_day=bins_per_day, hidden_dims=hidden_dims, depth=depth,
@@ -344,35 +308,20 @@ class CoST:
         self.cost = CoSTModel(
             self.net, encoder_k, dim=(self.net.trend_dims if disentangle else output_dims),
             alpha=alpha, K=moco_k, disentangle=disentangle, phase_mode=phase_mode,
-            trend_pool=trend_pool, weights=weights, w_supcon=w_supcon,
-            supcon_temp=supcon_temp, bins_per_day=bins_per_day,
-            supcon_dims=(readout_width(seq_len, bins_per_day, "circular",
-                                       self.net.trend_dims, self.net.seasonal_dims)
-                         if disentangle else 0),
-            device=device).to(device)
+            trend_pool=trend_pool, weights=weights, device=device).to(device)
         self.n_iters = 0
 
     # -- training ---------------------------------------------------------------------
-    def fit(self, train_data, n_iters=1000, val_data=None, log_every=100, verbose=True,
-            train_labels=None, train_groups=None, val_labels=None, val_groups=None):
-        """Pretrain. `train_data` is (N, T, D) float32.
-
-        Labels are read ONLY when w_supcon > 0, and must then be the fold's training-
-        participant labels (-1 for unlabelled windows) -- train.run_fold builds them and
-        asserts no held-out participant is present. At w_supcon = 0 they are ignored.
-        """
-        if self.w_supcon and train_labels is None:
-            raise ValueError("w_supcon > 0 needs train_labels; without them the supervised "
-                             "term would silently see an all-unlabelled batch")
-        loader = self._loader(train_data, train_labels, train_groups, shuffle=True)
+    def fit(self, train_data, n_iters=1000, val_data=None, log_every=100, verbose=True):
+        """Pretrain. `train_data` is (N, T, D) float32; no labels are used anywhere here."""
+        loader = self._loader(train_data, shuffle=True)
         if len(loader.dataset) < self.batch_size:
             raise ValueError(f"{len(loader.dataset)} windows is fewer than one batch "
                              f"({self.batch_size}); lower --batch-size or widen the fold")
 
         val_loader = None
         if val_data is not None and len(val_data) >= self.batch_size:
-            val_loader = self._loader(val_data, val_labels, val_groups, shuffle=False,
-                                      multiplier=1)
+            val_loader = self._loader(val_data, shuffle=False, multiplier=1)
 
         params = [p for p in self.cost.parameters() if p.requires_grad]
         opt = torch.optim.SGD(params, lr=self.lr, momentum=0.9, weight_decay=1e-4)
@@ -404,22 +353,21 @@ class CoST:
         self.cost.eval()
         return hist
 
-    def _loader(self, data, labels=None, groups=None, *, shuffle, multiplier=None):
-        """Two augmented views per window, plus its label and participant for the SupCon term."""
+    def _loader(self, data, *, shuffle, multiplier=None):
+        """Two independently augmented views per window."""
         kw = {} if multiplier is None else {"multiplier": multiplier}
         ds = PretrainDataset(torch.as_tensor(data, dtype=torch.float),
                              jitter_sigma=self.jitter_sigma, shift_sigma=self.shift_sigma,
-                             smooth_bins=self.smooth_bins, labels=labels, groups=groups, **kw)
+                             smooth_bins=self.smooth_bins, **kw)
         return DataLoader(ds, batch_size=self.batch_size, shuffle=shuffle, drop_last=True)
 
     def _loss(self, batch, update=True):
         x_q, x_k = batch[0].to(self.device), batch[1].to(self.device)
-        labels, groups = batch[2].to(self.device), batch[3].to(self.device)
         if self.max_train_length and x_q.size(1) > self.max_train_length:
             off = np.random.randint(x_q.size(1) - self.max_train_length + 1)
             sl = slice(off, off + self.max_train_length)
             x_q, x_k = x_q[:, sl], x_k[:, sl]
-        return self.cost(x_q, x_k, labels=labels, groups=groups, update=update)
+        return self.cost(x_q, x_k, update=update)
 
     @torch.no_grad()
     def _validation_loss(self, loader):
@@ -500,7 +448,6 @@ class CoST:
         # never enters training -- so a checkpoint cannot own one. It is recorded under a
         # name that cannot be mistaken for a setting.
         torch.save({"net": self.net.state_dict(), "n_iters": self.n_iters,
-                    "w_supcon": self.w_supcon,
                     "residual_dims": self.net.residual_dims,
                     "phase_readout_at_construction": self.phase_readout}, path)
 

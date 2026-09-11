@@ -123,7 +123,6 @@ def plan(args, arms, folds, X, n_sensors, bins_per_day, n_folds_eff=None):
         "seasonal_dims": enc.seasonal_dims,
         "smooth_bins": smooth_bins_for(args.smooth_minutes, bins_per_day),
         "residual_dims": enc.residual_dims,
-        "w_supcon": args.w_supcon,
         "n_params": n_par,
         "circular_pair_block": [pair_start, pair_width],
         "arms": [a.as_dict() for a in arms],
@@ -146,9 +145,9 @@ def run_fold(args, weights_name, readouts, coh, fold, out_dir):
 
     The test participants are excluded from PRETRAINING as well as from the probe, so the
     representation a held-out participant is scored under has never seen that participant.
-    At --w-supcon 0 nothing here reads a label. Above 0 the supervised term reads labels of
-    the fold's TRAINING participants only; the guard below fails the run if a test
-    participant is present in pretraining at all.
+    Nothing here reads a label: the split is by participant, and `y` is only carried through
+    so eval.py can read it off the same arrays. The guard below fails the run if a test
+    participant reaches pretraining at all.
 
     WHY ONE ENCODER SERVES BOTH READOUTS. `phase_readout` never enters the training path --
     the objective compares phases through `phase_mode` inside objective.seasonal_loss, while
@@ -162,21 +161,14 @@ def run_fold(args, weights_name, readouts, coh, fold, out_dir):
     """
     fd = coh.fold_data(fold)
     Xp = coh.X[fd.pretrain]
-    pids_p = coh.pids[fd.pretrain]
     # Leakage guard, enforced rather than assumed: no held-out participant may reach
-    # pretraining, and the ONLY labels the supervised term can see are the fold's TRAINING
-    # participants'. Unlabelled participants stay in pretraining with label -1.
-    if np.isin(pids_p, list(fold.test_pids)).any():
+    # pretraining.
+    if np.isin(coh.pids[fd.pretrain], list(fold.test_pids)).any():
         raise AssertionError(f"{fold.tag}: a test participant reached the pretraining set")
-    lab_p = np.where(np.isin(pids_p, list(fold.train_pids)),
-                     coh.y[fd.pretrain], -1).astype(np.int64)
-    grp_p = np.unique(pids_p, return_inverse=True)[1].astype(np.int64)
     rng = np.random.default_rng(fold.model_seed)
     perm = rng.permutation(len(Xp))
     n_val = int(len(Xp) * args.val_frac)
     val, tr = Xp[perm[:n_val]], Xp[perm[n_val:]]
-    sup = dict(train_labels=lab_p[perm[n_val:]], train_groups=grp_p[perm[n_val:]],
-               val_labels=lab_p[perm[:n_val]], val_groups=grp_p[perm[:n_val]])
 
     model = CoST(
         input_dims=coh.n_features, seq_len=coh.seq_len, bins_per_day=coh.bins_per_day,
@@ -185,14 +177,13 @@ def run_fold(args, weights_name, readouts, coh, fold, out_dir):
         disentangle=not args.plain, mask_mode=args.mask_mode,
         trend_kernel_cap=args.trend_kernel_cap, seasonal_frac=args.seasonal_frac,
         residual_dims=args.residual_dims,
-        w_supcon=args.w_supcon, supcon_temp=args.supcon_temp,
         phase_readout=readouts[0], weights=WEIGHTS[weights_name], alpha=args.alpha,
         moco_k=args.moco_k, jitter_sigma=args.jitter_sigma, shift_sigma=args.shift_sigma,
         smooth_minutes=args.smooth_minutes, lr=args.lr, batch_size=args.batch_size,
         device=args.device, model_seed=fold.model_seed)
 
     hist = model.fit(tr, n_iters=args.iters, val_data=val if len(val) else None,
-                     log_every=args.log_every, verbose=args.verbose, **sup)
+                     log_every=args.log_every, verbose=args.verbose)
 
     if args.save_encoder:
         # Saved BEFORE the readout loop, and under the weighting rather than the arm: these
@@ -216,7 +207,7 @@ def run_fold(args, weights_name, readouts, coh, fold, out_dir):
         trend_w = reps["trend"].shape[1] if "trend" in reps else 0
         rec = {"arm": arm.as_dict(), "fold": fold.as_dict(), "split": fd.summary(),
                "n_pretrain_train": int(len(tr)), "n_pretrain_val": int(len(val)),
-               "iters": model.n_iters, "w_supcon": float(args.w_supcon),
+               "iters": model.n_iters,
                "residual_dims": int(args.residual_dims),
                "final_top1": hist["top1"][-1] if hist["top1"] else None,
                "loss": hist,
@@ -274,15 +265,6 @@ def parse_args(argv=None):
     g.add_argument("--mask-mode", choices=["none", "binomial"], default="none")
     g.add_argument("--plain", action="store_true",
                    help="plain-SSL control: no trend/seasonal split")
-
-    g = p.add_argument_group("supervised contrastive term (RQ3)")
-    g.add_argument("--w-supcon", type=float, default=0.0,
-                   help="weight on a supervised-contrastive term added to the contrastive "
-                        "objective. Uses ONLY the fold's training-participant labels; "
-                        "positives are same-label windows from a DIFFERENT participant. "
-                        "0 = the pure self-supervised objective, bit-identical to before")
-    g.add_argument("--supcon-temp", type=float, default=0.1,
-                   help="temperature of the supervised-contrastive term")
 
     g = p.add_argument_group("optimisation")
     g.add_argument("--iters", type=int, default=6000)
@@ -385,9 +367,6 @@ def main(argv=None):
     sb, bin_min = spec["smooth_bins"], 1440 // spec["bins_per_day"]
     print(f"[aug ] smoothing " + (f"up to {sb} bins ({sb * bin_min} min)" if sb >= 3 else
           f"OFF ({args.smooth_minutes:g} min is under 3 bins at {bin_min} min/bin)"))
-    print(f"[sup ] supervised-contrastive weight {args.w_supcon:g}" + (
-          " -- training-fold labels only, cross-participant positives" if args.w_supcon
-          else " -- off: pure self-supervised objective"))
     print(f"[prot] {args.protocol}: {pr['n_folds']}-fold x {pr['n_repeats']}, "
           f"{len(args.arms)} arms "
           f"-> {pr['n_encoder_fits']} encoder fits / "

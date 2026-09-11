@@ -43,8 +43,7 @@ import torch.nn.functional as F
 from torch import fft
 
 __all__ = ["TermWeights", "PAPER", "CONTRACTED", "convert_coeff", "circular_phase",
-           "instance_contrastive_loss", "moco_ce_loss", "seasonal_loss", "total_loss",
-           "supcon_loss"]
+           "instance_contrastive_loss", "moco_ce_loss", "seasonal_loss", "total_loss"]
 
 
 @dataclass(frozen=True)
@@ -176,31 +175,3 @@ def total_loss(trend_term, amp_term, phase_term, weights: TermWeights, alpha: fl
     `amp_term` and `phase_term` arrive already weighted, from `seasonal_loss`.
     """
     return weights.trend * trend_term + alpha * (amp_term + phase_term)
-
-
-def supcon_loss(z, labels, groups, temperature: float = 0.1):
-    """Supervised contrastive loss (Khosla et al. 2020, L_out) with the participant masked out.
-
-    Positives for an anchor are windows with the SAME label from a DIFFERENT participant.
-    Every pair from the anchor's own participant -- its other augmented view included -- is
-    removed from the numerator AND the denominator. The label is participant-level, so
-    without that mask the loss is minimised by clustering each person's windows together:
-    the training folds reward that and a held-out fold cannot, so it would learn identity,
-    not depression.
-
-    Unlabelled windows (label < 0) are neither anchors nor candidates. Anchors with no
-    positive in the batch are skipped, and a batch with none returns an exact zero that
-    still carries a graph. Only the anchor rows that have a positive are ever put through
-    logsumexp, so no all -inf row can produce a NaN gradient.
-    """
-    z = F.normalize(z, dim=-1)
-    lab = labels >= 0
-    cand = lab[:, None] & lab[None, :] & (groups[:, None] != groups[None, :])
-    pos = cand & (labels[:, None] == labels[None, :])
-    rows = pos.any(1)
-    if not bool(rows.any()):
-        return z.sum() * 0.0
-    logits = ((z[rows] @ z.T) / temperature).masked_fill(~cand[rows], float("-inf"))
-    log_prob = logits - torch.logsumexp(logits, dim=1, keepdim=True)
-    p = pos[rows]
-    return -(log_prob.masked_fill(~p, 0.0).sum(1) / p.sum(1)).mean()
