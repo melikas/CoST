@@ -55,18 +55,27 @@ def main(argv=None):
 
     pu = np.unique(pids)
     mu, sd = np.zeros((len(pu), ns)), np.ones((len(pu), ns))
-    worst = 0.0
+    worst, at = 0.0, ""
     for i, q in enumerate(pu):
         m = pids == q
         for c in range(ns):
             xz, xr = Xz[m, :, c].ravel(), Xr[m, :, c].ravel()
-            if np.ptp(xz) == 0:                    # zero-variance channel: sd was set to 1
-                mu[i, c] = xr.mean()
+            if np.ptp(xz) == 0:
+                # Constant over every window of this person (in hrd_2224103: i48's screen at
+                # z = -0.1436, x50's at 0) -- constant in the windows, not necessarily in the
+                # whole record the z-score was computed on. The scale is not identifiable
+                # from these windows and not needed to reconstruct them: sd = 1 and the
+                # offset alone is exact. mu = mean(raw) reconstructed z + raw instead.
+                mu[i, c] = (xr - xz).mean()
             else:
                 sd[i, c], mu[i, c] = np.polyfit(xz, xr, 1)
-            err = np.abs(xz * sd[i, c] + mu[i, c] - xr).max() / max(np.ptp(xr), 1e-12)
-            worst = max(worst, float(err))
-    print(f"[scale] {len(pu)} participants x {ns} channels; worst relative residual {worst:.2e}")
+            # Relative to the channel's range -- or to its magnitude when it has no range.
+            err = float(np.abs(xz * sd[i, c] + mu[i, c] - xr).max()
+                        / max(np.ptp(xr), np.abs(xr).max(), 1e-12))
+            if err > worst:
+                worst, at = err, f"{q}/{names[c]}"
+    print(f"[scale] {len(pu)} participants x {ns} channels; worst relative residual "
+          f"{worst:.2e} ({at})")
     if worst > TOL:
         raise SystemExit(f"residual {worst:.2e} exceeds {TOL:g}: the cache is not an affine "
                          "per-participant map of the raw windows -- refusing to write")
