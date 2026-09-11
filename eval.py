@@ -42,13 +42,17 @@ from scipy.stats import rankdata
 from sklearn.decomposition import PCA
 from sklearn.linear_model import RidgeCV
 from sklearn.metrics import roc_auc_score
+from sklearn.preprocessing import StandardScaler
+import torch
+import torch.nn.functional as F
+from torch import nn
 
 from baselines.random_projection import raw_projection
 from cost import CoST, WindowClassifier, finetune, predict_windows
 from cv import (Fold, delong_test, nadeau_bengio, paired_test,
                 required_margin)
 from data_loader import load_npz
-from probe import balanced_accuracy, best_threshold, make_probe
+from probe import IsotropicPairScaler, balanced_accuracy, best_threshold, make_probe
 
 PHASE_LEVELS = (0.5, 1.0, 2.0, 3.0, 4.0)
 BASELINE_R = 4                      # personal reference = 4 preceding windows = 28 days
@@ -589,6 +593,167 @@ def probe_auc_deviation(V, pids, y_by_pid, tr_pids, te_pids, tdays, seed):
     return score_participants(pu, X, y_by_pid, tr_pids, te_pids, seed)
 
 
+# =======================================================================================
+# Attention-MIL multi-task head: dense labels, pooled by learned attention
+# =======================================================================================
+def load_dense_labels(path, coh):
+    """Targets from scripts/build_hrd_dense_labels.py, asserted aligned to this cache."""
+    z = np.load(path, allow_pickle=True)
+    if coh.window_ids is None or not np.array_equal(
+            z["window_ids"].astype(str), np.asarray(coh.window_ids).astype(str)):
+        raise SystemExit(f"{path} was built for a different window cache; rebuild it "
+                         "against the --npz this run uses")
+    return {"ee": z["ee_window"].astype(np.float64),
+            "cesd": dict(zip(z["pid"].astype(str), z["cesd_endpoint"].astype(np.float64)))}
+
+
+class MILMultiTask(nn.Module):
+    """Gated-attention MIL (Ilse et al. 2018) over one participant's windows, three heads.
+
+        h_i = Dropout(GELU(W x_i))                       window embedding
+        e_i = w' (tanh(V h_i) * sigmoid(U h_i))          gated attention score
+        a_i = softmax of e over that participant's windows
+        z   = sum_i a_i h_i                              participant embedding
+        endpoint logit = w_y' z    CES-D = w_c' z    window emotional energy = w_e' h_i
+    """
+
+    def __init__(self, d_in, hidden=64, att=32, dropout=0.3):
+        super().__init__()
+        self.enc = nn.Sequential(nn.Linear(d_in, hidden), nn.GELU(), nn.Dropout(dropout))
+        self.att_v, self.att_u = nn.Linear(hidden, att), nn.Linear(hidden, att)
+        self.att_w = nn.Linear(att, 1)
+        self.head_y, self.head_c, self.head_e = (nn.Linear(hidden, 1) for _ in range(3))
+
+    def forward(self, x, bag, n_bags):
+        h = self.enc(x)
+        e = self.att_w(torch.tanh(self.att_v(h)) * torch.sigmoid(self.att_u(h))).squeeze(-1)
+        # Per-bag softmax. The max is detached: softmax is shift-invariant, so this changes
+        # only the floating-point range, never the value or the gradient.
+        m = torch.full((n_bags,), -torch.inf, device=x.device).scatter_reduce(
+            0, bag, e.detach(), reduce="amax", include_self=True)
+        w = torch.exp(e - m[bag])
+        a = w / torch.zeros(n_bags, device=x.device).index_add(0, bag, w)[bag]
+        z = torch.zeros(n_bags, h.size(1), device=x.device).index_add(0, bag, a[:, None] * h)
+        return (self.head_y(z).squeeze(-1), self.head_c(z).squeeze(-1),
+                self.head_e(h).squeeze(-1))
+
+
+def _zscore(v):
+    """Standardise with the statistics of the finite entries; all-NaN stays all-NaN."""
+    ok = np.isfinite(v)
+    if ok.sum() < 2:
+        return np.full(len(v), np.nan)
+    sd = v[ok].std()
+    return (v - v[ok].mean()) / (sd if sd > 0 else 1.0)
+
+
+def _mil_fit(X, bag, y, cesd, ee, args, seed, device, epochs, val=None):
+    """Full-batch training of one head. L = BCE_balanced(endpoint) + w_cesd MSE(CES-D) +
+    w_ee MSE(window energy), each MSE over its finite targets only. With `val` =
+    (X, bag, y) the endpoint AUROC on those participants picks the epoch."""
+    torch.manual_seed(seed)
+    model = MILMultiTask(X.shape[1], args.mil_hidden, args.mil_att, args.mil_dropout).to(device)
+    opt = torch.optim.AdamW(model.parameters(), lr=args.mil_lr, weight_decay=args.mil_wd)
+    n = len(y)
+    pos_w = torch.tensor((n - float(y.sum())) / max(float(y.sum()), 1.0), device=device)
+    mc, me = torch.isfinite(cesd), torch.isfinite(ee)
+    best, best_ep, since = -np.inf, epochs, 0
+    for ep in range(1, epochs + 1):
+        model.train()
+        s, c, r = model(X, bag, n)
+        loss = F.binary_cross_entropy_with_logits(s, y, pos_weight=pos_w)
+        if args.w_cesd and bool(mc.any()):
+            loss = loss + args.w_cesd * F.mse_loss(c[mc], cesd[mc])
+        if args.w_ee and bool(me.any()):
+            loss = loss + args.w_ee * F.mse_loss(r[me], ee[me])
+        opt.zero_grad(set_to_none=True)
+        loss.backward()
+        opt.step()
+        if val is not None:
+            model.eval()
+            with torch.no_grad():
+                sv = model(val[0], val[1], len(val[2]))[0].cpu().numpy()
+            auc = roc_auc_score(val[2], sv)
+            if auc > best:
+                best, best_ep, since = auc, ep, 0
+            else:
+                since += 1
+                if since >= args.mil_patience:
+                    break
+    return model, best_ep
+
+
+def probe_auc_mil(V, pids, y_by_pid, tr_pids, te_pids, dense, seed, args, device,
+                  pair_start=None, pair_width=0):
+    """Score one representation through the attention-MIL multi-task head.
+
+    LEAKAGE. Everything that is FIT -- the scaler, the target standardisation, the head, its
+    epoch count, the threshold -- sees training participants only, and the dense targets are
+    READ for training participants only. A test participant contributes windows to
+    prediction and nothing else. Verified by poisoning every test participant's CES-D and
+    energy targets: the out-of-fold predictions came back bit-identical.
+
+    The epoch count is chosen on a participant-disjoint, stratified inner split of the
+    training participants, then the head is refit on all of them for that many epochs.
+    `args.mil_seeds` heads are averaged, on every rung alike.
+    """
+    ptr = sorted(str(p) for p in tr_pids)
+    pte = sorted(str(p) for p in te_pids)
+    if set(ptr) & set(pte):
+        raise AssertionError("MIL: a participant is on both sides of the fold")
+    spids = np.asarray(pids).astype(str)
+
+    def rows_and_bags(group):
+        rows = np.flatnonzero(np.isin(spids, group))
+        pos = {p: i for i, p in enumerate(group)}
+        return rows, np.array([pos[p] for p in spids[rows]], dtype=np.int64)
+
+    tr_rows, tr_bag = rows_and_bags(ptr)
+    te_rows, te_bag = rows_and_bags(pte)
+    scaler = (IsotropicPairScaler(pair_start, pair_width) if pair_width
+              else StandardScaler()).fit(V[tr_rows])
+    as_t = lambda a: torch.as_tensor(np.asarray(a, dtype=np.float32), device=device)
+    X_tr = as_t(np.nan_to_num(scaler.transform(V[tr_rows])))
+    X_te = as_t(np.nan_to_num(scaler.transform(V[te_rows])))
+
+    y_tr = np.array([y_by_pid[p] for p in ptr], dtype=np.float64)
+    y_te = np.array([y_by_pid[p] for p in pte], dtype=np.float64)
+    cesd_z = _zscore(np.array([dense["cesd"].get(p, np.nan) for p in ptr]))
+    ee_z = _zscore(dense["ee"][tr_rows])
+
+    def pack(keep_mask):
+        """Tensors for a subset of the training participants, bags renumbered 0..k-1."""
+        keep = np.flatnonzero(keep_mask)
+        remap = np.full(len(ptr), -1, dtype=np.int64)
+        remap[keep] = np.arange(len(keep))
+        w = remap[tr_bag] >= 0
+        return (X_tr[torch.as_tensor(w, device=device)],
+                torch.as_tensor(remap[tr_bag][w], device=device),
+                as_t(y_tr[keep]), as_t(cesd_z[keep]), as_t(ee_z[w]))
+
+    fit_m, sel_m = selection_split(y_tr, None, seed)
+    fit, sel, full = pack(fit_m), pack(sel_m), pack(np.ones(len(ptr), bool))
+    te_bag_t = torch.as_tensor(te_bag, device=device)
+    p_te, p_tr, eps = [], [], []
+    for k in range(args.mil_seeds):
+        _, ep = _mil_fit(*fit, args, seed + k, device, args.mil_epochs,
+                         val=(sel[0], sel[1], y_tr[sel_m]))
+        model, _ = _mil_fit(*full, args, seed + k, device, ep)
+        model.eval()
+        with torch.no_grad():
+            p_te.append(torch.sigmoid(model(X_te, te_bag_t, len(pte))[0]).cpu().numpy())
+            p_tr.append(torch.sigmoid(model(full[0], full[1], len(ptr))[0]).cpu().numpy())
+        eps.append(ep)
+    p_te, p_tr = np.mean(p_te, axis=0), np.mean(p_tr, axis=0)
+    thr = best_threshold(y_tr, p_tr)
+    return {"auc": (float(roc_auc_score(y_te, p_te)) if len(np.unique(y_te)) > 1
+                    else float("nan")),
+            "probe_C": f"mil:ep{int(np.median(eps))}",
+            "oof": {p: float(v) for p, v in zip(pte, p_te)},
+            "bacc": balanced_accuracy(y_te.astype(int), (p_te >= thr).astype(int)),
+            "unit": "participant"}
+
+
 def probe_auc(Xtr, ytr, Xte, pids_te, y_te_w, seed, groups=None,
               pair_start=None, pair_width=0):
     """Fit a probe on the training participants, score the held-out ones.
@@ -641,6 +806,15 @@ def run_rq3(args, coh, plan, fold, recs, device):
                 for p in np.unique(coh.pids)}
     tr_pids, te_pids = list(fold.train_pids), list(fold.test_pids)
     ladder = {}
+    dense = load_dense_labels(args.dense_labels, coh) if args.mil else None
+
+    def finish():
+        for k, r in ladder.items():
+            bb = "" if not np.isfinite(r["bacc"]) else f" bacc={r['bacc']:.4f}[{r['unit'][:4]}]"
+            print(f"    [rq3] {k:34s} AUROC={r['auc']:.4f} (C={r['probe_C']}){bb}", flush=True)
+        _, _, ys = participant_scores(np.zeros(len(te)), pids_te, y_te_w)
+        labels = {str(p): int(v) for p, v in zip(np.unique(pids_te), ys)}
+        return {"_labels": labels, **ladder}
 
     def add(name, V, ps=None, pw=0, dev=True):
         """Score one representation every way, under one identical selection rule.
@@ -648,15 +822,24 @@ def run_rq3(args, coh, plan, fold, recs, device):
         `groups` carries the training windows' participants so the family is selected on a
         participant-disjoint inner split -- without it a forest can win selection by
         memorising the people it was fit on.
+
+        With --mil every representation also gets a [mil] rung: the SAME attention-MIL
+        multi-task head on every rung, raw window and untrained controls included, so no
+        rung is granted a head another was denied. --mil-only computes that rung alone.
         """
-        ladder[name] = probe_auc(V[tr], y_tr, V[te], pids_te, y_te_w, seed,
-                                 groups=coh.pids[tr], pair_start=ps, pair_width=pw)
-        ladder[name + " [agg]"] = probe_auc_participants(
-            V, coh.pids, y_by_pid, tr_pids, te_pids, tdays, seed,
-            pair_start=ps, pair_width=pw)
-        if dev:
-            ladder[name + " [dev]"] = probe_auc_deviation(
-                V, coh.pids, y_by_pid, tr_pids, te_pids, tdays, seed)
+        if not args.mil_only:
+            ladder[name] = probe_auc(V[tr], y_tr, V[te], pids_te, y_te_w, seed,
+                                     groups=coh.pids[tr], pair_start=ps, pair_width=pw)
+            ladder[name + " [agg]"] = probe_auc_participants(
+                V, coh.pids, y_by_pid, tr_pids, te_pids, tdays, seed,
+                pair_start=ps, pair_width=pw)
+            if dev:
+                ladder[name + " [dev]"] = probe_auc_deviation(
+                    V, coh.pids, y_by_pid, tr_pids, te_pids, tdays, seed)
+        if args.mil:
+            ladder[name + " [mil]"] = probe_auc_mil(
+                V, coh.pids, y_by_pid, tr_pids, te_pids, dense, seed, args, device,
+                pair_start=ps, pair_width=pw)
 
     flat = np.nan_to_num(coh.X[:, :, :coh.n_sensors].reshape(len(coh.X), -1), nan=0.0)
     # One raw arm now, not two. "RF on raw" and "Raw window" were the same features under
@@ -672,6 +855,11 @@ def run_rq3(args, coh, plan, fold, recs, device):
         V = np.load(Path(args.run) / arm_tag / fold.tag / "repr.npz")["full"]
         ps, pw = rec["pair_block_full"]
         add(f"DSSL {arm_tag}", V, ps, pw or 0)
+
+    if args.mil_only:
+        # Only the [mil] rungs were asked for. eval_fold MERGES them into the fold's
+        # existing rq3, so every rung not recomputed here is kept rather than dropped.
+        return finish()
 
     # ---- STEP C: end-to-end fine-tuning ------------------------------------------------
     # The control is supervised-from-scratch, NOT the frozen probe. Both arms get the same
@@ -749,12 +937,7 @@ def run_rq3(args, coh, plan, fold, recs, device):
     Z = cosinor_z(coh.X[:, :, :coh.n_sensors], coh.bins_per_day)
     ladder["Raw cosinor [dev]"] = probe_auc_deviation(
         np.c_[Z.real, Z.imag], coh.pids, y_by_pid, tr_pids, te_pids, tdays, seed)
-    for k, r in ladder.items():
-        bb = "" if not np.isfinite(r["bacc"]) else f" bacc={r['bacc']:.4f}[{r['unit'][:4]}]"
-        print(f"    [rq3] {k:34s} AUROC={r['auc']:.4f} (C={r['probe_C']}){bb}", flush=True)
-    _, _, ys = participant_scores(np.zeros(len(te)), pids_te, y_te_w)
-    labels = {str(p): int(v) for p, v in zip(np.unique(pids_te), ys)}
-    return {"_labels": labels, **ladder}
+    return finish()
 
 
 def split_idx(run, tag, recs, key):
@@ -907,7 +1090,9 @@ def eval_fold(args, coh, plan, tag):
     if not args.skip_rq2:
         res["rq2"] = run_rq2(args, coh, plan, fold, recs, args.device)
     if not args.skip_rq3:
-        res["rq3"] = run_rq3(args, coh, plan, fold, recs, args.device)
+        # Merged, not replaced: a --mil-only pass adds its rungs to the ones already there.
+        res["rq3"] = {**res.get("rq3", {}),
+                      **run_rq3(args, coh, plan, fold, recs, args.device)}
     for a in recs:
         (run / a / tag / "eval.json").write_text(json.dumps(res, indent=2), encoding="utf-8")
     return res
@@ -1320,7 +1505,32 @@ def parse_args(argv=None):
     p.add_argument("--skip-rq1", action="store_true")
     p.add_argument("--skip-rq2", action="store_true", help="skip if encoders were not saved")
     p.add_argument("--skip-rq3", action="store_true")
-    return p.parse_args(argv)
+    g = p.add_argument_group("attention-MIL multi-task head (dense labels, RQ3)")
+    g.add_argument("--mil", action="store_true",
+                   help="add a [mil] rung for every representation: gated-attention pooling "
+                        "over a participant's windows, trained on the endpoint, CES-D and "
+                        "window emotional energy of the fold's TRAINING participants only")
+    g.add_argument("--mil-only", action="store_true",
+                   help="compute ONLY the [mil] rungs and merge them into the fold's existing "
+                        "eval.json (implies --mil)")
+    g.add_argument("--dense-labels",
+                   help="scripts/build_hrd_dense_labels.py output, built for this --npz")
+    g.add_argument("--mil-hidden", type=int, default=64)
+    g.add_argument("--mil-att", type=int, default=32)
+    g.add_argument("--mil-dropout", type=float, default=0.3)
+    g.add_argument("--mil-lr", type=float, default=1e-3)
+    g.add_argument("--mil-wd", type=float, default=1e-2)
+    g.add_argument("--mil-epochs", type=int, default=300)
+    g.add_argument("--mil-patience", type=int, default=30)
+    g.add_argument("--mil-seeds", type=int, default=5, help="heads averaged per rung")
+    g.add_argument("--w-cesd", type=float, default=1.0, help="weight on the CES-D target")
+    g.add_argument("--w-ee", type=float, default=1.0,
+                   help="weight on the window emotional-energy target")
+    a = p.parse_args(argv)
+    a.mil = a.mil or a.mil_only
+    if a.mil and not a.dense_labels:
+        p.error("--mil / --mil-only need --dense-labels (scripts/build_hrd_dense_labels.py)")
+    return a
 
 
 def main(argv=None):
