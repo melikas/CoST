@@ -888,7 +888,16 @@ def block_cosinor(Xs, coh, cache_path):
     F = paper_cosinor_features(Xs, coh.bin_minutes, window_ids=coh.window_ids,
                                pids=coh.pids, cache_path=str(cache_path))
     pu = np.unique(coh.pids)
-    return pu, F[[int(np.flatnonzero(coh.pids == p)[0]) for p in pu]]
+    X = F[[int(np.flatnonzero(coh.pids == p)[0]) for p in pu]]
+    # A participant's row is zero only if every fit of every window failed. That is how a
+    # missing dependency looks once it is cached (Narval: 3890 of 3890 rows zero, the
+    # paper baseline at exactly 0.5), so it stops the run rather than enter the ladder.
+    blank = int((X == 0).all(1).sum())
+    if blank:
+        raise SystemExit(f"{blank} of {len(pu)} participants have all-zero cosinor features: "
+                         f"the fits failed. Check `from CosinorPy import cosinor` imports, "
+                         f"delete {cache_path}, and rerun.")
+    return pu, X
 
 
 @torch.no_grad()

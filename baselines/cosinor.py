@@ -215,6 +215,11 @@ def paper_cosinor_features(Xs, bin_minutes, need_mask=None, top_k=2, sig_level=0
     # analysis, so spread it over the cores the job already reserves. Processes, not threads:
     # the work is pure Python/NumPy inside CosinorPy, so the GIL would serialise a pool.
     if todo:
+        # Fail HERE, loudly. _channel_features swallows every exception so one bad window
+        # cannot kill a run -- which also swallowed a missing dependency: on Narval
+        # CosinorPy.cosinor could not import seaborn, every fit returned zeros, and the
+        # paper baseline scored exactly 0.5 with no error anywhere.
+        from CosinorPy import cosinor  # noqa: F401
         n_jobs = int(os.environ.get("SLURM_CPUS_PER_TASK") or 0) or (os.cpu_count() or 1)
         n_jobs = max(1, min(n_jobs, len(todo)))
         if verbose:
