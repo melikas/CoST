@@ -1,7 +1,7 @@
 """The SSL objective: a MoCo trend term and a within-batch seasonal term, with the
 seasonal term split into amplitude and phase and each term separately weighted.
 
-    L  =  w_trend * L_trend  +  alpha * ( w_amp * L_amp  +  w_phase * L_phase )
+    L  =  w_trend * L_trend  +  alpha * ( w_amp * L_amp  +  w_phase * L_phase )  [+ w_eq * L_eq]
 
 Upstream fixes w_trend = 1 and w_amp = w_phase = 1/2. Making the three weights explicit
 is the only structural change here, and it is what lets the objective be contracted onto
@@ -43,7 +43,8 @@ import torch.nn.functional as F
 from torch import fft
 
 __all__ = ["TermWeights", "PAPER", "CONTRACTED", "convert_coeff", "circular_phase",
-           "instance_contrastive_loss", "moco_ce_loss", "seasonal_loss", "total_loss"]
+           "instance_contrastive_loss", "moco_ce_loss", "seasonal_loss", "total_loss",
+           "equivariance_loss"]
 
 
 @dataclass(frozen=True)
@@ -167,6 +168,20 @@ def seasonal_loss(q_s, k_s, weights: TermWeights, phase_mode: str = "circular_am
             k_pha = circular_phase(k_pha, k_amp if w else None)
     return (weights.amp * instance_contrastive_loss(q_amp, k_amp),
             weights.phase * instance_contrastive_loss(q_pha, k_pha))
+
+
+def equivariance_loss(pred, delta):
+    """Level equivariance for the trend branch (Dangovski et al., ICLR 2022).
+
+    `shift` adds a per-channel offset -- the MESOR, the f=0 bin -- to each view, and the trend
+    branch is read out as its time-mean, i.e. that same content. Contrasting the two views
+    therefore trains the trend branch to DISCARD the quantity it is read out as: an
+    augmentation defines what the representation throws away (Xiao et al., ICLR 2021). This
+    term makes the branch predict the offset between the views instead. `pred` is a bias-free
+    linear map of the difference of the two views' time-mean trend, and `delta` is d1 - d2,
+    so at the optimum level is a linear direction of the trend readout.
+    """
+    return F.mse_loss(pred, delta)
 
 
 def total_loss(trend_term, amp_term, phase_term, weights: TermWeights, alpha: float):

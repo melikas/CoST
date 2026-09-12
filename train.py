@@ -126,6 +126,7 @@ def plan(args, arms, folds, X, n_sensors, bins_per_day, n_folds_eff=None):
         "hidden_dims": args.hidden_dims,
         "smooth_bins": smooth_bins_for(args.smooth_minutes, bins_per_day),
         "residual_dims": enc.residual_dims,
+        "w_eq": args.w_eq,
         "n_params": n_par,
         "circular_pair_block": [pair_start, pair_width],
         "arms": [a.as_dict() for a in arms],
@@ -183,7 +184,7 @@ def run_fold(args, weights_name, readouts, coh, fold, out_dir):
         phase_readout=readouts[0], weights=WEIGHTS[weights_name], alpha=args.alpha,
         moco_k=args.moco_k, jitter_sigma=args.jitter_sigma, shift_sigma=args.shift_sigma,
         smooth_minutes=args.smooth_minutes, lr=args.lr, batch_size=args.batch_size,
-        device=args.device, model_seed=fold.model_seed)
+        w_eq=args.w_eq, device=args.device, model_seed=fold.model_seed)
 
     hist = model.fit(tr, n_iters=args.iters, val_data=val if len(val) else None,
                      log_every=args.log_every, verbose=args.verbose)
@@ -212,6 +213,7 @@ def run_fold(args, weights_name, readouts, coh, fold, out_dir):
                "n_pretrain_train": int(len(tr)), "n_pretrain_val": int(len(val)),
                "iters": model.n_iters,
                "residual_dims": int(args.residual_dims),
+               "w_eq": float(args.w_eq),
                "final_top1": hist["top1"][-1] if hist["top1"] else None,
                "loss": hist,
                "repr_dims": {k: list(v.shape) for k, v in reps.items()},
@@ -277,6 +279,11 @@ def parse_args(argv=None):
     g.add_argument("--moco-k", type=int, default=4096, help="MoCo queue size")
     g.add_argument("--jitter-sigma", type=float, default=0.1)
     g.add_argument("--shift-sigma", type=float, default=0.5)
+    g.add_argument("--w-eq", type=float, default=0.0,
+                   help="weight of the level-equivariance term: the trend branch must predict "
+                        "the per-channel offset `shift` put between the two views instead of "
+                        "being trained invariant to it. 0 = the contrastive objective, "
+                        "bit-identical to before")
     g.add_argument("--smooth-minutes", type=float, default=75.0,
                    help="widest box filter for the smoothing augmentation, in MINUTES, "
                         "converted per cohort: 75 = 5 bins on HRD (the old --smooth-bins "
@@ -308,6 +315,8 @@ def parse_args(argv=None):
         a.arms = parse_arms(a.arms)
     if not 0.1 <= a.seasonal_frac <= 0.9:
         p.error("--seasonal-frac must be in [0.1, 0.9]")
+    if a.w_eq < 0 or (a.w_eq and a.plain):
+        p.error("--w-eq must be >= 0 and needs the disentangled encoder (not --plain)")
     return a
 
 

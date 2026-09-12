@@ -81,12 +81,16 @@ class PretrainDataset(Dataset):
         return self.N * self.multiplier
 
     def __getitem__(self, item):
-        i = item % self.N
-        x = self.data[i]
-        return self.transform(x), self.transform(x)
+        """Two views, and the per-channel level offset between them (d1 - d2), which only
+        the equivariance term reads. Tracking it draws no extra random numbers."""
+        x = self.data[item % self.N]
+        v1, d1 = self.transform(x)
+        v2, d2 = self.transform(x)
+        return v1, v2, d1 - d2
 
     def transform(self, x):
-        return self.jitter(self.shift(self.smooth(x)))
+        x, d = self.shift(self.smooth(x))
+        return self.jitter(x), d
 
     def smooth(self, x):
         """Circular box filter of random odd width up to `smooth_bins` -- what declares
@@ -129,10 +133,15 @@ class PretrainDataset(Dataset):
     def shift(self, x):
         """A constant per-channel offset moves only the MESOR -- the f=0 bin -- and leaves
         the amplitude and phase of every rhythm untouched. Safe, non-trivial, and it guards
-        against contrastive collapse."""
+        against contrastive collapse.
+
+        It is also exactly what the trend branch is read out as (its time-mean), so on its
+        own it trains that branch to discard level. Returns (view, offset) so --w-eq can make
+        the branch predict the offset instead; the offset is zero when no shift is applied."""
         if random.random() > self.p:
-            return x
-        return x + torch.randn(x.size(-1)) * self.shift_sigma
+            return x, torch.zeros(x.size(-1))
+        d = torch.randn(x.size(-1)) * self.shift_sigma
+        return x + d, d
 
 
 # --------------------------------------------------------------------------------------
@@ -173,7 +182,7 @@ class CoSTModel(nn.Module):
 
     def __init__(self, encoder_q, encoder_k, *, dim=128, alpha=0.005, K=4096, m=0.999,
                  T=0.07, disentangle=True, phase_mode="circular_amp", trend_pool="random",
-                 weights: O.TermWeights = O.PAPER, device="cuda"):
+                 weights: O.TermWeights = O.PAPER, w_eq=0.0, eq_dims=0, device="cuda"):
         super().__init__()
         if trend_pool not in ("random", "mean"):
             raise ValueError(f"trend_pool must be 'random' or 'mean', got {trend_pool!r}")
@@ -192,6 +201,13 @@ class CoSTModel(nn.Module):
         self.register_buffer("queue", F.normalize(torch.randn(dim, K), dim=0))
         self.register_buffer("queue_ptr", torch.zeros(1, dtype=torch.long))
         self.last_top1 = float("nan")
+
+        # Level equivariance (objective.equivariance_loss). Built AFTER the queue: at w_eq=0
+        # it does not exist and draws no random numbers, which keeps the contrastive run
+        # bit-identical. Bias-free, so it maps a DIFFERENCE of readouts to a difference of
+        # offsets -- an equivariance for the additive group, not a regression on level.
+        self.w_eq = w_eq
+        self.head_eq = nn.Linear(dim, eq_dims, bias=False) if w_eq > 0 else None
 
     # -- MoCo state -------------------------------------------------------------------
     @torch.no_grad()
@@ -219,7 +235,7 @@ class CoSTModel(nn.Module):
         return z.mean(1) if self.trend_pool == "mean" else z[:, idx]
 
     # -- objective --------------------------------------------------------------------
-    def forward(self, x_q, x_k, update=True, return_parts=False):
+    def forward(self, x_q, x_k, update=True, return_parts=False, delta=None):
         idx = np.random.randint(0, x_q.shape[1])
         q_t, q_s, q_n = self.encoder_q(x_q)
 
@@ -237,6 +253,7 @@ class CoSTModel(nn.Module):
             z = loss.new_zeros(())
             return (loss, z, z) if return_parts else loss
 
+        q_level = q_t.mean(dim=1) if self.head_eq is not None else None   # the readout
         q_t = F.normalize(self.head_q(self._trend_view(q_t, idx)), dim=-1)
         with torch.no_grad():
             if update:
@@ -252,9 +269,16 @@ class CoSTModel(nn.Module):
         # is symmetric -- detaching one side behind an EMA copy would zero half its gradient
         # path. The key therefore comes from encoder_q, with gradients, at the cost of a
         # third encoder pass. Do not "fix" this to encoder_k.
-        _, k_s, _ = self.encoder_q(x_k)
+        k_tq, k_s, _ = self.encoder_q(x_k)
         amp, pha = O.seasonal_loss(q_s, k_s, self.weights, self.phase_mode)
         total = O.total_loss(trend, amp, pha, self.weights, self.alpha)
+        if self.head_eq is not None:
+            # Reuses the second encoder_q pass the seasonal term already makes, so the
+            # equivariance term costs no extra forward.
+            if delta is None:
+                raise ValueError("w_eq > 0 but the batch carries no level offsets")
+            total = total + self.w_eq * O.equivariance_loss(
+                self.head_eq(q_level - k_tq.mean(dim=1)), delta)
         return (total, trend, amp + pha) if return_parts else total
 
 
@@ -276,11 +300,13 @@ class CoST:
                  residual_dims=0,
                  phase_readout="circular", phase_mode="circular_amp", trend_pool="random",
                  weights: O.TermWeights = O.PAPER, alpha=0.005, moco_k=4096,
-                 jitter_sigma=0.1, shift_sigma=0.5, smooth_minutes=75.0,
+                 jitter_sigma=0.1, shift_sigma=0.5, smooth_minutes=75.0, w_eq=0.0,
                  lr=5e-4, batch_size=64, max_train_length=None, device="cuda",
                  model_seed=None):
         if phase_readout not in ("angle", "circular"):
             raise ValueError(f"phase_readout must be 'angle' or 'circular', got {phase_readout!r}")
+        if w_eq and not disentangle:
+            raise ValueError("w_eq needs the disentangled encoder: it acts on the trend branch")
         if model_seed is not None:
             torch.manual_seed(model_seed)
             np.random.seed(model_seed % (2 ** 31))
@@ -308,7 +334,8 @@ class CoST:
         self.cost = CoSTModel(
             self.net, encoder_k, dim=(self.net.trend_dims if disentangle else output_dims),
             alpha=alpha, K=moco_k, disentangle=disentangle, phase_mode=phase_mode,
-            trend_pool=trend_pool, weights=weights, device=device).to(device)
+            trend_pool=trend_pool, weights=weights, w_eq=w_eq, eq_dims=input_dims,
+            device=device).to(device)
         self.n_iters = 0
 
     # -- training ---------------------------------------------------------------------
@@ -367,7 +394,7 @@ class CoST:
             off = np.random.randint(x_q.size(1) - self.max_train_length + 1)
             sl = slice(off, off + self.max_train_length)
             x_q, x_k = x_q[:, sl], x_k[:, sl]
-        return self.cost(x_q, x_k, update=update)
+        return self.cost(x_q, x_k, update=update, delta=batch[2].to(self.device))
 
     @torch.no_grad()
     def _validation_loss(self, loader):

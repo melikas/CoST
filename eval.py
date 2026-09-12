@@ -1418,6 +1418,9 @@ def report(plan, per_fold, nf, nr):
       f"({plan['rf_over_window']}x window), bands {plan['bands']},")
     A(f"           trend kernels {plan['trend_kernels']}, V^T {plan['trend_dims']} / "
       f"V^S {plan['seasonal_dims']}, {plan['n_params']:,} params.")
+    if plan.get("w_eq"):
+        A(f"Objective  contrastive + level equivariance on the trend branch "
+          f"(w_eq={plan['w_eq']:g}); the untrained controls are unchanged.")
     if plan.get("w_supcon"):
         A(f"Objective  contrastive + supervised-contrastive (w={plan['w_supcon']:g}), "
           f"training-fold labels only.")
