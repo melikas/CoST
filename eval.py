@@ -10,6 +10,10 @@ The RQ3 super learner merges into an evaluated run without redoing anything else
     python eval.py --run runs/oneshot --npz hrd_2224103.npz --only-fold r0f0 --stack-only \
         --raw-scale hrd_2224103_scale.npz
 
+RQ2's paired amplitude arm merges the same way, keeping the stored phase arm:
+
+    python eval.py --run runs/oneshot --npz hrd_2224103.npz --only-fold r0f0 --rq2-amp-only
+
 Per-fold work writes `<arm>/<fold>/eval.json`; `--aggregate` reads all of them, applies the
 Nadeau-Bengio correction across folds, and writes `results_summary.txt`.
 
@@ -48,7 +52,7 @@ from scipy.optimize import nnls
 from scipy.stats import rankdata
 from sklearn.decomposition import PCA
 from sklearn.linear_model import RidgeCV
-from sklearn.metrics import roc_auc_score
+from sklearn.metrics import f1_score, roc_auc_score
 from sklearn.model_selection import StratifiedKFold
 
 from baselines.cosinor import _start_bins, paper_cosinor_features
@@ -60,6 +64,12 @@ from data_loader import load_npz
 from probe import balanced_accuracy, best_threshold, make_probe
 
 PHASE_LEVELS = (0.5, 1.0, 2.0, 3.0, 4.0)
+# RQ2 amplitude arm: each week's 24 h component is scaled by 1 - alpha and by 1 + alpha.
+# Fixed before the arm was ever run, from HRD itself. Against the mean of its 4 reference
+# weeks, a week's 24 h amplitude differs by 5% / 13% / 30% / 67% at the 25th / 50th / 75th /
+# 90th percentile (all channels, 2824 scored weeks), so the grid spans the natural range.
+# The cap of 0.5 keeps the damped version at no less than half its rhythm.
+AMP_LEVELS = (0.05, 0.1, 0.2, 0.3, 0.5)
 BASELINE_R = 4                      # personal reference = 4 preceding windows = 28 days
 # RQ2's measurability boundary. A fold's C is a claim about held-out PARTICIPANTS -- one
 # person's strata across shift levels are not independent -- so it is reported only when
@@ -148,6 +158,24 @@ def phase_shift(X, hours, n_sensors, bin_minutes):
     Xp = X.copy()
     k = int(round(hours * 60 / bin_minutes))
     Xp[:, :, :n_sensors] = np.roll(X[:, :, :n_sensors], k, axis=1)
+    return Xp
+
+
+def amplitude_scale(X, s, n_sensors, bpd):
+    """Scale ONLY the 24 h cosinor component of every sensor channel by `s`.
+
+    x' = x + (s - 1)(a cos wt + b sin wt), where a + ib = cosinor_z(x). Over a window of whole
+    days that component is orthogonal to the mean and to every other harmonic, so x' has
+    cosinor coefficient exactly s * z. The rhythm's strength changes; its level and timing
+    do not. Clock channels are left alone, as in phase_shift.
+    """
+    Xs = X[:, :, :n_sensors]
+    t = 2 * np.pi * np.arange(X.shape[1]) / bpd
+    z = cosinor_z(Xs, bpd)
+    comp = (z.real[:, None, :] * np.cos(t)[None, :, None]
+            + z.imag[:, None, :] * np.sin(t)[None, :, None])
+    Xp = X.copy()
+    Xp[:, :, :n_sensors] = Xs + (s - 1.0) * comp
     return Xp
 
 
@@ -248,6 +276,29 @@ def _blank_model(coh, plan, readout, device, seed):
 # =======================================================================================
 # RQ2 -- the flagship
 # =======================================================================================
+def _rq2_reference(model, X, pids, tdays, coh, test_mask):
+    """What both RQ2 perturbation arms share: each week's frozen personal baseline in the
+    representation and in raw 24 h cosinor space, and which weeks can be scored.
+
+    The raw-space reference is the COMPLEX mean of the preceding windows, not the mean of
+    magnitudes: a phase shift is a rotation of z, and averaging |z| would discard exactly
+    the quantity the perturbation moves. `personal_baseline` is reused for the mask only.
+    """
+    bpd, ns = coh.bins_per_day, coh.n_sensors
+    V0 = model.encode(X, parts=False)
+    max_span = float(7 * (BASELINE_R - 1))
+    mu, sd, ok = personal_baseline(V0, pids, BASELINE_R, tdays, max_span)
+    Z0 = cosinor_z(X[:, :, :ns], bpd)
+    _, _, zok = personal_baseline(np.abs(Z0), pids, BASELINE_R, tdays, max_span)
+    zbar = np.zeros_like(Z0)
+    for p in np.unique(pids):
+        idx = np.flatnonzero(pids == p)
+        for j in range(BASELINE_R, len(idx)):
+            zbar[idx[j]] = Z0[idx[j - BASELINE_R:j]].mean(0)
+    return {"mu": mu, "sd": sd, "d0": dscore(V0, mu, sd), "Z0": Z0, "zbar": zbar,
+            "g0": raw_deviation(Z0, zbar), "scored": ok & zok & test_mask}
+
+
 def rq2_arm(model, X, pids, tdays, coh, levels, test_mask):
     """Concordance C for one representation, over the fold's held-out participants.
 
@@ -256,24 +307,8 @@ def rq2_arm(model, X, pids, tdays, coh, levels, test_mask):
     out of sample for that person.
     """
     bpd, ns, bm = coh.bins_per_day, coh.n_sensors, coh.bin_minutes
-    V0 = model.encode(X, parts=False)
-    max_span = float(7 * (BASELINE_R - 1))
-    mu, sd, ok = personal_baseline(V0, pids, BASELINE_R, tdays, max_span)
-    d0 = dscore(V0, mu, sd)
-
-    # The raw-space reference is the COMPLEX mean of the preceding windows, not the mean of
-    # magnitudes: a phase shift is a rotation of z, and averaging |z| would discard exactly
-    # the quantity the perturbation moves. `personal_baseline` is reused for the mask only.
-    Z0 = cosinor_z(X[:, :, :ns], bpd)
-    _, _, zok = personal_baseline(np.abs(Z0), pids, BASELINE_R, tdays, max_span)
-    zbar = np.zeros_like(Z0)
-    for p in np.unique(pids):
-        idx = np.flatnonzero(pids == p)
-        for j in range(BASELINE_R, len(idx)):
-            zbar[idx[j]] = Z0[idx[j - BASELINE_R:j]].mean(0)
-    g0 = raw_deviation(Z0, zbar)
-
-    scored = ok & zok & test_mask
+    ref = _rq2_reference(model, X, pids, tdays, coh, test_mask)
+    mu, sd, d0, zbar, g0, scored = (ref[k] for k in ("mu", "sd", "d0", "zbar", "g0", "scored"))
     dd_all, dg_all, key_all, pid_all = [], [], [], []
     for lv in levels:
         Xp = phase_shift(X, lv, ns, bm)
@@ -293,6 +328,45 @@ def rq2_arm(model, X, pids, tdays, coh, levels, test_mask):
             "n_participants": len({k.rsplit("|", 1)[0] for k in per}),
             "n_pairs": float(sum(v[1] for v in per.values())),
             "n_scored_windows": int(scored.sum())}
+
+
+def rq2_amp_arm(model, X, pids, tdays, coh, alphas, test_mask):
+    """RQ2 amplitude arm: paired within-week concordance, C_amp.
+
+    For every scored week, two versions scale ONLY its 24 h component (amplitude_scale), by
+    1 - alpha and by 1 + alpha. They change the input by the same amount and leave level and
+    timing untouched. Ground truth, measured without the model: which version is further
+    from the person's recent rhythm in raw cosinor space, sign(g(1+a) - g(1-a)). The
+    representation agrees when sign(d(1+a) - d(1-a)) matches it, against the SAME frozen
+    baseline as the phase arm. A tie in d counts 1/2; a week whose two versions are equally
+    far in raw space has no ground truth and is dropped.
+
+    WHY PAIRED. The one-sided damping arm this replaces compared DIFFERENT weeks, and whether
+    damping moves a week away or closer depends on that week's own amplitude. Its two classes
+    were therefore not magnitude-matched: a pure change detector scored 0.075 and a random
+    projection 0.87-0.94 (experiment_q2.py). Here both versions of a week change the input
+    equally and share its amplitude, so any detector that registers only how much the input
+    changed ties on every week and scores exactly 0.5.
+    """
+    bpd, ns = coh.bins_per_day, coh.n_sensors
+    ref = _rq2_reference(model, X, pids, tdays, coh, test_mask)
+    agree, keys = [], []
+    for a in alphas:
+        lo, hi = amplitude_scale(X, 1.0 - a, ns, bpd), amplitude_scale(X, 1.0 + a, ns, bpd)
+        d_lo = dscore(model.encode(lo, parts=False), ref["mu"], ref["sd"])
+        d_hi = dscore(model.encode(hi, parts=False), ref["mu"], ref["sd"])
+        truth = np.sign(raw_deviation(cosinor_z(hi[:, :, :ns], bpd), ref["zbar"])
+                        - raw_deviation(cosinor_z(lo[:, :, :ns], bpd), ref["zbar"]))
+        said = np.sign(d_hi - d_lo)
+        m = ref["scored"] & (truth != 0) & np.isfinite(d_hi) & np.isfinite(d_lo)
+        agree.append(np.where(said[m] == 0, 0.5, (said[m] == truth[m]).astype(float)))
+        keys.append(np.array([f"{p}|{a}" for p in pids[m]]))
+    agree, keys = np.concatenate(agree), np.concatenate(keys)
+    return {"C": float(agree.mean()) if len(agree) else float("nan"),
+            "n_strata": int(len(set(keys))),
+            "n_participants": len({k.rsplit("|", 1)[0] for k in keys}),
+            "n_pairs": float(len(agree)),
+            "n_scored_windows": int(ref["scored"].sum())}
 
 
 def rq2_verdict(rec, n_levels):
@@ -340,6 +414,36 @@ def run_rq2(args, coh, plan, fold, recs, device):
         tag = f"random-init_{readout}"
         out["arms"][tag] = rq2_arm(ctrl, coh.X, coh.pids, tdays, coh, levels, te)
         _rq2_line(tag, out["arms"][tag], len(levels))
+    return out
+
+
+class _RawProjection:
+    """An untrained random linear map of the raw week (baselines.random_projection) with the
+    one method the RQ2 arms call. It is the amplitude arm's difficulty reference: how much
+    of the task a readout of the raw input, with no encoder, already solves."""
+
+    def __init__(self, n_sensors, seed, width=512):
+        self.n_sensors, self.seed, self.width = n_sensors, seed, width
+
+    def encode(self, X, parts=False):
+        return raw_projection(X, self.n_sensors, self.width, self.seed)
+
+
+def run_rq2_amp(args, coh, plan, fold, recs, device):
+    """RQ2 amplitude arm for every trained arm, its readout-matched random-init control, and
+    the raw random projection as a difficulty reference. Held-out participants only."""
+    tdays = window_start_days(coh.window_ids)
+    te = np.isin(coh.pids, list(fold.test_pids))
+    out = {"alphas": list(AMP_LEVELS), "arms": {}}
+    models = {tag: load_encoder(args.run, rec["arm"]["weights"], fold.tag, coh, plan,
+                                rec["arm"]["phase_readout"], device) for tag, rec in recs.items()}
+    for readout in sorted({r["arm"]["phase_readout"] for r in recs.values()}):
+        models[f"random-init_{readout}"] = _blank_model(coh, plan, readout, device,
+                                                        seed=fold.model_seed)
+    models["random projection (512)"] = _RawProjection(coh.n_sensors, fold.probe_seed)
+    for tag, model in models.items():
+        out["arms"][tag] = rq2_amp_arm(model, coh.X, coh.pids, tdays, coh, AMP_LEVELS, te)
+        _rq2_line(f"amp {tag}", out["arms"][tag], len(AMP_LEVELS))
     return out
 
 
@@ -632,6 +736,39 @@ def probe_auc(Xtr, ytr, Xte, pids_te, y_te_w, seed, groups=None,
             "bacc": bacc, "unit": "window"}
 
 
+LINEAR = " [linear]"          # suffix of the primary-protocol rungs
+LINEAR_THRESHOLD = 0.5        # the class-balanced probe's own decision; nothing is tuned
+
+
+def probe_linear(Xtr, ytr, Xte, pids_te, y_te_w, seed, groups=None,
+                 pair_start=None, pair_width=0):
+    """PRIMARY RQ3 protocol: the standard frozen linear evaluation.
+
+    A logistic-regression probe on the frozen representation and nothing else. This is the
+    linear probe of TS-TCC (Eldele et al., IJCAI 2021: "a linear classifier ... on top of a
+    frozen self-supervised pretrained encoder") and of Abbaspourazad et al. (ICLR 2024).
+    Logistic regression IS a linear layer trained with cross-entropy, fitted exactly here
+    rather than by SGD. There is no forest, no participant aggregation and no fusion; those
+    stay in the secondary ladder.
+
+    The penalty C comes from the same participant-disjoint inner split every rung uses. The
+    label belongs to the participant, so a participant's score is the mean of their windows'
+    probabilities, and ROC-AUC is computed on that score. The decision is the probe's own
+    (class-balanced logistic regression, positive at p >= 0.5), so balanced accuracy and
+    macro-F1 involve no tuned threshold.
+    """
+    pr, best_c = fit_probe(Xtr, ytr, seed, families=("supervised",), groups=groups,
+                           pair_start=pair_start, pair_width=pair_width)
+    pu, sc, ys = participant_scores(pr.predict_proba(Xte)[:, 1], pids_te, y_te_w)
+    pred = (sc >= LINEAR_THRESHOLD).astype(int)
+    return {"auc": float(roc_auc_score(ys, sc)) if len(np.unique(ys)) > 1 else float("nan"),
+            "probe_C": best_c, "oof": {str(p): float(v) for p, v in zip(pu, sc)},
+            "pred": {str(p): int(v) for p, v in zip(pu, pred)},
+            "bacc": balanced_accuracy(ys, pred),
+            "f1": float(f1_score(ys, pred, average="macro", zero_division=0)),
+            "unit": "participant"}
+
+
 def run_rq3(args, coh, plan, fold, recs, device):
     """The ladder: untrained references first, then the arms, all on identical rows.
 
@@ -654,13 +791,19 @@ def run_rq3(args, coh, plan, fold, recs, device):
     tr_pids, te_pids = list(fold.train_pids), list(fold.test_pids)
     ladder = {}
 
-    def add(name, V, ps=None, pw=0, dev=True):
+    def add(name, V, ps=None, pw=0, dev=True, linear=True):
         """Score one representation every way, under one identical selection rule.
 
         `groups` carries the training windows' participants so the family is selected on a
         participant-disjoint inner split -- without it a forest can win selection by
         memorising the people it was fit on.
         """
+        # The primary protocol first, as its own rung: it shares no fitted state with the
+        # rungs below, and every probe is seeded locally, so they are unchanged by it.
+        if linear:
+            ladder[name + LINEAR] = probe_linear(V[tr], y_tr, V[te], pids_te, y_te_w, seed,
+                                                 groups=coh.pids[tr], pair_start=ps,
+                                                 pair_width=pw)
         ladder[name] = probe_auc(V[tr], y_tr, V[te], pids_te, y_te_w, seed,
                                  groups=coh.pids[tr], pair_start=ps, pair_width=pw)
         ladder[name + " [agg]"] = probe_auc_participants(
@@ -675,7 +818,8 @@ def run_rq3(args, coh, plan, fold, recs, device):
     # two hard-coded families; with the family selected they collapse into a single honest
     # rung, and the chosen family is recorded in probe_C ("for:1.0" / "sup:0.01").
     add("Raw window", flat, dev=False)
-    add("Random projection (512)", raw_projection(coh.X, coh.n_sensors, 512, seed))
+    add("Random projection (512)", raw_projection(coh.X, coh.n_sensors, 512, seed),
+        linear=False)
     for readout in sorted({r["arm"]["phase_readout"] for r in recs.values()}):
         ctrl = _blank_model(coh, plan, readout, device, seed=fold.model_seed)
         ps, pw = _pair_of(recs, readout)
@@ -1196,6 +1340,11 @@ def eval_fold(args, coh, plan, tag):
         res["rq1"] = run_rq1(args, coh, plan, fold, recs)
     if not args.skip_rq2:
         res["rq2"] = run_rq2(args, coh, plan, fold, recs, args.device)
+        res["rq2"]["amp"] = run_rq2_amp(args, coh, plan, fold, recs, args.device)
+    if args.rq2_amp_only:
+        # Merge, never replace: the fold's stored phase arm is kept exactly as it is.
+        res.setdefault("rq2", {})["amp"] = run_rq2_amp(args, coh, plan, fold, recs,
+                                                       args.device)
     if not args.skip_rq3 and args.stack_only:
         # Merge, never replace: the stack's rungs join the fold's stored ladder, which its
         # pre-registered contrasts are made against. The held-out labels must agree with the
@@ -1322,7 +1471,7 @@ def _contrast(t):
             _fmt(t["required_margin"]), f"{t['wins']}/{t['n']}", verdict]
 
 
-def _pooled_oof(per_fold):
+def _pooled_oof(per_fold, key="oof"):
     """{repeat: {rung: (y, scores)}} -- one out-of-fold prediction per participant per repeat.
 
     Every participant is tested exactly once per repeat, so a repeat's folds concatenate into
@@ -1339,8 +1488,10 @@ def _pooled_oof(per_fold):
         d = reps.setdefault(int(tag[1:tag.index("f")]), {"_y": {}})
         d["_y"].update(rq3["_labels"])
         for rung, v in rq3.items():
-            if not rung.startswith("_") and isinstance(v, dict) and "oof" in v:
-                d.setdefault(rung, {}).update(v["oof"])
+            # `key` picks the per-participant field pooled: "oof" scores, or the [linear]
+            # rungs' binary "pred" decisions.
+            if not rung.startswith("_") and isinstance(v, dict) and key in v:
+                d.setdefault(rung, {}).update(v[key])
     out = {}
     for rep, d in sorted(reps.items()):
         y = d.pop("_y")
@@ -1405,6 +1556,93 @@ def _table(rows, headers):
 
 def _fmt(v, n=4):
     return "n/a" if v is None or (isinstance(v, float) and not np.isfinite(v)) else f"{v:.{n}f}"
+
+
+def rq2_amp_report(per_fold, nf, nr):
+    """RQ2 amplitude arm: mean C_amp per arm and each trained arm against its random-init
+    control, with the same measurability boundary and fold-level test as the phase arm."""
+    amp = {t: {"amp": r.get("rq2", {}).get("amp", {})} for t, r in per_fold.items()}
+    tags, series = _collect(amp, "amp", "C", sub="arms")
+    if not series:
+        return "\nRQ2 amplitude arm: not computed (run eval.py --rq2-amp-only).\n"
+    for i, t in enumerate(tags):
+        a = amp[t]["amp"]
+        for arm, v in series.items():
+            rec = a.get("arms", {}).get(arm)
+            if rec is not None and rq2_verdict(rec, len(a.get("alphas", ()))) != "measurable":
+                v[i] = np.nan
+    alphas = next((amp[t]["amp"].get("alphas") for t in tags if amp[t]["amp"]), [])
+    L = ["\nRQ2 -- STRENGTH (AMPLITUDE) ARM, paired within-week concordance C_amp",
+         f"For every scored week, two versions scale only its 24 h component by 1 - alpha and",
+         f"1 + alpha (alpha in {alphas}): equal input change, level and timing unchanged.",
+         "C_amp is the fraction of weeks whose representation ranks the two versions the way the",
+         "raw 24 h rhythm does (ties 1/2). Null is exactly 0.5 for any detector that registers",
+         "only how much the input changed. The random projection of the raw week is a difficulty",
+         "reference, not a competitor.\n",
+         _table([[n, _fmt(np.nanmean(v)), _fmt(np.nanstd(v, ddof=1)), int(np.isfinite(v).sum())]
+                 for n, v in sorted(series.items(), key=lambda kv: -np.nanmean(kv[1]))],
+                ["arm", "mean C_amp", "SD", "folds"])]
+    rows = []
+    for arm in sorted(a for a in series if not a.startswith(("random-init", "random proj"))):
+        ctrl = f"random-init_{'circular' if 'circular' in arm else 'angle'}"
+        if ctrl in series:
+            m = np.isfinite(series[arm]) & np.isfinite(series[ctrl])
+            if m.sum() >= 2:
+                rows.append([arm, f"vs {ctrl}"]
+                            + _contrast(paired_test(series[arm][m], series[ctrl][m], nf, nr)))
+    if rows:
+        L += ["\nPaired contrasts (same folds, Nadeau-Bengio corrected):",
+              _table(rows, ["arm", "against"] + CONTRAST_COLS)]
+    return "\n".join(L) + "\n"
+
+
+def linear_report(per_fold):
+    """PRIMARY RQ3 table: the standard frozen linear evaluation (probe_linear), pooled per repeat.
+
+    ROC-AUC is computed on the pooled out-of-fold participant scores; balanced accuracy and
+    macro-F1 on the pooled decisions. Each DSSL arm is compared, on the same participants and
+    the same probe, with the random-init control of its own readout and with the raw window:
+    DeLong's test on ROC-AUC, and mean differences over repeats for the two decision metrics.
+    """
+    scores, preds = _pooled_oof(per_fold), _pooled_oof(per_fold, "pred")
+    reps = sorted(r for r in scores if r in preds)
+    rungs = sorted({g for r in reps for g in scores[r] if g.endswith(LINEAR) and g in preds[r]})
+    if not rungs:
+        return "(no [linear] rungs: re-run the RQ3 evaluation to add the primary protocol)\n"
+    auc = {g: [roc_auc_score(*scores[r][g]) for r in reps] for g in rungs}
+    bac = {g: [balanced_accuracy(*preds[r][g]) for r in reps] for g in rungs}
+    f1 = {g: [f1_score(*preds[r][g], average="macro", zero_division=0) for r in reps]
+          for g in rungs}
+    name = lambda g: g[:-len(LINEAR)]
+    cell = lambda v: f"{_fmt(np.mean(v))} ({' '.join(_fmt(x) for x in v)})"
+    L = ["PRIMARY -- standard frozen linear evaluation (the TS-TCC / Abbaspourazad et al.",
+         "protocol). Frozen encoder; logistic-regression probe only, C chosen on a",
+         "participant-disjoint inner split; a participant's score is the mean of their windows'",
+         "probabilities; the decision is the probe's own (class-balanced, p >= 0.5), so no",
+         "threshold is tuned. Pooled over every labelled participant, one value per repeat.\n",
+         _table([[name(g), cell(auc[g]), cell(bac[g]), cell(f1[g])]
+                 for g in sorted(rungs, key=lambda g: -np.mean(auc[g]))],
+                ["representation", "ROC-AUC mean (per repeat)", "balanced accuracy",
+                 "macro-F1"]),
+         f"\n  n = {len(scores[reps[0]][rungs[0]][0])} participants per repeat, each scored once.\n"]
+    rows = []
+    for g in (x for x in rungs if x.startswith("DSSL")):
+        ro = "circular" if "circular" in g else "angle"
+        for ref in (f"Random-init ({ro}){LINEAR}", f"Raw window{LINEAR}"):
+            if ref not in rungs:
+                continue
+            d = [delong_test(scores[r][g][0], scores[r][g][1], scores[r][ref][1]) for r in reps]
+            md, mse = np.mean([x["diff"] for x in d]), np.mean([x["se"] for x in d])
+            rows.append([name(g), f"vs {name(ref)}", _fmt(md), _ci(md, 1.96 * mse),
+                         " ".join(f"{x['z']:+.2f}" for x in d),
+                         _fmt(np.mean(bac[g]) - np.mean(bac[ref])),
+                         _fmt(np.mean(f1[g]) - np.mean(f1[ref]))])
+    if rows:
+        L += ["Paired on the same participants: DeLong's test on ROC-AUC; balanced accuracy and",
+              "macro-F1 as mean differences over repeats.\n",
+              _table(rows, ["arm", "against", "diff ROC-AUC", "95% CI", "z per repeat",
+                            "diff bal. acc", "diff macro-F1"])]
+    return "\n".join(L) + "\n"
 
 
 def report(plan, per_fold, nf, nr):
@@ -1507,10 +1745,16 @@ held-out participants only: the encoder never saw them, in pretraining or otherw
         A(_table(rows, ["arm", "against"] + CONTRAST_COLS)
           if rows else "(no comparable pairs)")
 
+    A(rq2_amp_report(per_fold, nf, nr))
+
     # ---- RQ3 -------------------------------------------------------------------------
     A("\n" + rule)
-    A("RQ3 (REPORTED) -- downstream ladder, participant-level AUROC")
+    A("RQ3 -- depression prediction, participant level")
     A(rule)
+    A(linear_report(per_fold))
+    A("SECONDARY -- exploratory ladder: probe-family selection (logistic or forest), [agg],")
+    A("[dev] and raw-concatenation [fusion]. These go beyond the standard protocol above and")
+    A("answer secondary questions (aggregation, deviation, complementarity with the raw input).")
     A("""
 Read this ladder expecting the untrained references to win. That is the finding, it is
 supported by an architecture-matched control on every rung, and nothing here is arranged to
@@ -1545,7 +1789,8 @@ projection 0.7198, random-init 0.6874, DSSL 0.679, supervised 0.6609.
         A("PRIMARY ESTIMATOR -- pooled out-of-fold, one AUROC per repeat over the whole")
         A("labelled cohort, arms compared by DeLong's paired test.\n")
         reps = sorted(pooled)
-        rungs = sorted(set().union(*(set(pooled[r]) for r in reps)))
+        rungs = sorted(g for g in set().union(*(set(pooled[r]) for r in reps))
+                       if not g.endswith(LINEAR))
         auc = {g: np.array([roc_auc_score(*pooled[r][g]) for r in reps if g in pooled[r]])
                for g in rungs}
         n_sub = len(next(iter(pooled[reps[0]].values()))[0])
@@ -1580,6 +1825,7 @@ projection 0.7198, random-init 0.6874, DSSL 0.679, supervised 0.6609.
 
     # ---- secondary: the fold-averaged estimator, kept for transparency ------------------
     tags, series = _collect(per_fold, "rq3", "auc")
+    series = {k: v for k, v in series.items() if not k.endswith(LINEAR)}
     if not series:
         A("(no RQ3 results)")
     else:
@@ -1676,6 +1922,10 @@ def parse_args(argv=None):
     p.add_argument("--skip-rq1", action="store_true")
     p.add_argument("--skip-rq2", action="store_true", help="skip if encoders were not saved")
     p.add_argument("--skip-rq3", action="store_true")
+    p.add_argument("--rq2-amp-only", action="store_true",
+                   help="compute ONLY RQ2's paired amplitude arm and merge it into the fold's "
+                        "stored rq2, keeping the phase arm; implies --skip-rq1 --skip-rq2 "
+                        "--skip-rq3. Needs the saved encoders")
     return p.parse_args(argv)
 
 
@@ -1688,11 +1938,13 @@ def main(argv=None):
         raise SystemExit("--npz is required for the per-fold pass")
     if args.stack_only:
         args.stack, args.skip_rq1, args.skip_rq2 = True, True, True
+    if args.rq2_amp_only:
+        args.skip_rq1, args.skip_rq2, args.skip_rq3 = True, True, True
     coh = load_npz(args.npz)
     if coh.window_ids is None and args.stack:
         raise SystemExit("the super learner needs window_ids to anchor blocks B and C to "
                          "clock time")
-    if coh.window_ids is None and not args.skip_rq2:
+    if coh.window_ids is None and (not args.skip_rq2 or args.rq2_amp_only):
         raise SystemExit("RQ2 needs window_ids (for contiguous personal baselines) and the "
                          "cache has none; pass --skip-rq2 or use a cache that carries them")
     tags = ([args.only_fold] if args.only_fold
