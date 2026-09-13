@@ -78,7 +78,17 @@ def rhythm_bands(seq_len: int, bins_per_day: int, max_harmonics: int = 4):
     the whole fix: the old rule demanded all four and gave up otherwise.
 
         HRD    T=672, 96/day -> D=7,  harmonics 7,14,21,28 of 337 -> [(1,10),(10,17),(17,24),(24,31)]
+               max_harmonics=12   -> harmonics 7,...,84 -> 12 bands, (1,10) ... (80,87)
         GLOBEM T=112,  4/day -> D=28, harmonics 28,56      of  57 -> [(1,42),(42,57)]
+
+    `max_harmonics=4` stops HRD at periods of 6 h. Daily harmonics 5-12 (periods down to 2 h:
+    how sharply sleep starts and ends, how a day is fragmented) then have no band; only what
+    the backbone's nonlinearities mix into lower bins reaches the readout. On a synthetic 3-h
+    rhythm an untrained readout decodes its amplitude at R^2 0.87 (4) vs 0.99 (12) and its
+    phase at -0.92 vs 0.90. Measured on HRD's raw windows these harmonics carry the depression
+    signal: masked per-window harmonic amplitude and phase, per-participant means, the same
+    probe and splits, pooled AUROC 0.6491 at 4 harmonics and 0.7623 at 12 (+0.087, +0.120,
+    +0.133 per repeat).
 
     Returns a single full-spectrum band only when fewer than two harmonics are resolvable,
     i.e. when the window genuinely cannot support banding.
@@ -198,12 +208,19 @@ class CoSTEncoder(nn.Module):
                  hidden_dims=64, depth=None, kernels=None, n_time_features=0,
                  seasonal_bands="harmonics", disentangle=True, mask_mode="none",
                  mask_prob=0.5, trend_causal=True, max_harmonics=4,
-                 trend_kernel_cap=None, seasonal_frac=0.5, residual_dims=0):
+                 trend_kernel_cap=None, seasonal_frac=0.5, residual_dims=0,
+                 band_readout=False):
         super().__init__()
         if depth is None:
             depth = depth_for_window(seq_len)
 
         self.seq_len, self.bins_per_day = seq_len, bins_per_day
+        # Read back by every seasonal readout (cost.spectral_readout), so the readout reports
+        # exactly the daily harmonics the bands below carry.
+        self.harmonics = int(max_harmonics)
+        # Encode-time only, like phase_readout: whether the seasonal readout keeps just each
+        # band's own dims at the harmonics inside that band (cost.band_keep). Never trained.
+        self.band_readout = bool(band_readout)
         self.n_time_features = n_time_features
         self.n_sensor_dims = input_dims - n_time_features
         self.disentangle, self.mask_mode, self.mask_prob = disentangle, mask_mode, mask_prob

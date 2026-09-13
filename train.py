@@ -36,7 +36,7 @@ from pathlib import Path
 import numpy as np
 
 import objective as O
-from cost import CoST, smooth_bins_for
+from cost import CoST, band_keep, smooth_bins_for
 from cv import make_folds, make_lodo_folds, nadeau_bengio, required_margin
 from data_loader import load_npz
 from model import CoSTEncoder, depth_for_window, receptive_field
@@ -94,9 +94,11 @@ def build_encoder(args, X, n_sensors, bins_per_day, seed):
         input_dims=X.shape[-1], output_dims=args.repr_dims, seq_len=X.shape[1],
         bins_per_day=bins_per_day, hidden_dims=args.hidden_dims, depth=args.depth,
         n_time_features=X.shape[-1] - n_sensors,
-        seasonal_bands=args.seasonal_bands, disentangle=not args.plain,
+        seasonal_bands=args.seasonal_bands, max_harmonics=args.harmonics,
+        disentangle=not args.plain,
         mask_mode=args.mask_mode, trend_kernel_cap=args.trend_kernel_cap,
-        seasonal_frac=args.seasonal_frac, residual_dims=args.residual_dims)
+        seasonal_frac=args.seasonal_frac, residual_dims=args.residual_dims,
+        band_readout=args.band_readout)
 
 
 def plan(args, arms, folds, X, n_sensors, bins_per_day, n_folds_eff=None):
@@ -105,8 +107,10 @@ def plan(args, arms, folds, X, n_sensors, bins_per_day, n_folds_eff=None):
     depth = args.depth if args.depth is not None else depth_for_window(T)
     enc = build_encoder(args, X, n_sensors, bins_per_day, seed=0)
     n_par = sum(p.numel() for p in enc.parameters())
+    keep = band_keep(enc)
     pair_start, pair_width = phase_block_layout(
-        "circular", enc.seasonal_dims, T, bins_per_day)
+        "circular", enc.seasonal_dims, T, bins_per_day, harmonics=args.harmonics,
+        block=None if keep is None else len(keep))
     nf = n_folds_eff if n_folds_eff is not None else args.folds
     return {
         "dataset": args.dataset,
@@ -118,6 +122,8 @@ def plan(args, arms, folds, X, n_sensors, bins_per_day, n_folds_eff=None):
         "receptive_field": receptive_field(depth),
         "rf_over_window": round(receptive_field(depth) / T, 3),
         "bands": [list(b) for b in enc.bands],
+        "harmonics": args.harmonics,
+        "band_readout": args.band_readout,
         "trend_kernels": enc.kernels,
         "trend_dims": enc.trend_dims,
         "seasonal_dims": enc.seasonal_dims,
@@ -178,9 +184,9 @@ def run_fold(args, weights_name, readouts, coh, fold, out_dir):
         input_dims=coh.n_features, seq_len=coh.seq_len, bins_per_day=coh.bins_per_day,
         output_dims=args.repr_dims, hidden_dims=args.hidden_dims, depth=args.depth,
         n_time_features=coh.n_features - coh.n_sensors, seasonal_bands=args.seasonal_bands,
-        disentangle=not args.plain, mask_mode=args.mask_mode,
+        harmonics=args.harmonics, disentangle=not args.plain, mask_mode=args.mask_mode,
         trend_kernel_cap=args.trend_kernel_cap, seasonal_frac=args.seasonal_frac,
-        residual_dims=args.residual_dims,
+        residual_dims=args.residual_dims, band_readout=args.band_readout,
         phase_readout=readouts[0], weights=WEIGHTS[weights_name], alpha=args.alpha,
         moco_k=args.moco_k, jitter_sigma=args.jitter_sigma, shift_sigma=args.shift_sigma,
         smooth_minutes=args.smooth_minutes, lr=args.lr, batch_size=args.batch_size,
@@ -209,11 +215,14 @@ def run_fold(args, weights_name, readouts, coh, fold, out_dir):
                                 pretrain=fd.pretrain, probe_train=fd.probe_train,
                                 probe_test=fd.probe_test)
         trend_w = reps["trend"].shape[1] if "trend" in reps else 0
+        amp_w = reps["amp"].shape[1] if "amp" in reps else None     # the width actually emitted
         rec = {"arm": arm.as_dict(), "fold": fold.as_dict(), "split": fd.summary(),
                "n_pretrain_train": int(len(tr)), "n_pretrain_val": int(len(val)),
                "iters": model.n_iters,
                "residual_dims": int(args.residual_dims),
                "w_eq": float(args.w_eq),
+               "harmonics": int(args.harmonics),
+               "band_readout": bool(args.band_readout),
                "final_top1": hist["top1"][-1] if hist["top1"] else None,
                "loss": hist,
                "repr_dims": {k: list(v.shape) for k, v in reps.items()},
@@ -221,9 +230,11 @@ def run_fold(args, weights_name, readouts, coh, fold, out_dir):
                # here rather than recomputed downstream, so the scaler can never be pointed
                # at the wrong columns.
                "pair_block_full": list(phase_block_layout(
-                   readout, model.component_dims, coh.seq_len, coh.bins_per_day, trend_w)),
+                   readout, model.component_dims, coh.seq_len, coh.bins_per_day, trend_w,
+                   args.harmonics, amp_w)),
                "pair_block_seasonal": list(phase_block_layout(
-                   readout, model.component_dims, coh.seq_len, coh.bins_per_day, 0))}
+                   readout, model.component_dims, coh.seq_len, coh.bins_per_day, 0,
+                   args.harmonics, amp_w))}
         (d / "fold.json").write_text(json.dumps(rec, indent=2), encoding="utf-8")
         recs.append(rec)
     return recs
@@ -267,6 +278,16 @@ def parse_args(argv=None):
                    help="width of the V^N branch; 0 leaves it unbuilt (archive: the residual "
                         "alone probes 0.7117 against 0.6228 for trend+seasonal together)")
     g.add_argument("--seasonal-bands", choices=["harmonics", "single"], default="harmonics")
+    g.add_argument("--harmonics", type=int, default=4,
+                   help="daily harmonics the seasonal bands, the readout and the seasonal "
+                        "objective span: 4 stops HRD at 6-h periods, 12 at 2-h. Harmonics "
+                        "above Nyquist are dropped. 4 = the previous encoder, bit-identical")
+    g.add_argument("--band-readout", action="store_true",
+                   help="read each seasonal band's dims only at the harmonics inside that "
+                        "band (see cost.band_keep). For --harmonics 12, where the other "
+                        "columns are 92%% of the readout; it costs RQ3 at 4. Encode-time only, "
+                        "like the phase readout; applied to every arm and the random-init "
+                        "controls. Off = all bins, as before")
     g.add_argument("--mask-mode", choices=["none", "binomial"], default="none")
     g.add_argument("--plain", action="store_true",
                    help="plain-SSL control: no trend/seasonal split")
@@ -317,6 +338,11 @@ def parse_args(argv=None):
         p.error("--seasonal-frac must be in [0.1, 0.9]")
     if a.w_eq < 0 or (a.w_eq and a.plain):
         p.error("--w-eq must be >= 0 and needs the disentangled encoder (not --plain)")
+    if a.band_readout and a.plain:
+        p.error("--band-readout needs the disentangled encoder (not --plain)")
+    if a.harmonics < 2:
+        p.error("--harmonics must be >= 2: below two resolvable harmonics the bands fall back "
+                "to one full-spectrum layer")
     return a
 
 

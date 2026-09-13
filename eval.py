@@ -230,7 +230,8 @@ def _blank_model(coh, plan, readout, device, seed):
     shell without the V^N branch, so loading an MAE encoder failed on strict state_dict
     keys, and every random-init control silently ran 64 columns narrower than the arm it
     controls. It defaults to 0 because plans written before the branch existed describe
-    runs that never had one.
+    runs that never had one. `harmonics` and `band_readout` likewise, defaulting to what
+    every earlier plan used (4 harmonics, all bins).
     """
     return CoST(input_dims=coh.n_features, seq_len=coh.seq_len, bins_per_day=coh.bins_per_day,
                 output_dims=plan["trend_dims"] + plan["seasonal_dims"],
@@ -239,6 +240,8 @@ def _blank_model(coh, plan, readout, device, seed):
                 trend_kernel_cap=max(plan["trend_kernels"]) if plan["trend_kernels"] else None,
                 seasonal_frac=plan["seasonal_dims"] / (plan["trend_dims"] + plan["seasonal_dims"]),
                 residual_dims=plan.get("residual_dims", 0),
+                harmonics=plan.get("harmonics", 4),
+                band_readout=plan.get("band_readout", False),
                 phase_readout=readout, device=device, model_seed=seed)
 
 
@@ -929,7 +932,9 @@ def block_encoder(model, X, pids, bins_per_day, batch_size=64):
         at = [int(round(q * (z.size(1) - 1))) for q in ENC_QUANTILES]
         qs = z.sort(dim=1).values[:, at]                         # (B, quantiles, channels)
         stats.append(torch.cat([qs.reshape(len(z), -1), (z > 0).float().mean(1)], -1).cpu())
-        _, ang = spectral_readout(s, bins_per_day, "angle")
+        # All bins on purpose, whatever the run's readout: the [:, 1:3] below indexes the
+        # 24 h and 12 h bins across every dim.
+        _, ang = spectral_readout(s, bins_per_day, "angle", net.harmonics)
         phase.append(ang.reshape(len(s), -1, s.size(-1))[:, 1:3].reshape(len(s), -1).cpu())
     S, P = torch.cat(stats).numpy(), torch.cat(phase).numpy().astype(np.float64)
     pu, rows = np.unique(pids), []
@@ -1418,6 +1423,12 @@ def report(plan, per_fold, nf, nr):
       f"({plan['rf_over_window']}x window), bands {plan['bands']},")
     A(f"           trend kernels {plan['trend_kernels']}, V^T {plan['trend_dims']} / "
       f"V^S {plan['seasonal_dims']}, {plan['n_params']:,} params.")
+    if plan.get("harmonics", 4) != 4:
+        A(f"Readout    seasonal bands and readout to {plan['harmonics']} harmonics per day; "
+          f"the untrained controls share the geometry.")
+    if plan.get("band_readout"):
+        A("Readout    band-matched: each band's dims are read only at the harmonics inside "
+          "that band, for every arm and control.")
     if plan.get("w_eq"):
         A(f"Objective  contrastive + level equivariance on the trend branch "
           f"(w_eq={plan['w_eq']:g}); the untrained controls are unchanged.")

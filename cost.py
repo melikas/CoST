@@ -38,9 +38,10 @@ from torch.utils.data import DataLoader, Dataset
 
 import objective as O
 from model import CoSTEncoder
+from probe import spectral_freqs
 
 __all__ = ["PretrainDataset", "CoSTModel", "CoST", "WindowClassifier", "finetune",
-           "predict_windows", "spectral_readout", "readout_width",
+           "predict_windows", "spectral_readout", "band_keep", "readout_width",
            "smooth_bins_for"]
 
 
@@ -145,36 +146,69 @@ class PretrainDataset(Dataset):
 
 
 # --------------------------------------------------------------------------------------
-def spectral_readout(z, bins_per_day, phase_readout, eps=1e-6):
+def band_keep(net):
+    """Flat (bin, dim) indices the band-matched readout keeps, or None to keep every column.
+
+    Each BandedFourierLayer owns its own dims and emits only its own bins, so at a harmonic
+    the dims of every OTHER band carry only what the per-timestep normalisation before the
+    rFFT mixes in: measured on HRD, 54x (4 harmonics) to 88x (12) below the owning band's
+    amplitude. They are ~75% of the all-bins readout at 4 harmonics and ~92% at 12.
+    Untrained encoder, same probe as the harmonic gate:
+
+        harmonics   all bins    band-matched      RQ1 MESOR R^2 (eval ridge), all -> band
+        4           0.6370      0.5597            0.992 -> 0.999
+        12          0.6974      0.7420            0.034 -> 0.999
+
+    So the mixed-in columns are not noise -- at 4 harmonics they carry cross-band structure
+    the few wide bands cannot -- but at 12 they are 92% of the readout and cost both RQ1 and
+    RQ3. Use it with 12 harmonics, not 4. Ordered bin-major, as the readout flattens.
+    """
+    if not getattr(net, "band_readout", False):
+        return None
+    d = net.seasonal_dims
+    widths = [layer.out_channels for layer in net.sfd]
+    starts = np.cumsum([0] + widths[:-1])
+    idx = [i * d + int(s) + j
+           for i, f in enumerate(spectral_freqs(net.seq_len, net.bins_per_day, net.harmonics))
+           for (lo, hi), s, w in zip(net.bands, starts, widths) if lo <= f < hi
+           for j in range(w)]
+    return torch.as_tensor(idx, dtype=torch.long)
+
+
+def spectral_readout(z, bins_per_day, phase_readout, harmonics=4, keep=None, eps=1e-6):
     """Frequency-domain readout of the seasonal branch -- (amplitude, phase) blocks.
 
     Shared by the frozen path and the fine-tuning head so both read the representation the
     SAME way. Every operation is differentiable, which is what lets a classification head
     train through it: rfft, and a sqrt whose argument is kept strictly positive by `eps` so
-    its gradient stays finite at the origin.
+    its gradient stays finite at the origin. `harmonics` is the encoder's own
+    (`CoSTEncoder.harmonics`), so the readout reports every daily harmonic the bands carry;
+    `keep` (from `band_keep`) restricts each block to the band-matched columns.
     """
-    T = z.size(1)
-    D = max(1, T // int(bins_per_day))
-    f = [i for i in (1, D, 2 * D, 3 * D, 4 * D) if 0 < i <= T // 2]
+    f = spectral_freqs(z.size(1), bins_per_day, harmonics)
     Z = fft.rfft(F.normalize(z.float(), dim=-1), dim=1)[:, f]
     amp = torch.sqrt((Z.real + eps).pow(2) + (Z.imag + eps).pow(2))
     ang = torch.atan2(Z.imag, Z.real + eps)
     pha = (torch.cos(ang), torch.sin(ang)) if phase_readout == "circular" else (ang,)
-    flat = lambda p: p.reshape(p.size(0), -1)
+
+    def flat(p):
+        p = p.reshape(p.size(0), -1)
+        return p if keep is None else p[:, keep.to(p.device)]
+
     return flat(amp), torch.cat([flat(p) for p in pha], dim=-1)
 
 
 def readout_width(seq_len, bins_per_day, phase_readout, trend_dims, seasonal_dims,
-                  residual_dims=0):
+                  residual_dims=0, harmonics=4, n_kept=None):
     """Width of [trend | amp | phase | resid] -- what the classification head receives.
 
     `residual_dims` defaults to 0, so every arm without the V^N branch keeps exactly the
-    width it had before that branch existed.
+    width it had before that branch existed. `n_kept` is len(band_keep(net)) under the
+    band-matched readout, the columns each seasonal block keeps.
     """
-    D = max(1, seq_len // int(bins_per_day))
-    nf = len([i for i in (1, D, 2 * D, 3 * D, 4 * D) if 0 < i <= seq_len // 2])
-    return (trend_dims + nf * seasonal_dims * (1 + (2 if phase_readout == "circular" else 1))
-            + residual_dims)
+    per = (n_kept if n_kept is not None
+           else len(spectral_freqs(seq_len, bins_per_day, harmonics)) * seasonal_dims)
+    return trend_dims + per * (1 + (2 if phase_readout == "circular" else 1)) + residual_dims
 
 
 class CoSTModel(nn.Module):
@@ -295,9 +329,9 @@ class CoST:
     """Fit the encoder, then read frozen representations out of it."""
 
     def __init__(self, input_dims, seq_len, bins_per_day, *, output_dims=320, hidden_dims=64,
-                 depth=None, n_time_features=0, seasonal_bands="harmonics", disentangle=True,
-                 mask_mode="none", trend_kernel_cap=None, seasonal_frac=0.5,
-                 residual_dims=0,
+                 depth=None, n_time_features=0, seasonal_bands="harmonics", harmonics=4,
+                 disentangle=True, mask_mode="none", trend_kernel_cap=None, seasonal_frac=0.5,
+                 residual_dims=0, band_readout=False,
                  phase_readout="circular", phase_mode="circular_amp", trend_pool="random",
                  weights: O.TermWeights = O.PAPER, alpha=0.005, moco_k=4096,
                  jitter_sigma=0.1, shift_sigma=0.5, smooth_minutes=75.0, w_eq=0.0,
@@ -307,6 +341,8 @@ class CoST:
             raise ValueError(f"phase_readout must be 'angle' or 'circular', got {phase_readout!r}")
         if w_eq and not disentangle:
             raise ValueError("w_eq needs the disentangled encoder: it acts on the trend branch")
+        if band_readout and not disentangle:
+            raise ValueError("band_readout needs the disentangled encoder: it reads the bands")
         if model_seed is not None:
             torch.manual_seed(model_seed)
             np.random.seed(model_seed % (2 ** 31))
@@ -324,10 +360,11 @@ class CoST:
         enc = dict(input_dims=input_dims, output_dims=output_dims, seq_len=seq_len,
                    bins_per_day=bins_per_day, hidden_dims=hidden_dims, depth=depth,
                    n_time_features=n_time_features, seasonal_bands=seasonal_bands,
-                   disentangle=disentangle, mask_mode=mask_mode,
+                   max_harmonics=harmonics, disentangle=disentangle, mask_mode=mask_mode,
                    trend_kernel_cap=trend_kernel_cap, seasonal_frac=seasonal_frac,
-                   residual_dims=residual_dims)
+                   residual_dims=residual_dims, band_readout=band_readout)
         self.net = CoSTEncoder(**enc).to(device)
+        self._keep = band_keep(self.net)
         self.component_dims = self.net.seasonal_dims if disentangle else output_dims
 
         encoder_k = CoSTEncoder(**enc).to(device)
@@ -423,7 +460,8 @@ class CoST:
         angles. probe.IsotropicPairScaler is what keeps the (cos, sin) pair from being
         sheared by per-column standardisation downstream.
         """
-        return spectral_readout(z, self.bins_per_day, self.phase_readout)
+        return spectral_readout(z, self.bins_per_day, self.phase_readout, self.net.harmonics,
+                                self._keep)
 
     @torch.no_grad()
     def encode(self, data, batch_size=256, pool="mean", parts=False):
@@ -512,8 +550,10 @@ class WindowClassifier(nn.Module):
         super().__init__()
         self.encoder = encoder
         self.bins_per_day, self.phase_readout = bins_per_day, phase_readout
-        w = readout_width(seq_len, bins_per_day, phase_readout,
-                          encoder.trend_dims, encoder.seasonal_dims, encoder.residual_dims)
+        self.keep = band_keep(encoder)
+        w = readout_width(seq_len, bins_per_day, phase_readout, encoder.trend_dims,
+                          encoder.seasonal_dims, encoder.residual_dims, encoder.harmonics,
+                          None if self.keep is None else len(self.keep))
         self.norm = nn.LayerNorm(w)
         self.drop = nn.Dropout(dropout)
         self.head = nn.Linear(w, 1)
@@ -523,7 +563,8 @@ class WindowClassifier(nn.Module):
         if s is None:
             feat = t.mean(dim=1)
         else:
-            amp, pha = spectral_readout(s, self.bins_per_day, self.phase_readout)
+            amp, pha = spectral_readout(s, self.bins_per_day, self.phase_readout,
+                                        self.encoder.harmonics, self.keep)
             feat = torch.cat([t.mean(dim=1), amp, pha], dim=-1)
             if r is not None:
                 feat = torch.cat([feat, r.mean(dim=1)], dim=-1)
