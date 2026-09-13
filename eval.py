@@ -499,7 +499,7 @@ def selection_split(y, groups, seed, frac=0.25):
 
 
 def fit_probe(Xtr, ytr, seed, families=PROBE_FAMILIES, groups=None,
-              pair_start=None, pair_width=0, cs=PROBE_C):
+              pair_start=None, pair_width=0):
     """Fit a probe, selecting the FAMILY and its penalty on the training rows only.
 
     PHASE 0. The family used to be hard-coded per arm: `RF on raw` was the only rung ever
@@ -510,13 +510,12 @@ def fit_probe(Xtr, ytr, seed, families=PROBE_FAMILIES, groups=None,
 
     The forest gets its own, shorter grid: `C` maps to min_samples_leaf, where the linear
     grid's 0.001 would mean a leaf of 1000 rows -- a stump on these cohorts -- and each
-    forest fit is far more expensive than a logistic one. `cs` is the logistic grid: the
-    ladder keeps PROBE_C, the primary linear protocol passes LINEAR_C.
+    forest fit is far more expensive than a logistic one.
     """
     fit_m, sel_m = selection_split(ytr, groups, seed)
-    best, choice = -np.inf, (families[0], cs[0])
+    best, choice = -np.inf, (families[0], PROBE_C[0])
     for fam in families:
-        for c in (PROBE_C_FOREST if fam == "forest" else cs):
+        for c in (PROBE_C_FOREST if fam == "forest" else PROBE_C):
             try:
                 pr = make_probe(fam, c, seed, pair_start=pair_start, pair_width=pair_width)
                 pr.fit(Xtr[fit_m], ytr[fit_m])
@@ -739,12 +738,6 @@ def probe_auc(Xtr, ytr, Xte, pids_te, y_te_w, seed, groups=None,
 
 LINEAR = " [linear]"          # suffix of the primary-protocol rungs
 LINEAR_THRESHOLD = 0.5        # the class-balanced probe's own decision; nothing is tuned
-# The primary probe's penalty grid must contain its own optimum. The probe is fitted on
-# windows that all carry their participant's label, so it memorises training participants
-# (inner-fit balanced accuracy 1.0000 at C = 1) and the participant-disjoint inner split keeps
-# preferring more shrinkage. On PROBE_C that optimum was the floor, 0.001, in 86/90 fits, and
-# on training participants alone it lies below the floor in 10/10 folds (1e-5 or 1e-4).
-LINEAR_C = (1e-6, 1e-5, 1e-4, 1e-3, 1e-2, 1e-1, 1.0)
 
 
 def probe_linear(Xtr, ytr, Xte, pids_te, y_te_w, seed, groups=None,
@@ -765,7 +758,7 @@ def probe_linear(Xtr, ytr, Xte, pids_te, y_te_w, seed, groups=None,
     macro-F1 involve no tuned threshold.
     """
     pr, best_c = fit_probe(Xtr, ytr, seed, families=("supervised",), groups=groups,
-                           pair_start=pair_start, pair_width=pair_width, cs=LINEAR_C)
+                           pair_start=pair_start, pair_width=pair_width)
     pu, sc, ys = participant_scores(pr.predict_proba(Xte)[:, 1], pids_te, y_te_w)
     pred = (sc >= LINEAR_THRESHOLD).astype(int)
     return {"auc": float(roc_auc_score(ys, sc)) if len(np.unique(ys)) > 1 else float("nan"),
