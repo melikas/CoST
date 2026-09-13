@@ -49,7 +49,7 @@ import numpy as np
 import pandas as pd
 import torch
 from scipy.optimize import nnls
-from scipy.stats import rankdata
+from scipy.stats import norm, rankdata
 from sklearn.decomposition import PCA
 from sklearn.linear_model import RidgeCV
 from sklearn.metrics import f1_score, roc_auc_score
@@ -499,7 +499,7 @@ def selection_split(y, groups, seed, frac=0.25):
 
 
 def fit_probe(Xtr, ytr, seed, families=PROBE_FAMILIES, groups=None,
-              pair_start=None, pair_width=0):
+              pair_start=None, pair_width=0, cs=PROBE_C):
     """Fit a probe, selecting the FAMILY and its penalty on the training rows only.
 
     PHASE 0. The family used to be hard-coded per arm: `RF on raw` was the only rung ever
@@ -510,12 +510,13 @@ def fit_probe(Xtr, ytr, seed, families=PROBE_FAMILIES, groups=None,
 
     The forest gets its own, shorter grid: `C` maps to min_samples_leaf, where the linear
     grid's 0.001 would mean a leaf of 1000 rows -- a stump on these cohorts -- and each
-    forest fit is far more expensive than a logistic one.
+    forest fit is far more expensive than a logistic one. `cs` is the logistic grid: the
+    ladder keeps PROBE_C, the primary linear protocol passes LINEAR_C.
     """
     fit_m, sel_m = selection_split(ytr, groups, seed)
-    best, choice = -np.inf, (families[0], PROBE_C[0])
+    best, choice = -np.inf, (families[0], cs[0])
     for fam in families:
-        for c in (PROBE_C_FOREST if fam == "forest" else PROBE_C):
+        for c in (PROBE_C_FOREST if fam == "forest" else cs):
             try:
                 pr = make_probe(fam, c, seed, pair_start=pair_start, pair_width=pair_width)
                 pr.fit(Xtr[fit_m], ytr[fit_m])
@@ -738,6 +739,12 @@ def probe_auc(Xtr, ytr, Xte, pids_te, y_te_w, seed, groups=None,
 
 LINEAR = " [linear]"          # suffix of the primary-protocol rungs
 LINEAR_THRESHOLD = 0.5        # the class-balanced probe's own decision; nothing is tuned
+# The primary probe's penalty grid must contain its own optimum. The probe is fitted on
+# windows that all carry their participant's label, so it memorises training participants
+# (inner-fit balanced accuracy 1.0000 at C = 1) and the participant-disjoint inner split keeps
+# preferring more shrinkage. On PROBE_C that optimum was the floor, 0.001, in 86/90 fits, and
+# on training participants alone it lies below the floor in 10/10 folds (1e-5 or 1e-4).
+LINEAR_C = (1e-6, 1e-5, 1e-4, 1e-3, 1e-2, 1e-1, 1.0)
 
 
 def probe_linear(Xtr, ytr, Xte, pids_te, y_te_w, seed, groups=None,
@@ -758,7 +765,7 @@ def probe_linear(Xtr, ytr, Xte, pids_te, y_te_w, seed, groups=None,
     macro-F1 involve no tuned threshold.
     """
     pr, best_c = fit_probe(Xtr, ytr, seed, families=("supervised",), groups=groups,
-                           pair_start=pair_start, pair_width=pair_width)
+                           pair_start=pair_start, pair_width=pair_width, cs=LINEAR_C)
     pu, sc, ys = participant_scores(pr.predict_proba(Xte)[:, 1], pids_te, y_te_w)
     pred = (sc >= LINEAR_THRESHOLD).astype(int)
     return {"auc": float(roc_auc_score(ys, sc)) if len(np.unique(ys)) > 1 else float("nan"),
@@ -1634,14 +1641,17 @@ def linear_report(per_fold):
             d = [delong_test(scores[r][g][0], scores[r][g][1], scores[r][ref][1]) for r in reps]
             md, mse = np.mean([x["diff"] for x in d]), np.mean([x["se"] for x in d])
             rows.append([name(g), f"vs {name(ref)}", _fmt(md), _ci(md, 1.96 * mse),
+                         f"{2 * norm.sf(abs(md / mse)):.4f}" if mse > 0 else "-",
                          " ".join(f"{x['z']:+.2f}" for x in d),
+                         " ".join(f"{x['p']:.3f}" for x in d),
                          _fmt(np.mean(bac[g]) - np.mean(bac[ref])),
                          _fmt(np.mean(f1[g]) - np.mean(f1[ref]))])
     if rows:
-        L += ["Paired on the same participants: DeLong's test on ROC-AUC; balanced accuracy and",
-              "macro-F1 as mean differences over repeats.\n",
-              _table(rows, ["arm", "against", "diff ROC-AUC", "95% CI", "z per repeat",
-                            "diff bal. acc", "diff macro-F1"])]
+        L += ["Paired on the same participants: DeLong's test on ROC-AUC, per repeat; the",
+              "combined p is 2 * Phi(-|mean diff / mean SE|), the convention of the 95% CI.",
+              "Balanced accuracy and macro-F1 as mean differences over repeats.\n",
+              _table(rows, ["arm", "against", "diff ROC-AUC", "95% CI", "p", "z per repeat",
+                            "p per repeat", "diff bal. acc", "diff macro-F1"])]
     return "\n".join(L) + "\n"
 
 
