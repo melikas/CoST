@@ -216,7 +216,8 @@ class CoSTModel(nn.Module):
 
     def __init__(self, encoder_q, encoder_k, *, dim=128, alpha=0.005, K=4096, m=0.999,
                  T=0.07, disentangle=True, phase_mode="circular_amp", trend_pool="random",
-                 weights: O.TermWeights = O.PAPER, w_eq=0.0, eq_dims=0, device="cuda"):
+                 weights: O.TermWeights = O.PAPER, w_eq=0.0, eq_dims=0, w_ac=0.0,
+                 ac_gamma=0.7114, ac_queue=512, device="cuda"):
         super().__init__()
         if trend_pool not in ("random", "mean"):
             raise ValueError(f"trend_pool must be 'random' or 'mean', got {trend_pool!r}")
@@ -242,6 +243,19 @@ class CoSTModel(nn.Module):
         # offsets -- an equivariance for the additive group, not a regression on level.
         self.w_eq = w_eq
         self.head_eq = nn.Linear(dim, eq_dims, bias=False) if w_eq > 0 else None
+        # Anti-collapse on the seasonal readout's log amplitudes (objective.anticollapse_loss).
+        # No parameters and no random numbers, so w_ac=0 stays bit-identical. `_ac_mem` holds
+        # detached rows of recent batches: one batch of 64 cannot estimate a full-rank
+        # covariance of 160 channels.
+        self.w_ac, self.ac_gamma, self.ac_queue = w_ac, ac_gamma, int(ac_queue)
+        self._ac_mem = None
+
+    def _log_readout_amp(self, z):
+        """Log amplitude at every readout bin, B x bins x channels: exactly the columns
+        spectral_readout emits, so the constraint acts on the vector the probes read."""
+        e = self.encoder_q
+        amp, _ = spectral_readout(z, e.bins_per_day, "angle", e.harmonics)
+        return amp.view(amp.size(0), -1, e.seasonal_dims).log()
 
     # -- MoCo state -------------------------------------------------------------------
     @torch.no_grad()
@@ -313,6 +327,16 @@ class CoSTModel(nn.Module):
                 raise ValueError("w_eq > 0 but the batch carries no level offsets")
             total = total + self.w_eq * O.equivariance_loss(
                 self.head_eq(q_level - k_tq.mean(dim=1)), delta)
+        if self.w_ac > 0:
+            # The queue holds training-mode rows (dropout on); scoring eval-mode rows against
+            # them mixes two shifted distributions and inflates the covariance term. The
+            # validation monitor therefore uses its own rows only.
+            cur = torch.cat([self._log_readout_amp(q_s), self._log_readout_amp(k_s)], dim=0)
+            total = total + self.w_ac * O.anticollapse_loss(
+                cur, self._ac_mem if self.training else None, self.ac_gamma)
+            if update:
+                mem = cur.detach() if self._ac_mem is None else torch.cat([cur.detach(), self._ac_mem])
+                self._ac_mem = mem[:self.ac_queue]
         return (total, trend, amp + pha) if return_parts else total
 
 
@@ -335,12 +359,15 @@ class CoST:
                  phase_readout="circular", phase_mode="circular_amp", trend_pool="random",
                  weights: O.TermWeights = O.PAPER, alpha=0.005, moco_k=4096,
                  jitter_sigma=0.1, shift_sigma=0.5, smooth_minutes=75.0, w_eq=0.0,
+                 w_ac=0.0, ac_gamma=0.7114, ac_queue=512,
                  lr=5e-4, batch_size=64, max_train_length=None, device="cuda",
                  model_seed=None):
         if phase_readout not in ("angle", "circular"):
             raise ValueError(f"phase_readout must be 'angle' or 'circular', got {phase_readout!r}")
         if w_eq and not disentangle:
             raise ValueError("w_eq needs the disentangled encoder: it acts on the trend branch")
+        if w_ac and not disentangle:
+            raise ValueError("w_ac needs the disentangled encoder: it acts on the seasonal readout")
         if band_readout and not disentangle:
             raise ValueError("band_readout needs the disentangled encoder: it reads the bands")
         if model_seed is not None:
@@ -372,7 +399,7 @@ class CoST:
             self.net, encoder_k, dim=(self.net.trend_dims if disentangle else output_dims),
             alpha=alpha, K=moco_k, disentangle=disentangle, phase_mode=phase_mode,
             trend_pool=trend_pool, weights=weights, w_eq=w_eq, eq_dims=input_dims,
-            device=device).to(device)
+            w_ac=w_ac, ac_gamma=ac_gamma, ac_queue=ac_queue, device=device).to(device)
         self.n_iters = 0
 
     # -- training ---------------------------------------------------------------------

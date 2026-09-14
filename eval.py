@@ -1673,6 +1673,9 @@ def report(plan, per_fold, nf, nr):
     if plan.get("w_eq"):
         A(f"Objective  contrastive + level equivariance on the trend branch "
           f"(w_eq={plan['w_eq']:g}); the untrained controls are unchanged.")
+    if plan.get("w_ac"):
+        A(f"Objective  + anti-collapse on the seasonal readout's log amplitudes "
+          f"(w_ac={plan['w_ac']:g}, variance floor {plan.get('ac_gamma', 0.7114):g}).")
     if plan.get("w_supcon"):
         A(f"Objective  contrastive + supervised-contrastive (w={plan['w_supcon']:g}), "
           f"training-fold labels only.")

@@ -6207,5 +6207,92 @@ RELATED SWEEPS SINCE THE RESET (full reports in final_results.txt and the run di
 
 
 ====================================================================================================
+13. RQ3 PRIMARY PROTOCOL, AUDITS AND THE AMPLITUDE PATHOLOGY -- 2026-09-13/14
+====================================================================================================
+
+All on results_eq_h (angle_contracted, K=4, w_eq=1), 10 folds x 3 repeats, 114 labelled
+participants per repeat. Every family below was pre-registered before scoring (files named in
+brackets live in the session scratchpad). "RI" = the fold's untrained encoder.
+
+13.1  RQ3 PRIMARY = STANDARD FROZEN LINEAR PROBE (2002200)             (2026-09-13)
+    Logistic regression only, C in 0.001..1 on a participant-disjoint inner split, participant
+    score = mean window probability, decision p >= 0.5. Narval record:
+        Random-init  ROC-AUC 0.7159 (0.7118 0.7305 0.7053)  BAcc 0.6522  MF1 0.6507
+        DSSL         ROC-AUC 0.6993 (0.6973 0.7252 0.6756)  BAcc 0.6436  MF1 0.6423
+        Raw window   ROC-AUC 0.6944 (0.6942 0.6998 0.6892)  BAcc 0.6474  MF1 0.6471
+        DSSL - RI   -0.0165 [-0.0490, +0.0159]  p 0.318      DSSL - Raw  +0.0050  p 0.847
+    Repeat 0 was later overwritten by the 62e9ba2 grid (eval_array ran on the old eval.py);
+    re-scored with bc08577, extended-grid probe_C count 0, table restored exactly.
+
+13.2  PROBE AUDIT AND THE EXTENDED C GRID                               (2026-09-13)
+    The window-level probe memorises training participants (inner-fit BAcc 1.0000 at C=1);
+    the inner optimum lay below the grid in 10/10 folds. Pre-registered grid 1e-6..1 (62e9ba2),
+    30 folds: DSSL 0.6869, RI 0.7034, Raw 0.6780 -- all three fell; DSSL - RI -0.0164, p 0.45.
+    Reverted in bc08577.
+
+13.3  WHERE THE TRAINED REPRESENTATION DIFFERS                          (2026-09-13/14)
+    Variance (repeat 0, non-test participants): amplitude-block median ICC DSSL 0.3252 vs RI
+    0.1319 vs raw 0.1309; features with |t| > 3: 86.4 vs 163.2 vs 162.4.
+    Neighbour graph (k = 10, cross-person depression agreement, null ~0.499): raw spectrum
+    0.5530, raw window 0.5594, RI 0.5613, DSSL 0.5599; same-person share 0.2411 / 0.1681 /
+    0.2178 / 0.2502.
+    Dimensional collapse (effective rank, standardised correlation spectrum): whole readout
+    DSSL 213.1 vs RI 388.6 vs raw 392.1; amplitude block 42.4 vs 155.3; phase 416.6 vs 432.5.
+    Localised with scripts/backbone_rank.py (Narval, r0f0, 600 non-test windows):
+        TCN output 5.4 vs 5.0 | seasonal z_s 58.9 vs 72.1 | amp readout 32.3 vs 115.5 |
+        amp at 24 h 16.7 vs 49.1.  Per bin: 24 h band weight rank 29.1 vs 37.6, 24 h band
+        amplitude |Y_7| 1.6 vs 5.7; own-band rank rises x1.5-3.5 at the other bins; all-column
+        readout rank x0.34-0.46 at every bin.
+    Readout energy: the 24 h bin holds ~99% of the trained readout's energy (222,991 vs 92,902
+    untrained; 12 h 10.9 vs 29,966). The per-timestep L2 normalisation (upstream CoST, in both
+    the loss and the readout) is a shared energy budget, so the other bands are starved.
+    Upstream weights (results_oneshot angle_paper, 1/0.5/0.5): amp readout x0.43 vs x0.28 for
+    contracted, but RQ3 unchanged (window 0.6842 vs 0.6858).
+    Covariance audit: the LDA direction's split-half cosine is 0.047 / 0.031 / 0.031 (raw / RI /
+    DSSL) -- whitening is fragile for every representation, not only the encoders.
+
+13.4  PRE-REGISTERED READOUT FAMILIES ON THE STORED REPRESENTATIONS  -- NO WIN   (2026-09-13/14)
+    ROC-AUC, DSSL vs RI vs Raw; DeLong per repeat, Holm within each family.
+    Participant level [PREREG_agg_family.md]:
+        F1 mean/SD/volatility 0.6921 vs 0.6946 vs 0.6691 | F2 PCA-16 covariance/drift 0.5511
+        vs 0.6354 vs 0.6670 | F3 top-100 |t| 0.6755 vs 0.7168 vs 0.6622
+    Subject-adapted [PREREG_readout_family.md]:
+        P1 per-subject z-score 0.5000 for all three (centring removes the trait) | P1b scale
+        only 0.6349 vs 0.6721 vs 0.5969 | G nuisance-attribute projection 0.6338 vs 0.6392 vs
+        0.6964 | M1 nearest centroid 0.7016 vs 0.7240 vs 0.7002 | M2 shrinkage LDA 0.6331 vs
+        0.6442 vs 0.7265 (DSSL - Raw -0.0935, p 0.047, Holm 0.47)
+    Phase-amplitude hybrid [PREREG_hybrid.md], [own-band phase cos/sin | raw window]:
+        J1 LDA 0.7095 vs [RI phase | raw] 0.7016 vs raw alone 0.7265
+        J2 whitened raw + LR 0.6608 vs 0.6463 vs raw alone 0.7343 (0.7184 0.7329 0.7516)
+        -- the highest ROC-AUC on these folds, with no encoder
+    RQ2 -> RQ3 bridge on Narval [PREREG_rq3_bridge.md]:
+        T1 within-person emotional-energy concordance C_mood: DSSL 0.5178, RI 0.5198, Raw
+           0.5066; DSSL - RI -0.0020 [-0.0232, +0.0193], 14/30
+        T2 circular readout: DSSL 0.7034 vs RI (circular) 0.7077, p 0.789; vs Raw p 0.688
+
+13.5  RQ2 AMPLITUDE ARM (PAIRED +/- ALPHA), NARVAL                       (2026-09-14)
+    alpha in {0.05, 0.1, 0.2, 0.3, 0.5}; 24 h component scaled by 1 - alpha and 1 + alpha.
+        DSSL C_amp 0.4065 | RI 0.4480 | random projection (512) 0.4182
+        DSSL - RI -0.0415 [-0.0638, -0.0192], 1/30, LOSS.
+    Calibration without an encoder: null 0.5000, raw 24 h rhythm 0.8297, raw projection 0.4130.
+    RQ2 phase is unchanged: 0.8876 vs 0.8614, +0.0262 [+0.0072, +0.0452], 26/30, WIN.
+
+13.6  CODE IN THIS COMMIT (NOT YET TRAINED)                              (2026-09-14)
+    --w-ac: VICReg variance (mu 25) + covariance (nu 1) terms on the seasonal readout's log
+    amplitudes at the 5 readout bins, both views, statistics over the batch plus a 512-row
+    detached queue (training mode only); gamma 0.7114 = the untrained encoder's median
+    log-amplitude SD on r0f0. Verified: bit-identical to 16b9507 at --w-ac 0 (58 encoder
+    tensors, representations and loss history, r0f0, 20 iterations); a 20-iteration smoke run
+    at --w-ac 1 is finite (train loss 4.32 / 4.86 vs 2.08 / 2.25 without the term). NOT yet
+    verified: the unit tests (test_ac.py) and the smoke rerun after the validation-monitor fix
+    were stopped before finishing.
+    Pre-registered Stage 0 [PREREG_ac_stage0.md]: train r0f0 with --w-ac 1; gate = amplitude
+    readout effective rank >= 150 (all non-test windows) AND RQ2 phase C >= 0.88; otherwise
+    stop without re-tuning. Not run.
+    scripts/backbone_rank.py: stage-wise and per-bin effective rank of a trained encoder vs its
+    untrained control (the diagnostic behind 13.3).
+    Abandoned, never committed: --w-amp-eq (24 h amplitude equivariance).
+
+====================================================================================================
 END OF ARCHIVE
 ====================================================================================================

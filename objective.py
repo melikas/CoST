@@ -2,6 +2,7 @@
 seasonal term split into amplitude and phase and each term separately weighted.
 
     L  =  w_trend * L_trend  +  alpha * ( w_amp * L_amp  +  w_phase * L_phase )  [+ w_eq * L_eq]
+                                                                              [+ w_ac * L_ac]
 
 Upstream fixes w_trend = 1 and w_amp = w_phase = 1/2. Making the three weights explicit
 is the only structural change here, and it is what lets the objective be contracted onto
@@ -44,7 +45,7 @@ from torch import fft
 
 __all__ = ["TermWeights", "PAPER", "CONTRACTED", "convert_coeff", "circular_phase",
            "instance_contrastive_loss", "moco_ce_loss", "seasonal_loss", "total_loss",
-           "equivariance_loss"]
+           "equivariance_loss", "anticollapse_loss"]
 
 
 @dataclass(frozen=True)
@@ -182,6 +183,27 @@ def equivariance_loss(pred, delta):
     so at the optimum level is a linear direction of the trend readout.
     """
     return F.mse_loss(pred, delta)
+
+
+def anticollapse_loss(cur, mem, gamma: float, mu: float = 25.0, nu: float = 1.0,
+                      eps: float = 1e-4):
+    """VICReg variance and covariance terms (Bardes, Ponce & LeCun, ICLR 2022) on the seasonal
+    readout's LOG amplitudes, one frequency bin at a time.
+
+    `cur` is B x F x C with gradient, `mem` M x F x C detached rows from earlier batches (or
+    None). Statistics are taken over both, because one batch of 64 cannot estimate a full-rank
+    covariance of 160 channels; only `cur` carries gradient. Per bin: every channel's standard
+    deviation across windows is held above `gamma` (the variance floor), and the channels are
+    decorrelated (the covariance term) -- which is what the readout's effective rank measures.
+    The loss depends on |Z| only, so its gradient with respect to every phase is exactly zero.
+    """
+    x = cur if mem is None or len(mem) == 0 else torch.cat([cur, mem], dim=0)
+    x = x - x.mean(dim=0, keepdim=True)
+    n, _, c = x.shape
+    var = F.relu(gamma - torch.sqrt(x.var(dim=0) + eps)).mean()
+    cov = torch.einsum("nfc,nfd->fcd", x, x) / (n - 1)
+    off = cov - torch.diag_embed(torch.diagonal(cov, dim1=1, dim2=2))
+    return mu * var + nu * off.pow(2).sum(dim=(1, 2)).div(c).mean()
 
 
 def total_loss(trend_term, amp_term, phase_term, weights: TermWeights, alpha: float):

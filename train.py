@@ -133,6 +133,8 @@ def plan(args, arms, folds, X, n_sensors, bins_per_day, n_folds_eff=None):
         "smooth_bins": smooth_bins_for(args.smooth_minutes, bins_per_day),
         "residual_dims": enc.residual_dims,
         "w_eq": args.w_eq,
+        "w_ac": args.w_ac,
+        "ac_gamma": args.ac_gamma,
         "n_params": n_par,
         "circular_pair_block": [pair_start, pair_width],
         "arms": [a.as_dict() for a in arms],
@@ -190,7 +192,8 @@ def run_fold(args, weights_name, readouts, coh, fold, out_dir):
         phase_readout=readouts[0], weights=WEIGHTS[weights_name], alpha=args.alpha,
         moco_k=args.moco_k, jitter_sigma=args.jitter_sigma, shift_sigma=args.shift_sigma,
         smooth_minutes=args.smooth_minutes, lr=args.lr, batch_size=args.batch_size,
-        w_eq=args.w_eq, device=args.device, model_seed=fold.model_seed)
+        w_eq=args.w_eq, w_ac=args.w_ac, ac_gamma=args.ac_gamma, ac_queue=args.ac_queue,
+        device=args.device, model_seed=fold.model_seed)
 
     hist = model.fit(tr, n_iters=args.iters, val_data=val if len(val) else None,
                      log_every=args.log_every, verbose=args.verbose)
@@ -221,6 +224,7 @@ def run_fold(args, weights_name, readouts, coh, fold, out_dir):
                "iters": model.n_iters,
                "residual_dims": int(args.residual_dims),
                "w_eq": float(args.w_eq),
+               "w_ac": float(args.w_ac),
                "harmonics": int(args.harmonics),
                "band_readout": bool(args.band_readout),
                "final_top1": hist["top1"][-1] if hist["top1"] else None,
@@ -305,6 +309,15 @@ def parse_args(argv=None):
                         "the per-channel offset `shift` put between the two views instead of "
                         "being trained invariant to it. 0 = the contrastive objective, "
                         "bit-identical to before")
+    g.add_argument("--w-ac", type=float, default=0.0,
+                   help="weight of the anti-collapse term: VICReg variance and covariance "
+                        "terms on the seasonal readout's log amplitudes at every readout bin. "
+                        "0 = off, bit-identical to before")
+    g.add_argument("--ac-gamma", type=float, default=0.7114,
+                   help="variance floor on each log-amplitude channel's SD across windows; "
+                        "0.7114 is the untrained encoder's median on HRD r0f0")
+    g.add_argument("--ac-queue", type=int, default=512,
+                   help="detached rows of recent batches added to the covariance estimate")
     g.add_argument("--smooth-minutes", type=float, default=75.0,
                    help="widest box filter for the smoothing augmentation, in MINUTES, "
                         "converted per cohort: 75 = 5 bins on HRD (the old --smooth-bins "
@@ -338,6 +351,9 @@ def parse_args(argv=None):
         p.error("--seasonal-frac must be in [0.1, 0.9]")
     if a.w_eq < 0 or (a.w_eq and a.plain):
         p.error("--w-eq must be >= 0 and needs the disentangled encoder (not --plain)")
+    if a.w_ac < 0 or (a.w_ac and a.plain) or a.ac_gamma <= 0 or a.ac_queue < 0:
+        p.error("--w-ac must be >= 0 and needs the disentangled encoder (not --plain); "
+                "--ac-gamma must be > 0 and --ac-queue >= 0")
     if a.band_readout and a.plain:
         p.error("--band-readout needs the disentangled encoder (not --plain)")
     if a.harmonics < 2:
