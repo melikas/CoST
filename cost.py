@@ -1,34 +1,18 @@
-"""MoCo pretraining for the disentangled seasonal/trend encoder, and the frozen readout.
+"""CoST pretraining and the frozen spectral readout.
 
-Derived from salesforce/CoST (BSD-3), which vendors TS2Vec (MIT). See NOTICE.
-
-WHAT WAS PORTED, AND WHAT WAS NOT. The 4-arm design varies `phase_readout` and the objective
-weights and holds everything else fixed, so every alternative that all four arms would leave
-switched off was dropped rather than carried. Each of these was ruled out by a measurement
-already in archive_logs.txt, not by taste:
-
-  positive='participant'   downstream ceiling 0.6658, BELOW the 0.7198 an untrained random
-                           projection of the raw window already reaches. It is the only HARD
-                           pairing implemented and its ceiling is still dominated.
-  positive='day-disjoint'  ceiling 0.6574. Dominated by both of the above.
-  decomposition views      the trend-sharing pair is solved at initialisation (top-1 0.980);
-                           `decomp_aug` was False in both reference runs.
-  subject negatives        the study concluded participant identity is NOT the shortcut, so
-                           the mode has served its purpose; `negatives='global'` in both runs.
-  V^N / noise branch       `noise_weight=0.0` in both reference runs. Dropped, not ported.
-  GradNorm balancing       `loss_balance='fixed'` in both reference runs.
-  n_exact_tail             existed to keep integer calendar channels bit-exact under
-                           augmentation, and calendar PE is part 4.
-
-The three augmentations survive because they were measured to matter. `scale` stays removed:
-amplitude is the discriminative circadian feature, so contrasting scaled views would train
-the model to ignore exactly the signal.
+MoCo on the trend branch, within-batch instance contrast of amplitude and phase on the
+seasonal branch, as upstream. Derived from salesforce/CoST (BSD-3), which vendors TS2Vec
+(MIT); see NOTICE. Differences from upstream: harmonic bands (models.encoder.rhythm_bands), a
+smoothing augmentation in place of scaling, an amplitude-weighted circular phase contrast
+(models.losses.seasonal_loss), the optional level-equivariance (w_eq) and anti-collapse (w_ac)
+terms, and a readout of amplitude and phase at the daily harmonics.
 """
 from __future__ import annotations
 
 import math
 import random
-from typing import Optional
+import hashlib
+from pathlib import Path
 
 import numpy as np
 import torch
@@ -36,88 +20,59 @@ import torch.nn.functional as F
 from torch import fft, nn
 from torch.utils.data import DataLoader, Dataset
 
-import objective as O
-from model import CoSTEncoder
-from probe import spectral_freqs
+from models import losses as O
+from models.encoder import CoSTEncoder
 
-__all__ = ["PretrainDataset", "CoSTModel", "CoST", "WindowClassifier", "finetune",
-           "predict_windows", "spectral_readout", "band_keep", "readout_width",
+__all__ = ["PretrainDataset", "CoSTModel", "DSSL", "WEIGHTS", "REFERENCE_SHARED",
+           "spectral_freqs", "phase_block_layout", "spectral_readout", "band_keep",
            "smooth_bins_for"]
 
 
 # --------------------------------------------------------------------------------------
+# Augmentations
+# --------------------------------------------------------------------------------------
 def smooth_bins_for(minutes, bins_per_day):
-    """Widest smoothing box, in bins, for a width given in MINUTES.
-
-    The augmentation is defined physically -- detail finer than `minutes` is declared noise --
-    so its width in bins must follow the cohort's resolution. It used to be given in bins,
-    where the same 5 meant 1.25 h on HRD (15-min bins) but 30 h on GLOBEM (6-h bins).
-    Measured on a pure 24 h cosine through `PretrainDataset.smooth`: GLOBEM kept 33% of the
-    daily amplitude at width 3 and 20%, phase-INVERTED, at width 5, against >= 99.6% and no
-    phase change on HRD. Every GLOBEM contrastive run at train.py's old default (5 bins) was
-    therefore trained to treat the daily rhythm itself as noise. Below 3 bins no odd box
-    wider than one bin fits, and the augmentation switches off -- which is exactly GLOBEM's
-    case at any sub-day width.
-    """
+    """Widest smoothing box, in bins, for a width given in minutes: 5 bins on HRD at 75 min.
+    Below 3 bins no odd box fits and smoothing is off (GLOBEM's 6-h bins)."""
     return int(minutes * bins_per_day // 1440)
 
 
 class PretrainDataset(Dataset):
-    """Two independently augmented views of the same window.
+    """Two independently augmented views of the same window, and their level offset.
 
-    `multiplier` re-visits each window that many times per epoch, so a small cohort still
-    yields a full-length epoch of distinct augmentations.
+    `multiplier` revisits each window that many times per epoch with fresh augmentations.
     """
 
     def __init__(self, data, jitter_sigma=0.1, shift_sigma=0.5, p=0.5, multiplier=10,
-                 smooth_bins=0):
+                 smooth_bins=0, scale_sigma=0.0):
         super().__init__()
         self.data = data
         self.p, self.multiplier = p, multiplier
         self.jitter_sigma, self.shift_sigma = jitter_sigma, shift_sigma
         self.smooth_bins = int(smooth_bins)
+        self.scale_sigma = float(scale_sigma)
         self.N, self.T, self.D = data.shape
 
     def __len__(self):
         return self.N * self.multiplier
 
     def __getitem__(self, item):
-        """Two views, and the per-channel level offset between them (d1 - d2), which only
-        the equivariance term reads. Tracking it draws no extra random numbers."""
+        """(view 1, view 2, per-channel offset d1 - d2). Only the equivariance term reads the
+        offset, and tracking it draws no extra random numbers."""
         x = self.data[item % self.N]
         v1, d1 = self.transform(x)
         v2, d2 = self.transform(x)
         return v1, v2, d1 - d2
 
     def transform(self, x):
+        if self.scale_sigma and random.random() <= self.p:
+            x = x * (1 + torch.randn(x.size(-1)) * self.scale_sigma)
         x, d = self.shift(self.smooth(x))
         return self.jitter(x), d
 
     def smooth(self, x):
-        """Circular box filter of random odd width up to `smooth_bins` -- what declares
-        detail finer than that width to be noise.
-
-        `smooth_bins` must come from `smooth_bins_for`, never be set in bins directly: the
-        same bin count is 1.25 h on HRD and 30 h on GLOBEM, where it erased the daily rhythm.
-
-        In a contrastive objective the augmentation IS the definition of noise: whatever it
-        destroys, the representation learns to ignore. Each candidate therefore carries a
-        ceiling, the predictive content of what survives it, measured on HRD over 24 seeds
-        through an identical projection and probe:
-
-            sub-hour smoothing  0.6926   the only one ABOVE the raw window's 0.6884
-            jitter              0.6884   removes nothing, so it defines no task at all
-            per-channel offset  0.6835
-            per-channel gain    0.6492
-            day permutation     0.6303
-            time roll           0.6273
-
-        The filter is circular, so the window keeps its length and every rhythm keeps its
-        phase exactly. Widths are ODD only: an even box has no centre bin, so its padding is
-        asymmetric and it moves every phase by half a bin -- 0.0327 rad on the 24 h component
-        at 96 bins/day, exactly half of 2*pi/96. That would make this a time shift wearing a
-        smoother's clothes, and the ceiling for time shifts is 0.6273.
-        """
+        """Circular box filter of random odd width up to `smooth_bins`. Circular and odd, so
+        the window keeps its length and every rhythm keeps its phase exactly."""
         if self.smooth_bins < 3 or random.random() > self.p:
             return x
         w = random.randrange(3, (self.smooth_bins // 2) * 2 + 2, 2)
@@ -126,19 +81,13 @@ class PretrainDataset(Dataset):
         return F.avg_pool1d(xp, kernel_size=w, stride=1).squeeze(0).transpose(0, 1)
 
     def jitter(self, x):
-        """Sensor-noise level (sigma ~0.1), not the 0.5 upstream uses on other domains."""
         if random.random() > self.p:
             return x
         return x + torch.randn(x.shape) * self.jitter_sigma
 
     def shift(self, x):
-        """A constant per-channel offset moves only the MESOR -- the f=0 bin -- and leaves
-        the amplitude and phase of every rhythm untouched. Safe, non-trivial, and it guards
-        against contrastive collapse.
-
-        It is also exactly what the trend branch is read out as (its time-mean), so on its
-        own it trains that branch to discard level. Returns (view, offset) so --w-eq can make
-        the branch predict the offset instead; the offset is zero when no shift is applied."""
+        """Constant per-channel offset: changes only the f=0 bin (the MESOR). Returns the
+        offset too, zero when no shift is applied."""
         if random.random() > self.p:
             return x, torch.zeros(x.size(-1))
         d = torch.randn(x.size(-1)) * self.shift_sigma
@@ -146,22 +95,54 @@ class PretrainDataset(Dataset):
 
 
 # --------------------------------------------------------------------------------------
+# Readout
+# --------------------------------------------------------------------------------------
+def spectral_freqs(seq_len, bins_per_day, harmonics=4):
+    """Resolved weekly and daily harmonics, excluding DC and Nyquist's fixed real phase.
+
+    HRD: [1,7,14,21,28]. GLOBEM: [4,28]; bin 1 there means 28 days, not one week.
+    This shared wearable readout is OUR ADAPTER, not the original forecasting readout.
+    """
+    if seq_len % int(bins_per_day):
+        raise ValueError("spectral readout requires a whole number of days")
+    days = seq_len // int(bins_per_day)
+    bins = ([days // 7] if days % 7 == 0 else []) + [k * days for k in range(1, harmonics + 1)]
+    return sorted({i for i in bins if 0 < i < seq_len / 2})
+
+
+def phase_block_layout(readout, seasonal_dims, seq_len, bins_per_day, n_leading=0,
+                       harmonics=4, block=None):
+    """Where the (cos, sin) blocks sit in a representation, for `IsotropicPairScaler`.
+
+    Two offsets have to be right, and getting either wrong is worse than not scaling at all,
+    because it couples columns that are not a pair and leaves the real pair sheared:
+
+      * EACH BLOCK IS |f| * seasonal_dims WIDE, not seasonal_dims. The readout stacks blocks
+        shaped (b, |f|, d) flattened to |f|*d, and HRD reports |f| = 5 bins at the default
+        4 harmonics, so a block is 5 * 160 = 800 columns (13 * 160 = 2080 at 12).
+      * THE TREND BLOCK COMES FIRST in the full representation. `CoST.encode` concatenates
+        [trend | amp | cos | sin], so on HRD the cos block starts at 160 + 800 = 960. Pass
+        `n_leading=trend_dims` when probing the full vector, and `n_leading=0` when probing
+        the seasonal block on its own.
+
+    `block` overrides the width for a readout that keeps fewer columns (the band-matched
+    one); pass the encoded amplitude block's width.
+
+    Returns (pair_start, width), or (None, 0) for the 'angle' readout, which has no pair.
+    """
+    if readout != "circular":
+        return None, 0
+    if block is None:
+        block = len(spectral_freqs(seq_len, bins_per_day, harmonics)) * int(seasonal_dims)
+    return int(n_leading) + int(block), int(block)
+
+
 def band_keep(net):
-    """Flat (bin, dim) indices the band-matched readout keeps, or None to keep every column.
+    """Flat (bin, dim) indices of the band-matched readout, or None to keep every column.
 
-    Each BandedFourierLayer owns its own dims and emits only its own bins, so at a harmonic
-    the dims of every OTHER band carry only what the per-timestep normalisation before the
-    rFFT mixes in: measured on HRD, 54x (4 harmonics) to 88x (12) below the owning band's
-    amplitude. They are ~75% of the all-bins readout at 4 harmonics and ~92% at 12.
-    Untrained encoder, same probe as the harmonic gate:
-
-        harmonics   all bins    band-matched      RQ1 MESOR R^2 (eval ridge), all -> band
-        4           0.6370      0.5597            0.992 -> 0.999
-        12          0.6974      0.7420            0.034 -> 0.999
-
-    So the mixed-in columns are not noise -- at 4 harmonics they carry cross-band structure
-    the few wide bands cannot -- but at 12 they are 92% of the readout and cost both RQ1 and
-    RQ3. Use it with 12 harmonics, not 4. Ordered bin-major, as the readout flattens.
+    Under `band_readout` each band's dims are read only at the harmonics inside that band.
+    Intended for 12 harmonics, where the other columns are ~92% of the readout; at 4 it
+    lowers RQ3. Ordered bin-major, as the readout flattens.
     """
     if not getattr(net, "band_readout", False):
         return None
@@ -176,14 +157,11 @@ def band_keep(net):
 
 
 def spectral_readout(z, bins_per_day, phase_readout, harmonics=4, keep=None, eps=1e-6):
-    """Frequency-domain readout of the seasonal branch -- (amplitude, phase) blocks.
+    """Seasonal branch -> (amplitude, phase) at the readout bins (spectral_freqs).
 
-    Shared by the frozen path and the fine-tuning head so both read the representation the
-    SAME way. Every operation is differentiable, which is what lets a classification head
-    train through it: rfft, and a sqrt whose argument is kept strictly positive by `eps` so
-    its gradient stays finite at the origin. `harmonics` is the encoder's own
-    (`CoSTEncoder.harmonics`), so the readout reports every daily harmonic the bands carry;
-    `keep` (from `band_keep`) restricts each block to the band-matched columns.
+    Each timestep is L2-normalised over channels, then rFFT over time. Phase is the raw
+    angle ('angle') or its (cos, sin) ('circular'). `keep` restricts both blocks to the
+    band-matched columns.
     """
     f = spectral_freqs(z.size(1), bins_per_day, harmonics)
     Z = fft.rfft(F.normalize(z.float(), dim=-1), dim=1)[:, f]
@@ -198,32 +176,18 @@ def spectral_readout(z, bins_per_day, phase_readout, harmonics=4, keep=None, eps
     return flat(amp), torch.cat([flat(p) for p in pha], dim=-1)
 
 
-def readout_width(seq_len, bins_per_day, phase_readout, trend_dims, seasonal_dims,
-                  residual_dims=0, harmonics=4, n_kept=None):
-    """Width of [trend | amp | phase | resid] -- what the classification head receives.
-
-    `residual_dims` defaults to 0, so every arm without the V^N branch keeps exactly the
-    width it had before that branch existed. `n_kept` is len(band_keep(net)) under the
-    band-matched readout, the columns each seasonal block keeps.
-    """
-    per = (n_kept if n_kept is not None
-           else len(spectral_freqs(seq_len, bins_per_day, harmonics)) * seasonal_dims)
-    return trend_dims + per * (1 + (2 if phase_readout == "circular" else 1)) + residual_dims
-
-
+# --------------------------------------------------------------------------------------
+# Objective
+# --------------------------------------------------------------------------------------
 class CoSTModel(nn.Module):
     """MoCo on the trend branch, within-batch instance discrimination on the seasonal one."""
 
     def __init__(self, encoder_q, encoder_k, *, dim=128, alpha=0.005, K=4096, m=0.999,
-                 T=0.07, disentangle=True, phase_mode="circular_amp", trend_pool="random",
-                 weights: O.TermWeights = O.PAPER, w_eq=0.0, eq_dims=0, w_ac=0.0,
-                 ac_gamma=0.7114, ac_queue=512, device="cuda"):
+                 T=0.07, phase_mode="circular_amp", weights: O.TermWeights = O.PAPER,
+                 w_eq=0.0, eq_dims=0, w_ac=0.0, ac_gamma=0.7114, ac_queue=512, device="cuda"):
         super().__init__()
-        if trend_pool not in ("random", "mean"):
-            raise ValueError(f"trend_pool must be 'random' or 'mean', got {trend_pool!r}")
         self.alpha, self.K, self.m, self.T = alpha, K, m, T
-        self.disentangle, self.phase_mode = disentangle, phase_mode
-        self.trend_pool, self.weights, self.device = trend_pool, weights, device
+        self.phase_mode, self.weights, self.device = phase_mode, weights, device
 
         self.encoder_q, self.encoder_k = encoder_q, encoder_k
         self.head_q = nn.Sequential(nn.Linear(dim, dim), nn.ReLU(), nn.Linear(dim, dim))
@@ -237,27 +201,21 @@ class CoSTModel(nn.Module):
         self.register_buffer("queue_ptr", torch.zeros(1, dtype=torch.long))
         self.last_top1 = float("nan")
 
-        # Level equivariance (objective.equivariance_loss). Built AFTER the queue: at w_eq=0
-        # it does not exist and draws no random numbers, which keeps the contrastive run
-        # bit-identical. Bias-free, so it maps a DIFFERENCE of readouts to a difference of
-        # offsets -- an equivariance for the additive group, not a regression on level.
+        # Level equivariance. Built after the queue, so w_eq=0 draws no extra random numbers.
+        # Bias-free: it maps a difference of readouts to a difference of offsets.
         self.w_eq = w_eq
         self.head_eq = nn.Linear(dim, eq_dims, bias=False) if w_eq > 0 else None
-        # Anti-collapse on the seasonal readout's log amplitudes (objective.anticollapse_loss).
-        # No parameters and no random numbers, so w_ac=0 stays bit-identical. `_ac_mem` holds
-        # detached rows of recent batches: one batch of 64 cannot estimate a full-rank
-        # covariance of 160 channels.
+        # Anti-collapse on the readout's log amplitudes. `_ac_mem` holds detached rows of
+        # recent batches: one batch cannot estimate a full-rank covariance of 160 channels.
         self.w_ac, self.ac_gamma, self.ac_queue = w_ac, ac_gamma, int(ac_queue)
         self._ac_mem = None
 
     def _log_readout_amp(self, z):
-        """Log amplitude at every readout bin, B x bins x channels: exactly the columns
-        spectral_readout emits, so the constraint acts on the vector the probes read."""
+        """Log amplitude at every readout bin, B x bins x channels."""
         e = self.encoder_q
         amp, _ = spectral_readout(z, e.bins_per_day, "angle", e.harmonics)
         return amp.view(amp.size(0), -1, e.seasonal_dims).log()
 
-    # -- MoCo state -------------------------------------------------------------------
     @torch.no_grad()
     def _momentum_update(self):
         for a, b in ((self.encoder_q, self.encoder_k), (self.head_q, self.head_k)):
@@ -273,64 +231,33 @@ class CoSTModel(nn.Module):
         self.queue[:, ptr:ptr + b] = keys.T
         self.queue_ptr[0] = (ptr + b) % self.K
 
-    def _trend_view(self, z, idx):
-        """The vector the trend term contrasts: one timestep (upstream) or the mean.
-
-        'random' is upstream, but the head it goes through is discarded at inference and
-        encode() mean-pools the whole sequence, so that objective never constrains the
-        vector the probes read. 'mean' contrasts what is actually read.
-        """
-        return z.mean(1) if self.trend_pool == "mean" else z[:, idx]
-
-    # -- objective --------------------------------------------------------------------
     def forward(self, x_q, x_k, update=True, return_parts=False, delta=None):
-        idx = np.random.randint(0, x_q.shape[1])
-        q_t, q_s, q_n = self.encoder_q(x_q)
+        idx = np.random.randint(0, x_q.shape[1])            # the timestep the trend term contrasts
+        q_t, q_s = self.encoder_q(x_q)
 
-        if not self.disentangle:
-            # Plain-SSL control: one representation, one MoCo, no seasonal term at all.
-            q = F.normalize(self.head_q(self._trend_view(q_t, idx)), dim=-1)
-            with torch.no_grad():
-                if update:
-                    self._momentum_update()
-                k_t, _, _ = self.encoder_k(x_k)
-                k = F.normalize(self.head_k(self._trend_view(k_t, idx)), dim=-1)
-            loss, self.last_top1 = O.moco_ce_loss(q, k, self.queue.clone().detach(), self.T)
-            if update:
-                self._enqueue(k)
-            z = loss.new_zeros(())
-            return (loss, z, z) if return_parts else loss
-
-        q_level = q_t.mean(dim=1) if self.head_eq is not None else None   # the readout
-        q_t = F.normalize(self.head_q(self._trend_view(q_t, idx)), dim=-1)
+        q_level = q_t.mean(dim=1) if self.head_eq is not None else None   # the trend readout
+        q_t = F.normalize(self.head_q(q_t[:, idx]), dim=-1)
         with torch.no_grad():
             if update:
                 self._momentum_update()
-            k_t, _, _ = self.encoder_k(x_k)
-            k_t = F.normalize(self.head_k(self._trend_view(k_t, idx)), dim=-1)
+            k_t, _ = self.encoder_k(x_k)
+            k_t = F.normalize(self.head_k(k_t[:, idx]), dim=-1)
         trend, self.last_top1 = O.moco_ce_loss(q_t, k_t, self.queue.clone().detach(), self.T)
         if update:
             self._enqueue(k_t)
 
-        # The seasonal branch is deliberately NOT MoCo, matching upstream: it has no queue,
-        # so there are no stale keys for a momentum encoder to keep consistent, and the loss
-        # is symmetric -- detaching one side behind an EMA copy would zero half its gradient
-        # path. The key therefore comes from encoder_q, with gradients, at the cost of a
-        # third encoder pass. Do not "fix" this to encoder_k.
-        k_tq, k_s, _ = self.encoder_q(x_k)
+        # Seasonal term as upstream: no queue and symmetric, so the key view also goes through
+        # encoder_q with gradients (a third encoder pass).
+        k_tq, k_s = self.encoder_q(x_k)
         amp, pha = O.seasonal_loss(q_s, k_s, self.weights, self.phase_mode)
         total = O.total_loss(trend, amp, pha, self.weights, self.alpha)
         if self.head_eq is not None:
-            # Reuses the second encoder_q pass the seasonal term already makes, so the
-            # equivariance term costs no extra forward.
             if delta is None:
                 raise ValueError("w_eq > 0 but the batch carries no level offsets")
             total = total + self.w_eq * O.equivariance_loss(
                 self.head_eq(q_level - k_tq.mean(dim=1)), delta)
         if self.w_ac > 0:
-            # The queue holds training-mode rows (dropout on); scoring eval-mode rows against
-            # them mixes two shifted distributions and inflates the covariance term. The
-            # validation monitor therefore uses its own rows only.
+            # The queue holds training-mode rows (dropout on), so validation uses its own rows.
             cur = torch.cat([self._log_readout_amp(q_s), self._log_readout_amp(k_s)], dim=0)
             total = total + self.w_ac * O.anticollapse_loss(
                 cur, self._ac_mem if self.training else None, self.ac_gamma)
@@ -340,7 +267,6 @@ class CoSTModel(nn.Module):
         return (total, trend, amp + pha) if return_parts else total
 
 
-# --------------------------------------------------------------------------------------
 def adjust_learning_rate(optimizer, lr, step, total):
     """Half-cycle cosine decay, as upstream."""
     cur = lr * 0.5 * (1.0 + math.cos(math.pi * step / max(total, 1)))
@@ -349,27 +275,57 @@ def adjust_learning_rate(optimizer, lr, step, total):
     return cur
 
 
-class CoST:
-    """Fit the encoder, then read frozen representations out of it."""
+# --------------------------------------------------------------------------------------
+# Model
+# --------------------------------------------------------------------------------------
+WEIGHTS = {"paper": O.PAPER, "contracted": O.CONTRACTED}
+# The only settings the CoST reference adapter takes from the experiment configuration: the
+# shared readout, geometry and budget. Everything else is fixed to upstream CoST below.
+REFERENCE_SHARED = ("output_dims", "hidden_dims", "tcn_depth", "harmonics", "seasonal_frac",
+                    "phase_readout", "alpha", "moco_k", "lr", "batch_size", "mask_mode")
 
-    def __init__(self, input_dims, seq_len, bins_per_day, *, output_dims=320, hidden_dims=64,
-                 depth=None, n_time_features=0, seasonal_bands="harmonics", harmonics=4,
-                 disentangle=True, mask_mode="none", trend_kernel_cap=None, seasonal_frac=0.5,
-                 residual_dims=0, band_readout=False,
-                 phase_readout="circular", phase_mode="circular_amp", trend_pool="random",
-                 weights: O.TermWeights = O.PAPER, alpha=0.005, moco_k=4096,
-                 jitter_sigma=0.1, shift_sigma=0.5, smooth_minutes=75.0, w_eq=0.0,
-                 w_ac=0.0, ac_gamma=0.7114, ac_queue=512,
-                 lr=5e-4, batch_size=64, max_train_length=None, device="cuda",
-                 model_seed=None):
+
+class DSSL:
+    """Fit the encoder, then read frozen representations out of it.
+
+    The defaults are the paper's DSSL: four harmonic bands, causal trend experts up to T/8,
+    contracted seasonal weights, amplitude-weighted circular phase contrast, level
+    equivariance (w_eq = 1), smoothing up to 75 min, angle readout. method="cost_reference"
+    is upstream CoST behind the same readout: one full-spectrum band, trend experts up to
+    T/2, raw-phase contrast, weights 1 / 0.5 / 0.5, no equivariance, scaling, jitter and
+    shift augmentation at 0.5; callers pass it only REFERENCE_SHARED.
+    """
+
+    def __init__(self, input_dims, seq_len, bins_per_day, *, method="dssl",
+                 output_dims=320, hidden_dims=64, n_time_features=0,
+                 backbone="tcn", temporal_encoding="none", tcn_depth=None, n_layers=4,
+                 n_heads=4, bidirectional=True, seasonal_bands="harmonics", harmonics=4,
+                 trend_kernel_cap=None, seasonal_frac=0.5, band_readout=False, mask_mode="none",
+                 phase_readout="angle", phase_mode="circular_amp", weights="contracted",
+                 alpha=0.005, w_eq=1.0, w_ac=0.0, ac_gamma=0.7114, ac_queue=512, moco_k=4096,
+                 jitter_sigma=0.1, shift_sigma=0.5, smooth_minutes=75.0, lr=5e-4, batch_size=64,
+                 device="cuda", model_seed=None):
+        if method not in ("dssl", "cost_reference"):
+            raise ValueError("method must be dssl or cost_reference")
+        self.method = method
+        self.scale_sigma = 0.0
+        if method == "cost_reference":
+            if n_time_features:
+                raise ValueError("the CoST reference adapter is sensor-only")
+            backbone, temporal_encoding, seasonal_bands, band_readout = "tcn", "none", "single", False
+            trend_kernel_cap, phase_mode, weights = max(1, seq_len // 2), "raw", "paper"
+            w_eq, w_ac, jitter_sigma, shift_sigma, smooth_minutes = 0.0, 0.0, 0.5, 0.5, 0.0
+            self.scale_sigma = 0.5
+        if trend_kernel_cap is None:
+            trend_kernel_cap = max(1, seq_len // 8)
+        if isinstance(weights, str):
+            if weights not in WEIGHTS:
+                raise ValueError(f"weights must be one of {sorted(WEIGHTS)}, got {weights!r}")
+            weights_name, weights = weights, WEIGHTS[weights]
+        else:
+            weights_name = next((k for k, v in WEIGHTS.items() if v == weights), "custom")
         if phase_readout not in ("angle", "circular"):
             raise ValueError(f"phase_readout must be 'angle' or 'circular', got {phase_readout!r}")
-        if w_eq and not disentangle:
-            raise ValueError("w_eq needs the disentangled encoder: it acts on the trend branch")
-        if w_ac and not disentangle:
-            raise ValueError("w_ac needs the disentangled encoder: it acts on the seasonal readout")
-        if band_readout and not disentangle:
-            raise ValueError("band_readout needs the disentangled encoder: it reads the bands")
         if model_seed is not None:
             torch.manual_seed(model_seed)
             np.random.seed(model_seed % (2 ** 31))
@@ -379,35 +335,66 @@ class CoST:
         self.seq_len, self.bins_per_day = seq_len, bins_per_day
         self.phase_readout = phase_readout
         self.batch_size, self.lr = batch_size, lr
-        self.max_train_length = max_train_length
         self.jitter_sigma, self.shift_sigma = jitter_sigma, shift_sigma
         self.smooth_bins = smooth_bins_for(smooth_minutes, bins_per_day)
-        self.disentangle = disentangle
 
         enc = dict(input_dims=input_dims, output_dims=output_dims, seq_len=seq_len,
-                   bins_per_day=bins_per_day, hidden_dims=hidden_dims, depth=depth,
+                   bins_per_day=bins_per_day, hidden_dims=hidden_dims,
                    n_time_features=n_time_features, seasonal_bands=seasonal_bands,
-                   max_harmonics=harmonics, disentangle=disentangle, mask_mode=mask_mode,
+                   max_harmonics=harmonics, mask_mode=mask_mode,
                    trend_kernel_cap=trend_kernel_cap, seasonal_frac=seasonal_frac,
-                   residual_dims=residual_dims, band_readout=band_readout)
+                   band_readout=band_readout, backbone=backbone, temporal_encoding=temporal_encoding,
+                   tcn_depth=tcn_depth, n_layers=n_layers, n_heads=n_heads,
+                   bidirectional=bidirectional)
         self.net = CoSTEncoder(**enc).to(device)
         self._keep = band_keep(self.net)
-        self.component_dims = self.net.seasonal_dims if disentangle else output_dims
+        self.component_dims = self.net.seasonal_dims
 
         encoder_k = CoSTEncoder(**enc).to(device)
         self.cost = CoSTModel(
-            self.net, encoder_k, dim=(self.net.trend_dims if disentangle else output_dims),
-            alpha=alpha, K=moco_k, disentangle=disentangle, phase_mode=phase_mode,
-            trend_pool=trend_pool, weights=weights, w_eq=w_eq, eq_dims=input_dims,
+            self.net, encoder_k, dim=self.net.trend_dims, alpha=alpha, K=moco_k,
+            phase_mode=phase_mode, weights=weights, w_eq=w_eq, eq_dims=input_dims,
             w_ac=w_ac, ac_gamma=ac_gamma, ac_queue=ac_queue, device=device).to(device)
         self.n_iters = 0
+        self._optimizer = None
+        self._permutation = None
+        self._cursor = 0
+        self._training_hash = None
+        self._horizon = None
+        self.history = {"iters": [], "train": [], "val": [], "top1": []}
+        self.config = dict(method=method, input_dims=input_dims, seq_len=seq_len,
+                           bins_per_day=bins_per_day, output_dims=output_dims,
+                           hidden_dims=hidden_dims, n_time_features=n_time_features,
+                           backbone=backbone, temporal_encoding=temporal_encoding,
+                           tcn_depth=self.net.depth, receptive_field=self.net.receptive_field,
+                           n_layers=n_layers, n_heads=n_heads, bidirectional=bidirectional,
+                           seasonal_bands=seasonal_bands, bands=[list(b) for b in self.net.bands],
+                           harmonics=harmonics, trend_kernel_cap=trend_kernel_cap,
+                           trend_kernels=self.net.kernels, seasonal_frac=seasonal_frac,
+                           band_readout=band_readout, mask_mode=mask_mode,
+                           phase_readout=phase_readout, phase_mode=phase_mode,
+                           weights=weights_name, alpha=alpha, w_eq=w_eq, w_ac=w_ac,
+                           moco_k=moco_k, jitter_sigma=jitter_sigma, shift_sigma=shift_sigma,
+                           scale_sigma=self.scale_sigma, smooth_minutes=smooth_minutes,
+                           smooth_bins=self.smooth_bins, lr=lr, batch_size=batch_size,
+                           model_seed=model_seed)
 
     # -- training ---------------------------------------------------------------------
-    def fit(self, train_data, n_iters=1000, val_data=None, log_every=100, verbose=True):
-        """Pretrain. `train_data` is (N, T, D) float32; no labels are used anywhere here."""
-        loader = self._loader(train_data, shuffle=True)
-        if len(loader.dataset) < self.batch_size:
-            raise ValueError(f"{len(loader.dataset)} windows is fewer than one batch "
+    def fit(self, train_data, n_iters=1000, val_data=None, log_every=100, verbose=True,
+            checkpoint_path=None, checkpoint_every=200, stop_after=None):
+        """Pretrain. `train_data` is (N, T, D) float32; no labels are used."""
+        array = np.ascontiguousarray(train_data, dtype=np.float32)
+        if array.ndim != 3 or not np.isfinite(array).all():
+            raise ValueError("SSL requires finite (windows,time,features) training input")
+        digest = hashlib.sha256(array.tobytes()).hexdigest()
+        if self._training_hash not in (None, digest) or self._horizon not in (None, n_iters):
+            raise ValueError("resume requires identical training data/order and planned iteration horizon")
+        self._training_hash, self._horizon = digest, n_iters
+        ds = PretrainDataset(torch.from_numpy(array), jitter_sigma=self.jitter_sigma,
+                             shift_sigma=self.shift_sigma, smooth_bins=self.smooth_bins,
+                             scale_sigma=self.scale_sigma)
+        if len(ds) < self.batch_size:
+            raise ValueError(f"{len(ds)} windows is fewer than one batch "
                              f"({self.batch_size}); lower --batch-size or widen the fold")
 
         val_loader = None
@@ -415,54 +402,55 @@ class CoST:
             val_loader = self._loader(val_data, shuffle=False, multiplier=1)
 
         params = [p for p in self.cost.parameters() if p.requires_grad]
-        opt = torch.optim.SGD(params, lr=self.lr, momentum=0.9, weight_decay=1e-4)
-
-        hist = {"iters": [], "train": [], "val": [], "top1": []}
+        if self._optimizer is None:
+            self._optimizer = torch.optim.SGD(params, lr=self.lr, momentum=0.9, weight_decay=1e-4)
+        opt, hist = self._optimizer, self.history
         self.cost.train()
-        done = False
-        while not done:
-            for batch in loader:
-                if self.n_iters >= n_iters:
-                    done = True
-                    break
-                adjust_learning_rate(opt, self.lr, self.n_iters, n_iters)
-                loss = self._loss(batch)
-                opt.zero_grad(set_to_none=True)
-                loss.backward()
-                opt.step()
-                self.n_iters += 1
-
-                if self.n_iters % log_every == 0 or self.n_iters == n_iters:
-                    v = self._validation_loss(val_loader) if val_loader else float("nan")
-                    hist["iters"].append(self.n_iters)
-                    hist["train"].append(float(loss.item()))
-                    hist["val"].append(v)
-                    hist["top1"].append(self.cost.last_top1)
-                    if verbose:
-                        print(f"    iter {self.n_iters:>6}  loss {loss.item():.4f}  "
-                              f"val {v:.4f}  top1 {self.cost.last_top1:.4f}", flush=True)
+        finish = n_iters if stop_after is None else min(n_iters, self.n_iters + stop_after)
+        while self.n_iters < finish:
+            if self._permutation is None or self._cursor + self.batch_size > len(ds):
+                self._permutation, self._cursor = torch.randperm(len(ds)), 0
+            idx = self._permutation[self._cursor:self._cursor + self.batch_size]
+            self._cursor += self.batch_size
+            batch = [torch.stack(v) for v in zip(*(ds[int(i)] for i in idx))]
+            adjust_learning_rate(opt, self.lr, self.n_iters, n_iters)
+            loss = self._loss(batch)
+            if not torch.isfinite(loss):
+                raise FloatingPointError("nonfinite SSL loss")
+            opt.zero_grad(set_to_none=True)
+            loss.backward()
+            if any(p.grad is not None and not torch.isfinite(p.grad).all() for p in params):
+                raise FloatingPointError("nonfinite SSL gradient")
+            opt.step()
+            self.n_iters += 1
+            if self.n_iters % log_every == 0 or self.n_iters == n_iters:
+                v = self._validation_loss(val_loader) if val_loader else None
+                hist["iters"].append(self.n_iters)
+                hist["train"].append(float(loss.item()))
+                hist["val"].append(v)
+                hist["top1"].append(self.cost.last_top1)
+                if verbose:
+                    print(f"    iter {self.n_iters:>6}  loss {loss.item():.4f}  "
+                          f"val {v}  top1 {self.cost.last_top1:.4f}", flush=True)
+            if checkpoint_path and (self.n_iters % checkpoint_every == 0 or self.n_iters == finish):
+                self.save_training(checkpoint_path)
         self.cost.eval()
         return hist
 
     def _loader(self, data, *, shuffle, multiplier=None):
-        """Two independently augmented views per window."""
         kw = {} if multiplier is None else {"multiplier": multiplier}
         ds = PretrainDataset(torch.as_tensor(data, dtype=torch.float),
                              jitter_sigma=self.jitter_sigma, shift_sigma=self.shift_sigma,
-                             smooth_bins=self.smooth_bins, **kw)
+                             smooth_bins=self.smooth_bins, scale_sigma=self.scale_sigma, **kw)
         return DataLoader(ds, batch_size=self.batch_size, shuffle=shuffle, drop_last=True)
 
     def _loss(self, batch, update=True):
         x_q, x_k = batch[0].to(self.device), batch[1].to(self.device)
-        if self.max_train_length and x_q.size(1) > self.max_train_length:
-            off = np.random.randint(x_q.size(1) - self.max_train_length + 1)
-            sl = slice(off, off + self.max_train_length)
-            x_q, x_k = x_q[:, sl], x_k[:, sl]
         return self.cost(x_q, x_k, update=update, delta=batch[2].to(self.device))
 
     @torch.no_grad()
     def _validation_loss(self, loader):
-        """Held-out pretext loss. `update=False` so monitoring never mutates MoCo state."""
+        """Held-out pretext loss; `update=False` so monitoring never mutates MoCo state."""
         self.cost.eval()
         tot = n = 0
         for batch in loader:
@@ -473,55 +461,38 @@ class CoST:
 
     # -- readout ----------------------------------------------------------------------
     def _spectral(self, z):
-        """Frequency-domain readout of the seasonal branch: [amp | phase] or [amp | cos | sin].
-
-        Time-domain pooling destroys this branch by construction. The seasonal output is an
-        irFFT, so its mean over the window is EXACTLY the f=0 coefficient -- every oscillation
-        integrates to zero -- and 'last' is one arbitrary phase point on the edge. Reading
-        amplitude and phase at the chronobiological harmonics instead keeps the content the
-        branch exists to carry.
-
-        `phase_readout` is the experiment's first axis. 'angle' emits the raw atan2 angle,
-        which is what run 2224103 used; 'circular' emits (cos, sin), which is correct across
-        the branch cut -- 23.5 h and 0.5 h are one hour apart but average to 12.0 as raw
-        angles. probe.IsotropicPairScaler is what keeps the (cos, sin) pair from being
-        sheared by per-column standardisation downstream.
-        """
         return spectral_readout(z, self.bins_per_day, self.phase_readout, self.net.harmonics,
                                 self._keep)
 
+    def pair_block(self):
+        """(start, width) of the (cos, sin) phase columns in `encode` output, or None when the
+        readout emits raw angles. Probes scale this block isotropically."""
+        if self.phase_readout != "circular":
+            return None
+        amp = (len(self._keep) if self._keep is not None else
+               len(spectral_freqs(self.seq_len, self.bins_per_day, self.net.harmonics))
+               * self.net.seasonal_dims)
+        return phase_block_layout("circular", self.net.seasonal_dims, self.seq_len,
+                                  self.bins_per_day, n_leading=self.net.trend_dims,
+                                  harmonics=self.net.harmonics, block=amp)
+
     @torch.no_grad()
     def encode(self, data, batch_size=256, pool="mean", parts=False):
-        """Frozen representation, one vector per window.
-
-        With `parts=True` returns the blocks separately -- trend, seasonal amplitude,
-        seasonal phase -- which is what RQ2 needs to read the phase block on its own.
-        """
+        """Frozen representation [trend | amp | phase], one row per window. The trend branch
+        is pooled over time (`pool`); the seasonal branch is read in the frequency domain,
+        because its time mean is exactly zero. With `parts`, also returns each block."""
         self.net.eval()
         X = torch.as_tensor(data, dtype=torch.float)
-        outs = {"trend": [], "amp": [], "phase": [], "resid": [], "plain": []}
+        outs = {"trend": [], "amp": [], "phase": []}
         for i in range(0, len(X), batch_size):
-            t, s, r = self.net(X[i:i + batch_size].to(self.device))
-            if s is None:
-                outs["plain"].append(self._pool(t, pool).cpu())
-                continue
+            t, s = self.net(X[i:i + batch_size].to(self.device))
             outs["trend"].append(self._pool(t, pool).cpu())
             a, p = self._spectral(s)
             outs["amp"].append(a.cpu())
             outs["phase"].append(p.cpu())
-            if r is not None:
-                # Time-domain like the trend branch, so it is pooled the same way. The
-                # residual is emitted as its own block because the archive scores it alone
-                # (0.7117) far above trend and seasonal together (0.6228).
-                outs["resid"].append(self._pool(r, pool).cpu())
-        cat = {k: torch.cat(v).numpy() for k, v in outs.items() if v}
-        if "plain" in cat:
-            return {"full": cat["plain"]} if parts else cat["plain"]
-        blocks = ["trend", "amp", "phase"] + (["resid"] if "resid" in cat else [])
-        full = np.concatenate([cat[k] for k in blocks], axis=-1)
-        if not parts:
-            return full
-        return {"full": full, **{k: cat[k] for k in blocks}}
+        cat = {k: torch.cat(v).numpy() for k, v in outs.items()}
+        full = np.concatenate([cat["trend"], cat["amp"], cat["phase"]], axis=-1)
+        return {"full": full, **cat} if parts else full
 
     @staticmethod
     def _pool(z, how):
@@ -535,128 +506,55 @@ class CoST:
 
     # -- persistence ------------------------------------------------------------------
     def save(self, path):
-        # `phase_readout_at_construction` is PROVENANCE ONLY and `load` must never apply it.
-        # These weights are readout-agnostic -- the readout is chosen at encode time and
-        # never enters training -- so a checkpoint cannot own one. It is recorded under a
-        # name that cannot be mistaken for a setting.
+        # The weights are readout-agnostic; the readout at construction is provenance only.
         torch.save({"net": self.net.state_dict(), "n_iters": self.n_iters,
-                    "residual_dims": self.net.residual_dims,
-                    "phase_readout_at_construction": self.phase_readout}, path)
+                    "phase_readout_at_construction": self.phase_readout,
+                    "config": self.config}, path)
 
     def load(self, path):
-        """Load weights. The caller's `phase_readout` is preserved, deliberately.
-
-        An earlier version restored `phase_readout` from the checkpoint, which silently
-        overrode the readout the caller had asked for: every encoder is written under the
-        readout it happened to be constructed with, so asking for 'circular' and loading a
-        checkpoint built as 'angle' returned angle output under a circular label. That is
-        the same class of failure that made runs 2224103 and 2412728 disagree, and it would
-        have made the readout axis of this experiment measure nothing.
-        """
-        ck = torch.load(path, map_location=self.device)
+        """Load weights. The caller's `phase_readout` is kept: the readout is chosen at
+        encode time and never comes from the checkpoint."""
+        ck = torch.load(path, map_location=self.device, weights_only=True)
         self.net.load_state_dict(ck["net"])
         self.n_iters = ck.get("n_iters", 0)
         return self
 
+    def save_training(self, path):
+        """Atomic full-state checkpoint, including the exact shuffled sampling position."""
+        if self._optimizer is None:
+            raise ValueError("no training state to save")
+        state = np.random.get_state()
+        payload = {"config": self.config, "cost": self.cost.state_dict(),
+                   "optimizer": self._optimizer.state_dict(), "n_iters": self.n_iters,
+                   "history": self.history, "permutation": self._permutation, "cursor": self._cursor,
+                   "training_hash": self._training_hash, "horizon": self._horizon,
+                   "python_rng": random.getstate(), "torch_rng": torch.get_rng_state(),
+                   "cuda_rng": torch.cuda.get_rng_state_all() if torch.cuda.is_available() else [],
+                   "numpy_rng": (state[0], state[1].tolist(), state[2], state[3], state[4])}
+        path = Path(path)
+        path.parent.mkdir(parents=True, exist_ok=True)
+        temp = path.with_name(path.name + ".tmp")
+        torch.save(payload, temp)
+        temp.replace(path)
 
-# --------------------------------------------------------------------------------------
-# Step C: end-to-end fine-tuning
-# --------------------------------------------------------------------------------------
-class WindowClassifier(nn.Module):
-    """Encoder + the frozen path's own readout + a linear head, trained end to end.
-
-    The head sits on `spectral_readout`, NOT on a time-mean of the representation. Mean
-    pooling would destroy the seasonal branch by construction -- its output is an irFFT, so
-    its mean over the window is exactly the f=0 coefficient and every oscillation integrates
-    to zero. Reading it the same way the frozen probe does is also what makes the two
-    directly comparable: the only thing that changes between them is whether the backbone
-    receives gradient.
-    """
-
-    def __init__(self, encoder, seq_len, bins_per_day, phase_readout, dropout=0.5):
-        super().__init__()
-        self.encoder = encoder
-        self.bins_per_day, self.phase_readout = bins_per_day, phase_readout
-        self.keep = band_keep(encoder)
-        w = readout_width(seq_len, bins_per_day, phase_readout, encoder.trend_dims,
-                          encoder.seasonal_dims, encoder.residual_dims, encoder.harmonics,
-                          None if self.keep is None else len(self.keep))
-        self.norm = nn.LayerNorm(w)
-        self.drop = nn.Dropout(dropout)
-        self.head = nn.Linear(w, 1)
-
-    def forward(self, x):
-        t, s, r = self.encoder(x)
-        if s is None:
-            feat = t.mean(dim=1)
-        else:
-            amp, pha = spectral_readout(s, self.bins_per_day, self.phase_readout,
-                                        self.encoder.harmonics, self.keep)
-            feat = torch.cat([t.mean(dim=1), amp, pha], dim=-1)
-            if r is not None:
-                feat = torch.cat([feat, r.mean(dim=1)], dim=-1)
-        return self.head(self.drop(self.norm(feat))).squeeze(-1)
-
-
-def finetune(clf, Xtr, ytr, Xva, yva, *, device="cuda", epochs=40, batch_size=64,
-             lr=1e-4, weight_decay=1e-4, patience=8, verbose=False):
-    """Fine-tune end to end, early-stopping on a PARTICIPANT-DISJOINT validation split.
-
-    The validation windows must come from participants held out of the training set and
-    absent from the test fold. Splitting windows at random instead would put the same person
-    on both sides, and early stopping would then select the epoch that best memorised those
-    people -- the exact leak the whole protocol exists to prevent, arriving through the back
-    door of model selection.
-
-    `pos_weight` handles the class imbalance so the loss does not simply learn the majority.
-    The best validation AUROC is restored at the end, so what is scored is the selected
-    model rather than whatever the last epoch happened to produce.
-    """
-    from sklearn.metrics import roc_auc_score
-    clf = clf.to(device)
-    Xtr_t = torch.as_tensor(Xtr, dtype=torch.float)
-    ytr_t = torch.as_tensor(ytr, dtype=torch.float)
-    Xva_t = torch.as_tensor(Xva, dtype=torch.float).to(device)
-    npos, nneg = float((ytr_t == 1).sum()), float((ytr_t == 0).sum())
-    pos_weight = torch.tensor([nneg / max(npos, 1.0)], device=device)
-    lossf = nn.BCEWithLogitsLoss(pos_weight=pos_weight)
-    opt = torch.optim.AdamW(clf.parameters(), lr=lr, weight_decay=weight_decay)
-
-    best, best_state, bad = -np.inf, None, 0
-    n = len(Xtr_t)
-    for ep in range(epochs):
-        clf.train()
-        perm = torch.randperm(n)
-        for i in range(0, n - batch_size + 1, batch_size):
-            b = perm[i:i + batch_size]
-            loss = lossf(clf(Xtr_t[b].to(device)), ytr_t[b].to(device))
-            opt.zero_grad(set_to_none=True)
-            loss.backward()
-            opt.step()
-        clf.eval()
-        with torch.no_grad():
-            pv = torch.cat([clf(Xva_t[i:i + 256]) for i in range(0, len(Xva_t), 256)]).cpu().numpy()
-        auc = (roc_auc_score(yva, pv) if len(np.unique(yva)) > 1 else float("nan"))
-        if np.isfinite(auc) and auc > best:
-            best, bad = auc, 0
-            best_state = {k: v.detach().clone() for k, v in clf.state_dict().items()}
-        else:
-            bad += 1
-        if verbose:
-            print(f"      ep {ep:3d} val AUROC {auc:.4f}{'  *' if bad == 0 else ''}", flush=True)
-        if bad >= patience:
-            break
-    if best_state is not None:
-        clf.load_state_dict(best_state)
-    clf.eval()
-    return clf, float(best), ep + 1
-
-
-@torch.no_grad()
-def predict_windows(clf, X, device="cuda", batch_size=256):
-    """Sigmoid scores, one per window."""
-    clf.eval()
-    X = torch.as_tensor(X, dtype=torch.float)
-    out = [torch.sigmoid(clf(X[i:i + batch_size].to(device))).cpu()
-           for i in range(0, len(X), batch_size)]
-    return torch.cat(out).numpy()
+    def load_training(self, path):
+        """Resume the same model/configuration/data and planned learning-rate horizon."""
+        state = torch.load(path, map_location=self.device, weights_only=True)
+        if state["config"] != self.config:
+            raise ValueError("training checkpoint configuration differs from the requested model")
+        self.cost.load_state_dict(state["cost"])
+        self._optimizer = torch.optim.SGD([p for p in self.cost.parameters() if p.requires_grad],
+                                           lr=self.lr, momentum=.9, weight_decay=1e-4)
+        self._optimizer.load_state_dict(state["optimizer"])
+        self.n_iters, self.history = state["n_iters"], state["history"]
+        self._permutation, self._cursor = state["permutation"].cpu(), state["cursor"]
+        self._training_hash, self._horizon = state["training_hash"], state["horizon"]
+        random.setstate(state["python_rng"])
+        ns = state["numpy_rng"]
+        np.random.set_state((ns[0], np.asarray(ns[1], dtype=np.uint32), ns[2], ns[3], ns[4]))
+        torch.set_rng_state(state["torch_rng"].cpu())
+        if state["cuda_rng"]:
+            if not torch.cuda.is_available():
+                raise ValueError("CUDA training state requires CUDA to reproduce the run")
+            torch.cuda.set_rng_state_all([s.cpu() for s in state["cuda_rng"]])
+        return self

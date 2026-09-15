@@ -4,6 +4,8 @@
 # and is covered by the study's data agreement, not by this repository.
 # ---------------------------------------------------------------------------
 datasets/*.csv
+datasets/cache/
+results/
 datasets/HRD_RAW_MinuteLevel.csv
 *.csv.gz
 *.parquet
@@ -65,3 +67,11 @@ pretext_gate.log
 # Runner output: plan.json plus per-fold artifacts.
 runs/
 metrics.json
+
+# Retired code kept for reference only, and the manuscript (its own repository).
+archive/
+SSL_Rhythmicity/
+docs/audit/evidence/
+
+# Written by scripts/stamp_version.py for the cluster copy; derived from git.
+CODE_VERSION

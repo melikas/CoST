@@ -1,0 +1,31 @@
+{
+  "date": "2026-09-14",
+  "scope": "corrected personalized RQ2",
+  "regression_tests_passed": 18,
+  "python_compile_check": "passed",
+  "manuscript_input_and_brace_check": "passed",
+  "bash_syntax": {"rq123.sbatch": "passed", "smoke.sbatch": "passed"},
+  "smoke": {
+    "hrd": {
+      "folds_complete": 2,
+      "rq2_status": "complete",
+      "rq2_unit": "held-out participant-week",
+      "rq2_rows_per_fold": [360, 360],
+      "rq2_methods": ["dssl", "untrained", "cost_reference_adapter"],
+      "rq2_perturbations": ["phase", "amplitude"],
+      "summaries_and_figures": "passed"
+    },
+    "globem": {
+      "folds_complete": 2,
+      "rq2_status": "not_applicable",
+      "reason": "requires non-overlapping seven-day windows and four preceding weeks",
+      "rq2_rows_per_fold": [0, 0],
+      "other_rq_summaries_and_figures": "passed"
+    }
+  },
+  "endpoint_association": "retained as secondary_endpoint_associations, not RQ2",
+  "narval_submitted": false,
+  "cuda_verified": false,
+  "latex_compiled": false,
+  "scientific_results_claimed_from_smoke": false
+}

@@ -1,6 +1,3 @@
-"""Downstream evaluation protocols run on top of a fitted model.
-
-Mirrors the upstream CoST layout: ``cost.py`` trains, ``tasks/`` evaluates. Each
-module takes an already-fitted model plus data and returns metrics / artefacts;
-none of them train.
-"""
+"""Evaluation tasks for a frozen encoder: rhythm markers and perturbations (rhythm), RQ2
+personalised records (personalized), the Yan et al. cosinor baseline (yan_cosinor) and the
+random-projection control (projection)."""
