@@ -68,6 +68,8 @@ def code_version():
     """Git commit and whether tracked files differ from it. On a copy without .git (the
     cluster upload), the CODE_VERSION stamp written by scripts/stamp_version.py."""
     try:
+        if Path(_git('rev-parse', '--show-toplevel')).resolve() != ROOT:
+            raise OSError('the enclosing git repository is not this checkout')
         return dict(git_commit=_git('rev-parse', 'HEAD'),
                     git_dirty=bool(_git('status', '--porcelain', '--untracked-files=no')),
                     source='git')

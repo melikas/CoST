@@ -26,8 +26,10 @@ EXTERNAL = [
      'Rhythm model reproduced on these windows; the paper compares group rhythms and reports no classifier score to compare'),
     ('GLOBEM benchmark (Xu et al. 2022): Canzian, Saeb, Farhan, Wahle, Lu, Wang, Xu 2019/2021, Chikersal; '
      'ERM, Mixup, DANN, IRM, CSD, MLDG, MASF, Siamese, Reorder', 'NOT REPRODUCIBLE FROM THIS EXPORT',
-     'They need the full daily RAPIDS feature set (incl. Calls), weekly labels and leave-one-dataset-out; '
-     'GLOBEM_REDUCED.csv has 14 segment features and an endpoint. Published scores are not inserted'),
+     'Defined on the full RAPIDS feature set (incl. calls) and scored on weekly labels under the '
+     "benchmark's own splits; GLOBEM_REDUCED.csv keeps 14 of those features at four day segments, "
+     'so run here they would be different methods, and RQ3 predicts the end-point label. '
+     'Published scores are not inserted'),
     ('Archived fusion, [agg], [dev] and supervised ladders', 'NOT IN PROTOCOL',
      'The governing protocol excludes unrestricted probe or feature-fusion searches'),
 ]

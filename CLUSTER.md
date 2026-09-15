@@ -1,121 +1,124 @@
-- Login: `melikas@NARVAL.alliancecan.ca`
-- Project on nibi: `~/projects/def-plago/melikas/projects/rhythmssl_project`
+# Narval: every command, in order
 
----
+Commands marked LOCAL run in Git Bash at this repository's root; NARVAL commands run on a
+Narval login node (`ssh melikas@narval.alliancecan.ca`, password + MFA). The code goes into a
+fresh directory, `~/projects/def-plago/melikas/projects/rhythmssl_rescue`, so nothing in the
+older `rhythmssl_project` directory is touched. Design and outputs: [docs/RUNNING.md](docs/RUNNING.md).
 
-## Step 0 — Log in to nibi
-
-```bash
-# NARVAL: open a session on the cluster (asks for password + MFA code)
-ssh melikas@narval.alliancecan.ca
-```
-scp -r ./cost.py ./utils.py ./train_hrd.py ./train_hrd_energy.py ./train_globem.py ./model_build.py ./experiment_q1.py ./experiment_q2.py ./experiment_q3.py ./requirements.txt ./models ./tasks ./baselines ./scripts melikas@narval.alliancecan.ca:~/projects/def-plago/melikas/projects/rhythmssl_project/
-
-
-
-> Do not have `rsync` on Windows? Use Git Bash, or this `scp` fallback. It uploads
-> the `.git` folder too (slower) and may print a harmless `.git/...rev failed`
-> warning at the end — that file is not needed, so you can ignore it:
->
-> ```bash
-> # LOCAL: simpler but copies extra junk; the dataset still uploads fully
-> scp -r 
->        melikas@narval.alliancecan.ca:~/projects/def-plago/melikas/projects/rhythmssl_project/
-> ```
-
-## Step 2 — Verify the upload (NARVAL)
+## 1. Package the committed code and the two caches (LOCAL)
 
 ```bash
-# NARVAL: go into the project and confirm the dataset is there
-ssh melikas@narval.alliancecan.ca
-ssh melikas@rorqual.alliancecan.ca
-ssh melikas@nibi.alliancecan.ca
-cd ~/projects/def-plago/melikas/projects/rhythmssl_project
-ls -lh datasets/HRD_RAW_MinuteLevel.csv
+git status --short                   # must print nothing: runs refuse uncommitted code
+python scripts/stamp_version.py      # prints: CODE_VERSION: <commit> (clean)
+git archive --format=tar.gz -o rescue_upload.tgz \
+    --prefix=rhythmssl_rescue/datasets/cache/ \
+    --add-file=datasets/cache/hrd_rescue_v1.npz --add-file=datasets/cache/globem_rescue_v1.npz \
+    --prefix=rhythmssl_rescue/ --add-file=CODE_VERSION HEAD
+scp rescue_upload.tgz melikas@narval.alliancecan.ca:~/projects/def-plago/melikas/projects/
 ```
 
+The archive holds exactly the committed files, the commit stamp and the caches (~40 MB); no raw
+CSV is needed on the cluster.
 
-## Step 3 — Submit a job (NARVAL)
-
-`sbatch` puts your job in the queue; the cluster runs it when a GPU is free.
-You do **not** wait at the terminal — the job runs in the background.
+## 2. Unpack and build the environment once (NARVAL)
 
 ```bash
-# NARVAL: run the BASELINE experiment (TCN + Transformer/sinusoidal)
-cd ~/projects/def-plago/melikas/projects/rhythmssl_project
-sbatch scripts/run.sh
-# 2. smoke test -- the heaviest task, no self-heal
-sbatch --array=12 scripts/run.sh
-"
-narval: 
-
-
-logs/cost_rq1-19421181_0.out       (seed 43)
-number** — it is your `<jobid>`.
-
-
-# NARVAL: follow the log live as the job runs 
-tail -n 40 logs/cost_hrd-20071782_0.out
+cd ~/projects/def-plago/melikas/projects
+tar xzf rescue_upload.tgz            # creates rhythmssl_rescue/
+cd rhythmssl_rescue
+cat CODE_VERSION                     # the commit you packaged, "git_dirty": false
+bash slurm/setup_env.sh              # login node only: needs the internet for CosinorPy
 ```
-logs/rhythmssl_project-16829002.out
-less logs/cost_hrd-<jobid>.out
 
-
-squeue -u melikas
+If `setup_env.sh` stops because `~/venvs/dssl` already exists, check that environment instead:
 
 ```bash
-# NARVAL: full details of one job (node, time used, why it is pending, ...)
-scontrol show job <jobid>
+source slurm/env.sh && python -c "import torch, sklearn, statsmodels, seaborn, tasks.yan_cosinor; from CosinorPy import cosinor; print('ok', torch.__version__)"
 ```
 
----
-
-## Step 6 — Cancel a job (NARVAL)
+## 3. GPU smoke test (NARVAL, ~15–30 min)
 
 ```bash
-# NARVAL: cancel one job by its id
-scancel 
-
-# NARVAL: cancel ALL of your jobs at once
-scancel -u melikas
+mkdir -p logs
+sbatch --account=def-plago slurm/smoke.sbatch        # prints: Submitted batch job <id>
 ```
 
----
-
-## Step 7 — Download the results (Narval → LOCAL)
-
-```powershell
-# LOCAL: back to the project folder
-cd c:\Users\umroot\Documents\CoST
-```
+When `squeue -u $USER` no longer lists it:
 
 ```bash
-# LOCAL: download the results of one job (replace <jobid>)
-rsync -avP \
-  melikas@narval.alliancecan.ca:~/projects/def-plago/melikas/projects/rhythmssl_project/results_hrd/62952884 \
-  ./results_hrd/
+sacct -j <id> --format=JobID%18,State,Elapsed        # State must be COMPLETED
+grep -iE 'traceback|error' logs/dssl-smoke_<id>.err  # must print nothing
+ls results/SUMMARY_narval_v1_smoke_cuda.md           # the whole output chain ran
+tail -n 5 logs/dssl-smoke_<id>.out                   # measured time per update
 ```
 
+The last lines read like `hrd cost_reference: 1.234 s/update -> 2.06 h for 6000 updates
+(training only)`. Each task also needs time for evaluation, so if the largest projection
+(normally `hrd cost_reference`) is above 2.5 h, submit with `TIME=12:00:00` in step 4.
 
----
-
-## Step 8 — Delete old outputs on Narval (cleanup)
-
-After you have downloaded results you no longer need on the cluster, free up
-space. **`rm -rf` permanently deletes — double-check the path first.**
+## 4. Submit the study (NARVAL)
 
 ```bash
-# NARVAL: see how big each job's results are
-cd ~/projects/def-plago/melikas/projects/rhythmssl_project
-du -sh results_hrd/*
-
-# NARVAL: delete ONE job's results
-rm -rf results_hrd/<jobid>
-
-# NARVAL: delete old log files too (optional)
-rm -f logs/cost_hrd-<jobid>.out
+bash slurm/submit.sh def-plago
 ```
 
-## Notes
+This queues, per dataset, 15 reference tasks, then 15 variant tasks once every reference task
+succeeded, then a CPU summary once every variant task succeeded (3 seeds × 5 folds). Each task
+uses one `a100_3g.20gb` GPU slice, 4 CPUs, 32 GB and at most 3 h. Options:
 
-- One A100 GPU is enough; 64 GB RAM covers the ~4 GB CSV plus the model.
+```bash
+TIME=12:00:00 bash slurm/submit.sh def-plago         # longer limit (12 h partition, slower queue)
+GPU=gpu:a100:1 bash slurm/submit.sh def-plago        # whole A100s
+bash slurm/submit.sh def-plago narval_v2             # a new run name; required after any code change
+```
+
+## 5. Monitor (NARVAL)
+
+```bash
+squeue -u $USER                                        # pending (PD) / running (R)
+sacct -j <array_id> --format=JobID%18,State,Elapsed,MaxRSS
+tail -n 20 logs/dssl-rq123_<array_id>_<task>.out       # training progress of one task
+scancel <jobid>                                        # cancel one job or array
+scancel -u melikas                                     # cancel ALL your jobs
+```
+
+Task `t` is seed `t // 5 + 1`, fold `t % 5`.
+
+## 6. If a task fails or times out (NARVAL)
+
+Resubmitting a task resumes it from its last checkpoint (every 100 updates); finished tasks
+are skipped. The jobs waiting on the failed array can never start, so cancel them and chain new
+ones (`hrd` shown; use `globem` for the other dataset):
+
+```bash
+scancel <waiting_variant_array_id> <waiting_summary_id>
+# a failed REFERENCE task, then the variant array and summary behind it:
+ref=$(sbatch --parsable --account=def-plago --array=<failed_tasks> --export=ALL,DATASET=hrd,RUN_NAME=narval_v1,STAGE=reference slurm/rq123.sbatch)
+var=$(sbatch --parsable --account=def-plago --dependency=afterok:$ref --export=ALL,DATASET=hrd,RUN_NAME=narval_v1,STAGE=variant slurm/rq123.sbatch)
+sbatch --account=def-plago --dependency=afterok:$var --export=ALL,DATASET=hrd,RUN_NAME=narval_v1 slurm/summarize.sbatch
+# a failed VARIANT task, then the summary behind it:
+var=$(sbatch --parsable --account=def-plago --array=<failed_tasks> --export=ALL,DATASET=hrd,RUN_NAME=narval_v1,STAGE=variant slurm/rq123.sbatch)
+sbatch --account=def-plago --dependency=afterok:$var --export=ALL,DATASET=hrd,RUN_NAME=narval_v1 slurm/summarize.sbatch
+```
+
+Add `--time=12:00:00` to the `sbatch` lines if the task timed out. Do not run the same task
+twice at once, and do not change the code within one run name.
+
+## 7. Bring the results home
+
+NARVAL, once both summary jobs are COMPLETED (training checkpoints `*.pt` stay behind):
+
+```bash
+tar czf ~/rescue_results_narval_v1.tgz --exclude='*.pt' \
+    results/SUMMARY_narval_v1.md results/hrd/narval_v1 results/globem/narval_v1
+```
+
+LOCAL, at this repository's root:
+
+```bash
+scp melikas@narval.alliancecan.ca:~/rescue_results_narval_v1.tgz .
+tar xzf rescue_results_narval_v1.tgz                  # unpacks into results/
+```
+
+Open `results/SUMMARY_narval_v1.md` first; per dataset,
+`results/<dataset>/narval_v1/tcn_none/REPORT.html` has every table and figure.

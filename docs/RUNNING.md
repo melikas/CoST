@@ -1,7 +1,8 @@
-# Corrected RQ1–RQ3 experiments: running them on Narval
+# Corrected RQ1–RQ3 experiments: design, outputs and running on Narval
 
 The authoritative design is `docs/SCIENTIFIC_PROTOCOL.md` (including its dated execution
-amendments). Historical entry points are not part of this protocol.
+amendments). Historical entry points are not part of this protocol. **Every Narval command, in
+order, is in [CLUSTER.md](../CLUSTER.md).**
 
 ## The model
 
@@ -53,7 +54,9 @@ variant    within-person input → Yan cosinor + random projection baselines →
 A variant loads the reference for its seed × fold and refuses it if its data, settings or code
 differ. After all 15 variant tasks succeed, a CPU job (`--summarize`) pools the out-of-fold
 records, computes paired participant-bootstrap intervals, and writes tables, figures and
-plain-language summaries. `slurm/submit.sh` chains the three steps.
+plain-language summaries. `slurm/submit.sh` chains the three steps. By default each GPU task
+uses one `a100_3g.20gb` slice, 4 CPUs, 32 GB and at most 3 h (`TIME=` and `GPU=` override);
+the GPU smoke job reports the measured time per update of both full-size models.
 
 GLOBEM uses only its earliest cohort (2018), because cross-year identity linkage is unavailable.
 RQ2 applies to HRD only: GLOBEM's overlapping 28-day windows and 6-hour bins cannot express the
@@ -81,9 +84,10 @@ select the penalty; the test fold never selects anything).
 | `dssl` | ✓ | ✓ | ✓ | Proposed method |
 
 RQ3 is reported for the primary logistic probe and, separately, for the manuscript's secondary
-random-forest ladder (AUROC only; never used for RQ3 claims). The published GLOBEM benchmark
-algorithms need the full daily RAPIDS feature set and weekly labels that `GLOBEM_REDUCED.csv`
-lacks, so they are listed as not reproducible and no published score is inserted.
+random-forest ladder (AUROC only; never used for RQ3 claims). The GLOBEM benchmark algorithms
+(Xu et al. 2022) are defined on the full RAPIDS feature set and scored on weekly labels under
+the benchmark's own splits; `GLOBEM_REDUCED.csv` keeps 14 of those features, so they are listed
+as not reproducible and no published score is inserted.
 
 ## Local check (CPU)
 
@@ -96,99 +100,6 @@ python scripts/run_experiment.py --dataset hrd --smoke --device cpu --summarize
 
 (Same for `--dataset globem`.) Smoke runs use an execution-sized model and 2 updates, write to
 `results/<dataset>/<run>_smoke_cpu/`, and are labelled as having no scientific meaning.
-
-## Narval: exact commands
-
-**0. Commit, stamp and copy the code and the two caches** (from this repository root on your
-machine). Scientific runs refuse uncommitted code. The copy has no `.git`, so first record the
-commit in `CODE_VERSION`, which every manifest then carries:
-
-```bash
-git status --short                       # must list no modified tracked files
-python scripts/stamp_version.py          # prints CODE_VERSION: <commit> (clean)
-rsync -avP --exclude '.git/' --exclude 'results*/' --exclude 'archive/' --exclude 'logs/' \
-      --exclude 'datasets/*.csv' --exclude '__pycache__/' --exclude 'SSL_Rhythmicity/' \
-      ./ melikas@narval.alliancecan.ca:~/projects/def-plago/melikas/projects/rhythmssl_project/
-```
-
-The jobs read only `datasets/cache/hrd_rescue_v1.npz` and `datasets/cache/globem_rescue_v1.npz`;
-the raw CSVs are not needed. Then log in and
-`cd ~/projects/def-plago/melikas/projects/rhythmssl_project`. Every command below runs from
-that directory on a login node.
-
-**1. Build the environment once** (login node, it needs the internet for CosinorPy):
-
-```bash
-bash slurm/setup_env.sh
-```
-
-It creates `~/venvs/dssl` (override with `DSSL_VENV`) from `StdEnv/2023 python/3.11`, installs
-PyTorch and the scientific stack from the Alliance wheelhouse, installs `CosinorPy==3.1 --no-deps`,
-checks the imports and writes `logs/pip_freeze.txt`. Jobs load the same modules through
-`slurm/env.sh`; nothing is installed inside a job. Mamba (`mamba-ssm`) is not installed; the
-TCN runs need none of it.
-
-**2. GPU smoke test** (checks CUDA, deterministic GPU operations, CosinorPy and the whole output
-chain, reference stage included, on a tiny subset with an execution-sized model):
-
-```bash
-mkdir -p logs
-sbatch --account=def-plago slurm/smoke.sbatch
-```
-
-Check `logs/dssl-smoke_<jobid>.err` is free of tracebacks and that
-`results/SUMMARY_narval_v1_smoke_cuda.md` exists. Its numbers are meaningless by design.
-
-**3. Submit the full study** (both datasets: the reference array, then the variant array once
-every reference task succeeded, then the summary once every variant task succeeded):
-
-```bash
-bash slurm/submit.sh def-plago
-```
-
-`GPU=gpu:a100_3g.20gb:1 bash slurm/submit.sh def-plago` requests MIG slices instead of whole
-A100s. The second argument sets a new run name, e.g. `bash slurm/submit.sh def-plago narval_v2`;
-never reuse a name after changing code. Another variant reuses the run's reference:
-
-```bash
-BACKBONE=transformer ENCODING=sinusoidal SKIP_REFERENCE=1 bash slurm/submit.sh def-plago narval_v1
-```
-
-**4. Monitor:**
-
-```bash
-squeue -u $USER
-sacct -j <array_id> --format=JobID%18,State,Elapsed,MaxRSS
-tail -n 20 logs/dssl-rq123_<array_id>_<task>.out
-```
-
-GPU timing is unmeasured: the smoke test uses an execution-sized model, so the first full task's
-`Elapsed` is the first real measurement. The 8 h limit is a safety margin.
-
-**5. If a task fails or times out**, resubmitting the same task resumes it from its last
-checkpoint (completed tasks are skipped). The job waiting on the failed array can never start,
-so replace it:
-
-```bash
-scancel <old_dependent_job_id>
-sbatch --account=def-plago --array=<failed_tasks> \
-       --export=ALL,DATASET=hrd,RUN_NAME=narval_v1,STAGE=variant slurm/rq123.sbatch
-sbatch --account=def-plago --dependency=afterok:<new_array_id> \
-       --export=ALL,DATASET=hrd,RUN_NAME=narval_v1 slurm/summarize.sbatch
-```
-
-For a failed reference task use `STAGE=reference`, then resubmit the variant array and summary
-with `--dependency=afterok:`. Task `t` is seed `t // 5 + 1`, fold `t % 5`. Do not run the same
-task twice concurrently: the reference stage takes an exclusive lock per seed × fold. Do not edit
-code between tasks of one run: the summary refuses runs whose code hashes differ.
-
-**6. Bring results home** (restart checkpoints excluded):
-
-```bash
-rsync -avP --exclude '*.pt' melikas@narval.alliancecan.ca:~/projects/def-plago/melikas/projects/rhythmssl_project/results/ ./results/
-```
-
-`*_training.pt` restart checkpoints can be deleted once that task's `complete.json` exists.
 
 ## What to open
 
@@ -239,7 +150,7 @@ timing and strength are both required for RQ2; RQ3 requires improvement over bot
 | `tasks/projection.py` | Training-fitted random projection |
 | `datautils.py`, `scripts/build_cache.py`, `data_processing/` | Caches, validation, participant folds |
 | `configs/hrd.json`, `configs/globem.json` | The paper model, budgets and split settings |
-| `scripts/stamp_version.py` | Records the git commit for the cluster copy |
+| `scripts/stamp_version.py`, `scripts/time_steps.py` | Commit stamp for the cluster copy; measured time per update |
 | `slurm/setup_env.sh`, `slurm/env.sh` | Narval environment |
 | `slurm/smoke.sbatch`, `slurm/rq123.sbatch`, `slurm/summarize.sbatch`, `slurm/submit.sh` | Jobs |
 | `tests/` | Unit tests, including the paper-model conformance test |

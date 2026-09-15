@@ -1,16 +1,19 @@
 #!/bin/bash
 #SBATCH --job-name=dssl-rq123
 #SBATCH --array=0-14
-#SBATCH --gres=gpu:1
-#SBATCH --cpus-per-task=8
+#SBATCH --gres=gpu:a100_3g.20gb:1
+#SBATCH --cpus-per-task=4
 #SBATCH --mem=32G
-#SBATCH --time=08:00:00
+#SBATCH --time=03:00:00
 #SBATCH --output=logs/%x_%A_%a.out
 #SBATCH --error=logs/%x_%A_%a.err
 # One task = one seed x fold.
 #   STAGE=reference  trains the CoST reference adapter only (shared by every variant)
 #   STAGE=variant    trains the variant (BACKBONE/ENCODING, default: the config's) and
 #                    evaluates RQ1-RQ3 against the cached reference
+# Up to 3 h a job also fits Narval's 3 h partition, which queues far faster than 12 h.
+# slurm/submit.sh overrides GPU and time (GPU=..., TIME=...); a task that times out resumes
+# from its last checkpoint (every 100 updates) when resubmitted.
 cd "${SLURM_SUBMIT_DIR:?Submit from the repository root}"
 source slurm/env.sh
 set -euo pipefail

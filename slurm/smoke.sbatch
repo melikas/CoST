@@ -1,12 +1,14 @@
 #!/bin/bash
 #SBATCH --job-name=dssl-smoke
-#SBATCH --gres=gpu:1
-#SBATCH --cpus-per-task=8
-#SBATCH --mem=16G
+#SBATCH --gres=gpu:a100_3g.20gb:1
+#SBATCH --cpus-per-task=4
+#SBATCH --mem=32G
 #SBATCH --time=01:00:00
 #SBATCH --output=logs/%x_%j.out
 #SBATCH --error=logs/%x_%j.err
-# Execution check on the GPU (drivers, deterministic CUDA ops, CosinorPy); no scientific results.
+# Execution check on the study's GPU type (drivers, deterministic CUDA ops, CosinorPy, the
+# reference stage and the whole output chain); no scientific results. Then the measured time
+# per update of the full-size models, to check against the study's --time limit.
 cd "${SLURM_SUBMIT_DIR:?Submit from the repository root}"
 source slurm/env.sh
 set -euo pipefail
@@ -16,3 +18,4 @@ for dataset in hrd globem; do
     done
     srun python scripts/run_experiment.py --dataset "$dataset" --smoke --summarize --device cuda
 done
+srun python scripts/time_steps.py --device cuda
