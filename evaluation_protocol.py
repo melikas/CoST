@@ -227,6 +227,85 @@ def evaluate(features, markers, pids, labels, train_ids, test_ids, channels, out
                                          ridge_alpha=1.0, threshold=0.5))
 
 
+# ---- RQ1 disentanglement: each window target from its own branch, and from the other branch
+# (leakage). target: (own blocks, leakage blocks), each a contiguous run of cost.DSSL.blocks().
+BRANCHES = {'MESOR': (('trend',), ('amplitude', 'phase')),
+            'amplitude': (('amplitude',), ('trend',)),
+            'acrophase': (('phase',), ('trend',))}
+
+
+def disentanglement(features, layouts, window, pids, window_ids, test_ids, channels, output):
+    """Predict every held-out window's targets (tasks.rhythm.window_rhythm) from one branch of
+    a frozen representation. Scaling and the ridge (alpha 1, as in RQ1) are fitted on all
+    other windows; no label is read. `layouts` maps a method to (DSSL.blocks(), pair_block())."""
+    test = np.isin(pids, test_ids)
+    frames = []
+    for method, (blocks, pair) in layouts.items():
+        for target, roles in BRANCHES.items():
+            y = np.asarray(np.stack([window['phase_cos'], window['phase_sin']], -1) if target == 'acrophase'
+                           else window[target][..., None], dtype=float)      # windows x channels x 1|2
+            for role, names in zip(('own', 'leakage'), roles):
+                lo, hi = blocks[names[0]][0], blocks[names[-1]][1]
+                local = (pair[0] - lo, pair[1]) if pair and lo <= pair[0] < hi else None
+                z = features[method][:, lo:hi].astype(float)             # encode() returns float32
+                z = feature_scaler(local).fit(z[~test]).transform(z)
+                for c, channel in enumerate(channels):
+                    ok = np.isfinite(y[:, c]).all(1)
+                    fit, score = ok & ~test, ok & test
+                    pred = Ridge(alpha=1.0).fit(z[fit], y[fit, c]).predict(z[score]).reshape(-1, y.shape[2])
+                    truth = y[score, c]
+                    frames.append(pd.DataFrame(dict(
+                        method=method, target=target, role=role, channel=channel,
+                        participant=pids[score].astype(str), window_id=np.asarray(window_ids)[score].astype(str),
+                        truth=truth[:, 0], prediction=pred[:, 0],
+                        truth_sin=truth[:, -1] if y.shape[2] == 2 else np.nan,
+                        prediction_sin=pred[:, -1] if y.shape[2] == 2 else np.nan)))
+    pd.concat(frames, ignore_index=True).to_csv(Path(output)/'rq1_disentanglement.csv', index=False)
+
+
+def disentanglement_intervals(frame, rng, n_boot):
+    """Held-out R², floored at 0, of the own and the leakage branch per method x target: pooled
+    over folds within a seed, averaged over channels, then over seeds. One participant
+    bootstrap (the same draws for every method, target and seed) gives the intervals of the
+    own and leakage R², their difference, and DSSL's difference minus each control's."""
+    f = frame.fillna({'truth_sin': 0., 'prediction_sin': 0.})
+    f = f.assign(n=1., sse=(f.truth - f.prediction) ** 2 + (f.truth_sin - f.prediction_sin) ** 2,
+                 ss=f.truth ** 2 + f.truth_sin ** 2, s_cos=f.truth, s_sin=f.truth_sin)
+    stats = f.groupby(['seed', 'method', 'target', 'role', 'channel', 'participant'])[
+        ['n', 'sse', 'ss', 's_cos', 's_sin']].sum().unstack('participant', fill_value=0.)
+    people = stats.shape[1] // 5
+    draws = rng.integers(people, size=(n_boot, people))
+    weights = np.vstack([np.ones(people)] + [np.bincount(d, minlength=people) for d in draws])
+    n, sse, ss, s_cos, s_sin = np.einsum('bp,ksp->sbk', weights, stats.to_numpy().reshape(len(stats), 5, people))
+    with np.errstate(divide='ignore', invalid='ignore'):
+        r2 = pd.DataFrame(np.clip(1 - sse / (ss - (s_cos ** 2 + s_sin ** 2) / n), 0, 1).T, index=stats.index)
+    r2 = r2.groupby(level=['seed', 'method', 'target', 'role']).mean().groupby(level=['method', 'target', 'role']).mean()
+    own, leakage = r2.xs('own', level='role'), r2.xs('leakage', level='role')
+    gap = own - leakage
+    rows = []
+
+    def add(method, target, quantity, values):
+        rows.append(dict(method=method, target=target, quantity=quantity, estimate=values[0],
+                         low=np.nanquantile(values[1:], .025), high=np.nanquantile(values[1:], .975)))
+
+    for method, target in own.index:
+        add(method, target, 'own', own.loc[(method, target)].to_numpy())
+        add(method, target, 'leakage', leakage.loc[(method, target)].to_numpy())
+        add(method, target, 'own_minus_leakage', gap.loc[(method, target)].to_numpy())
+        if method != 'dssl' and ('dssl', target) in gap.index:
+            add(method, target, 'dssl_minus_method', (gap.loc[('dssl', target)] - gap.loc[(method, target)]).to_numpy())
+    # Acrophase error in hours (point estimates), for reading the acrophase R² on a clock.
+    a = frame[frame.target == 'acrophase']
+    hours = np.abs(np.angle(np.exp(1j * (np.arctan2(a.prediction_sin, a.prediction)
+                                         - np.arctan2(a.truth_sin, a.truth))))) * 12 / np.pi
+    hours = a.assign(hours=hours).groupby(['seed', 'method', 'role']).hours.mean().groupby(['method', 'role']).mean()
+    rows += [dict(method=m, target='acrophase', quantity=f'{role}_error_hours', estimate=v, low=np.nan, high=np.nan)
+             for (m, role), v in hours.items()]
+    channels = pd.DataFrame(np.clip(1 - sse[0] / (ss[0] - (s_cos[0] ** 2 + s_sin[0] ** 2) / n[0]), 0, 1),
+                            index=stats.index, columns=['R2']).groupby(level=['method', 'target', 'role', 'channel']).R2.mean()
+    return pd.DataFrame(rows), channels.unstack('role').reset_index()
+
+
 def paired_interval(diff, rng, n_boot):
     """Participant bootstrap of a mean paired difference, conditional on the fitted models."""
     boot = diff[rng.integers(len(diff), size=(n_boot, len(diff)))].mean(axis=1)
@@ -244,7 +323,7 @@ def summarize(root, seeds, folds, smoke=False):
     root = Path(root)
     n_boot = 200 if smoke else 2000
     order = [m for m, *_ in LADDER]
-    frames, recovery, clinical, personalized = [], [], [], []
+    frames, recovery, clinical, personalized, disentangled = [], [], [], [], []
     invariant = None
     for seed in seeds:
         for fold in range(folds):
@@ -266,7 +345,8 @@ def summarize(root, seeds, folds, smoke=False):
             if current != invariant:
                 raise ValueError('Runs have different data, code, settings or dependencies')
             for name, dest in [('rq3_predictions', frames), ('rq1_recovery', recovery),
-                               ('secondary_endpoint_markers', clinical), ('rq2_personalized', personalized)]:
+                               ('secondary_endpoint_markers', clinical), ('rq2_personalized', personalized),
+                               ('rq1_disentanglement', disentangled)]:
                 frame = pd.read_csv(path/f'{name}.csv', dtype={'participant': str})
                 frame['seed'], frame['fold'] = seed, fold
                 dest.append(frame)
@@ -351,6 +431,10 @@ def summarize(root, seeds, folds, smoke=False):
     families = pd.DataFrame(families, columns=['marker','control','n','difference','low','high'])
     cells.to_csv(root/'rq1_paired_intervals.csv',index=False)
     families.to_csv(root/'rq1_family_intervals.csv',index=False)
+    ent_intervals, ent_channels = disentanglement_intervals(pd.concat(disentangled, ignore_index=True),
+                                                            np.random.default_rng(20260914), n_boot)
+    ent_intervals.to_csv(root/'rq1_disentanglement_intervals.csv', index=False)
+    ent_channels.to_csv(root/'rq1_disentanglement_channels.csv', index=False)
     # ---- RQ2: each seed separately, then participant concordances; windows never cross seeds.
     rq2 = pd.concat(personalized, ignore_index=True)
     rq2_summary, rq2_person = [], []

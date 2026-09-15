@@ -8,10 +8,13 @@ from pathlib import Path
 
 import numpy as np
 import pandas as pd
+from sklearn.metrics import r2_score
 from sklearn.preprocessing import StandardScaler
 
-from evaluation_protocol import IsotropicPairScaler, evaluate, feature_scaler, logistic_probe
+from evaluation_protocol import (IsotropicPairScaler, disentanglement, disentanglement_intervals,
+                                 evaluate, feature_scaler, logistic_probe)
 from tasks.personalized import personalized_records
+from tasks.rhythm import window_rhythm
 
 
 class EvaluationProtocolTests(unittest.TestCase):
@@ -85,6 +88,42 @@ class CircularPhaseScaler(unittest.TestCase):
         self.assertIsInstance(feature_scaler(None), StandardScaler)
         self.assertIsInstance(logistic_probe(1.0, 0, (1, 2)).steps[1][1], IsotropicPairScaler)
         self.assertIsInstance(logistic_probe(1.0, 0).steps[1][1], StandardScaler)
+
+
+class Disentanglement(unittest.TestCase):
+    def test_window_targets_follow_the_cosinor_convention(self):
+        t = np.arange(7 * 96)
+        x = (3 + 2 * np.cos(2 * np.pi * (t - 24) / 96))[None, :, None]    # peak 6 h after the start
+        w = window_rhythm(x, 96)
+        np.testing.assert_allclose([w['MESOR'][0, 0], w['amplitude'][0, 0]], [3, 2], atol=1e-12)
+        np.testing.assert_allclose([w['phase_cos'][0, 0], w['phase_sin'][0, 0]], [0, 1], atol=1e-12)
+
+    def test_own_branch_beats_leakage_only_when_branches_separate(self):
+        rng = np.random.default_rng(0)
+        n = 240
+        pids = np.repeat([f'p{i:02}' for i in range(24)], 10)
+        angle = rng.uniform(-np.pi, np.pi, (n, 1))
+        window = dict(MESOR=rng.normal(size=(n, 1)), amplitude=rng.gamma(2., size=(n, 1)),
+                      phase_cos=np.cos(angle), phase_sin=np.sin(angle))
+        noise = lambda k: rng.normal(size=(n, k))
+        separated = np.hstack([window['MESOR'] + .1 * noise(1), noise(3),
+                               window['amplitude'] + .1 * noise(1), noise(3),
+                               window['phase_cos'], window['phase_sin'], noise(2)])
+        blocks = {'trend': (0, 4), 'amplitude': (4, 8), 'phase': (8, 12)}
+        features = {'dssl': separated.astype(np.float32), 'untrained': noise(12).astype(np.float32)}  # as encode()
+        with tempfile.TemporaryDirectory() as directory:
+            disentanglement(features, {m: (blocks, None) for m in features}, window, pids, pids,
+                            np.unique(pids)[:8], ['Steps'], directory)
+            frame = pd.read_csv(Path(directory) / 'rq1_disentanglement.csv').assign(seed=1)
+        intervals, _ = disentanglement_intervals(frame, np.random.default_rng(1), 100)
+        q = intervals.set_index(['method', 'target', 'quantity'])
+        for target in ('MESOR', 'amplitude', 'acrophase'):
+            self.assertGreater(q.loc[('dssl', target, 'own'), 'estimate'], .9)
+            self.assertLess(q.loc[('dssl', target, 'leakage'), 'estimate'], .1)
+            self.assertGreater(q.loc[('untrained', target, 'dssl_minus_method'), 'low'], 0)
+        # The bootstrap's point estimate is the ordinary held-out R².
+        g = frame[(frame.method == 'dssl') & (frame.target == 'MESOR') & (frame.role == 'own')]
+        self.assertAlmostEqual(q.loc[('dssl', 'MESOR', 'own'), 'estimate'], r2_score(g.truth, g.prediction))
 
 
 if __name__ == '__main__':

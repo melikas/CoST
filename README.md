@@ -17,7 +17,8 @@ evaluates RQ1–RQ3 from the same frozen features. `configs/hrd.json` and
 `configs/globem.json` instantiate the paper's DSSL (harmonic bands, trend experts up to
 T/8, contracted weights, level equivariance, within-person input); `--backbone` and
 `--temporal-encoding` select other variants, each written to its own
-`results/<dataset>/<run>/<backbone>_<encoding>/`. The CoST reference adapter is trained
+`results/<dataset>/<run>/<backbone>_<encoding>/`. RQ1 includes a disentanglement audit: each
+window's MESOR, 24-h amplitude and acrophase from its own branch versus the other branch. The CoST reference adapter is trained
 once per seed × fold and shared by every variant.
 
 ```bash

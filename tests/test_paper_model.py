@@ -74,9 +74,11 @@ class PaperModel(unittest.TestCase):
         self.assertEqual(self.hrd.config["phase_readout"], "angle")
         self.assertEqual(self.hrd.encode(x).shape, (2, 160 + 800 + 800))
         self.assertIsNone(self.hrd.pair_block())
+        self.assertEqual(self.hrd.blocks(), {"trend": (0, 160), "amplitude": (160, 960), "phase": (960, 1760)})
         circular = DSSL(3, **HRD, device="cpu", phase_readout="circular")
         circular.net.load_state_dict(self.hrd.net.state_dict())
         self.assertEqual(circular.pair_block(), (960, 800))
+        self.assertEqual(circular.blocks()["phase"], (960, 2560))
         self.assertEqual(circular.encode(x).shape, (2, 160 + 800 + 2 * 800))
 
     def test_globem_architecture(self):

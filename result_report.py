@@ -35,6 +35,11 @@ EXTERNAL = [
 ]
 FAMILIES = ('amplitude', 'phase_hours', 'IS', 'IV', 'RA')        # MESOR is supplementary
 PERTURBATION = {'phase': 'timing (0.5-4 h shifts)', 'amplitude': 'strength (24-h amplitude x(1±α))'}
+# RQ1 disentanglement: target -> (label, own branch, leakage branch); see evaluation_protocol.BRANCHES.
+DISENTANGLEMENT = {'MESOR': ('MESOR (window mean)', 'trend', 'seasonal amplitude + phase'),
+                   'amplitude': ('24-h amplitude', 'seasonal amplitude', 'trend'),
+                   'acrophase': ('24-h acrophase', 'seasonal phase', 'trend')}
+DISENTANGLED = ('dssl', 'untrained', 'cost_reference_adapter')
 NOTES = ('Intervals are paired participant-bootstrap 95% intervals, conditional on the fitted models '
          '(no retraining uncertainty) and not simultaneous across rows. "inconclusive" means the '
          'interval includes 0: it is not evidence of equivalence. Missing estimates are unavailable, '
@@ -98,6 +103,35 @@ def write_report(root, smoke=False):
     tables += [('RQ1 — Marker families: control error minus DSSL error (positive favours DSSL)', 'RQ1_families.csv', family_table),
                ('RQ1 — Individual rhythm recovery per marker and channel (MAE, lower is better)', 'RQ1_table.csv', rq1),
                ('RQ1 — All paired marker/channel comparisons', 'RQ1_comparisons.csv', cells)]
+    # ---- RQ1 disentanglement audit: own branch vs leakage per target (held-out R², floored at 0).
+    ent = pd.read_csv(root/'rq1_disentanglement_intervals.csv').set_index(['method', 'target', 'quantity'])
+
+    def cell(method, target, quantity):
+        return ent.loc[(method, target, quantity)] if (method, target, quantity) in ent.index else None
+
+    audit, versus = [], []
+    for target, (label, own, leak) in DISENTANGLEMENT.items():
+        for method in DISENTANGLED:
+            gap = cell(method, target, 'own_minus_leakage')
+            if gap is None:
+                continue
+            hours = [cell(method, target, f'{r}_error_hours') for r in ('own', 'leakage')]
+            audit.append({'target': label, 'method': method, 'own branch': own,
+                          'own R²': cell(method, target, 'own').estimate,
+                          'leakage branch': leak, 'leakage R²': cell(method, target, 'leakage').estimate,
+                          'own − leakage [95% CI]': estimate(gap.estimate, gap.low, gap.high),
+                          'evidence': verdict(gap.low, gap.high, 'separated', 'entangled'),
+                          'acrophase error own / leakage (h)': ' / '.join(f'{h.estimate:.2f}' for h in hours)
+                          if all(h is not None for h in hours) else ''})
+            d = cell(method, target, 'dssl_minus_method')
+            if d is not None:
+                versus.append({'target': label, 'comparison': f'dssl − {method}',
+                               'difference in own − leakage [95% CI]': estimate(d.estimate, d.low, d.high),
+                               'evidence': verdict(d.low, d.high)})
+    audit, versus = pd.DataFrame(audit), pd.DataFrame(versus)
+    tables += [('RQ1 — Disentanglement audit: each target from its own branch vs the other branch (held-out windows)',
+                'RQ1_disentanglement.csv', audit),
+               ('RQ1 — Disentanglement: DSSL minus each control', 'RQ1_disentanglement_comparisons.csv', versus)]
     # ---- RQ2
     rq2, rq2i = pd.read_csv(root/'rq2_summary.csv'), pd.read_csv(root/'rq2_paired_intervals.csv')
     rq2i['evidence'] = [verdict(r.low, r.high, 'above chance', 'below chance') if r.comparison.endswith('chance')
@@ -164,6 +198,16 @@ def write_report(root, smoke=False):
              condition('DSSL beats the untrained encoder in every eligible family',
                        min([fam.loc[(f, 'untrained'), 'low'] for f in eligible] or [np.nan])),
              '', 'Per-channel detail: `RQ1_table.csv`, `rq1_recovery.png`, `rq1_families.png`.', '',
+             '### Disentanglement audit (window level, held-out participants)', '',
+             'Every held-out window\'s MESOR, 24-h amplitude and 24-h acrophase is predicted from its own branch '
+             'and, as leakage, from the other branch (ridge; held-out R², floored at 0; channels averaged, then '
+             'seeds). "separated" means own minus leakage is above 0 with its 95% CI.', '',
+             markdown(audit), '', markdown(versus), '',
+             condition('DSSL: own branch above leakage for MESOR, 24-h amplitude and 24-h acrophase',
+                       np.min([getattr(cell('dssl', t, 'own_minus_leakage'), 'low', np.nan) for t in DISENTANGLEMENT])),
+             condition('DSSL separates the branches better than the untrained encoder on all three targets',
+                       np.min([getattr(cell('untrained', t, 'dssl_minus_method'), 'low', np.nan) for t in DISENTANGLEMENT])),
+             '', 'Per-channel R²: `rq1_disentanglement_channels.csv`.', '',
              '## RQ2 — Do unlabeled personal baselines detect within-person rhythmic deviations?', '']
     if len(rq2):
         def low(comparison, perturbation):

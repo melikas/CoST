@@ -24,7 +24,7 @@ from models import losses as O
 from models.encoder import CoSTEncoder
 
 __all__ = ["PretrainDataset", "CoSTModel", "DSSL", "WEIGHTS", "REFERENCE_SHARED",
-           "spectral_freqs", "phase_block_layout", "spectral_readout", "band_keep",
+           "spectral_freqs", "spectral_readout", "band_keep",
            "smooth_bins_for"]
 
 
@@ -108,33 +108,6 @@ def spectral_freqs(seq_len, bins_per_day, harmonics=4):
     days = seq_len // int(bins_per_day)
     bins = ([days // 7] if days % 7 == 0 else []) + [k * days for k in range(1, harmonics + 1)]
     return sorted({i for i in bins if 0 < i < seq_len / 2})
-
-
-def phase_block_layout(readout, seasonal_dims, seq_len, bins_per_day, n_leading=0,
-                       harmonics=4, block=None):
-    """Where the (cos, sin) blocks sit in a representation, for `IsotropicPairScaler`.
-
-    Two offsets have to be right, and getting either wrong is worse than not scaling at all,
-    because it couples columns that are not a pair and leaves the real pair sheared:
-
-      * EACH BLOCK IS |f| * seasonal_dims WIDE, not seasonal_dims. The readout stacks blocks
-        shaped (b, |f|, d) flattened to |f|*d, and HRD reports |f| = 5 bins at the default
-        4 harmonics, so a block is 5 * 160 = 800 columns (13 * 160 = 2080 at 12).
-      * THE TREND BLOCK COMES FIRST in the full representation. `CoST.encode` concatenates
-        [trend | amp | cos | sin], so on HRD the cos block starts at 160 + 800 = 960. Pass
-        `n_leading=trend_dims` when probing the full vector, and `n_leading=0` when probing
-        the seasonal block on its own.
-
-    `block` overrides the width for a readout that keeps fewer columns (the band-matched
-    one); pass the encoded amplitude block's width.
-
-    Returns (pair_start, width), or (None, 0) for the 'angle' readout, which has no pair.
-    """
-    if readout != "circular":
-        return None, 0
-    if block is None:
-        block = len(spectral_freqs(seq_len, bins_per_day, harmonics)) * int(seasonal_dims)
-    return int(n_leading) + int(block), int(block)
 
 
 def band_keep(net):
@@ -464,17 +437,22 @@ class DSSL:
         return spectral_readout(z, self.bins_per_day, self.phase_readout, self.net.harmonics,
                                 self._keep)
 
+    def blocks(self):
+        """Column range (start, stop) of each branch in `encode` output: the trend readout,
+        then the seasonal amplitude block, then the phase block (twice as wide if circular)."""
+        t = self.net.trend_dims
+        a = (len(self._keep) if self._keep is not None else
+             len(spectral_freqs(self.seq_len, self.bins_per_day, self.net.harmonics)) * self.net.seasonal_dims)
+        p = 2 * a if self.phase_readout == "circular" else a
+        return {"trend": (0, t), "amplitude": (t, t + a), "phase": (t + a, t + a + p)}
+
     def pair_block(self):
         """(start, width) of the (cos, sin) phase columns in `encode` output, or None when the
         readout emits raw angles. Probes scale this block isotropically."""
         if self.phase_readout != "circular":
             return None
-        amp = (len(self._keep) if self._keep is not None else
-               len(spectral_freqs(self.seq_len, self.bins_per_day, self.net.harmonics))
-               * self.net.seasonal_dims)
-        return phase_block_layout("circular", self.net.seasonal_dims, self.seq_len,
-                                  self.bins_per_day, n_leading=self.net.trend_dims,
-                                  harmonics=self.net.harmonics, block=amp)
+        start, stop = self.blocks()["phase"]
+        return start, (stop - start) // 2
 
     @torch.no_grad()
     def encode(self, data, batch_size=256, pool="mean", parts=False):

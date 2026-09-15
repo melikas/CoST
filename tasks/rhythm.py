@@ -23,6 +23,17 @@ def cosinor_z(Xs, bpd):
     return a + 1j * b
 
 
+def window_rhythm(X, bins_per_day):
+    """RQ1 disentanglement targets per window x channel, on the model's input scale: MESOR
+    (the window mean) and the 24 h cosinor amplitude |z| and acrophase arg z as (cos, sin);
+    x = M + A cos(2 pi t / 24 h - phi), so phi is the peak time. Phase is NaN at zero amplitude."""
+    z = cosinor_z(X, bins_per_day)
+    defined = np.abs(z) > 1e-6
+    return dict(MESOR=X.mean(1), amplitude=np.abs(z),
+                phase_cos=np.where(defined, np.cos(np.angle(z)), np.nan),
+                phase_sin=np.where(defined, np.sin(np.angle(z)), np.nan))
+
+
 def individual_markers(raw_X, observed, bins_per_day, sensor_cols, min_coverage=0.7):
     """Original manuscript targets in physical feature units, one window x channel.
 

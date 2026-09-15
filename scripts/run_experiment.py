@@ -27,10 +27,10 @@ import pandas as pd
 import torch
 from cost import DSSL, REFERENCE_SHARED
 from datautils import load_npz, make_folds
-from evaluation_protocol import evaluate, summarize, write_json
+from evaluation_protocol import disentanglement, evaluate, summarize, write_json
 from tasks.personalized import personalized_records
 from tasks.projection import RawProjection
-from tasks.rhythm import individual_markers
+from tasks.rhythm import individual_markers, window_rhythm
 from tasks.yan_cosinor import yan_cosinor_features
 
 RQ2_COLUMNS = ['method', 'participant', 'window_id', 'perturbation', 'level',
@@ -172,7 +172,7 @@ def train_encoder(kwargs, label, out, data, steps):
     np.testing.assert_allclose(check.encode(X[:2], batch_size=16), features[:2], rtol=1e-5, atol=1e-5)
     write_json(out / f'{label}_model.json', dict(config=model.config,
                parameters=sum(p.numel() for p in model.net.parameters()), history=model.history))
-    return features, rows, model.pair_block()
+    return features, rows, (model.blocks(), model.pair_block())
 
 
 def cost_reference(base, common, model_cfg, data, steps, device):
@@ -193,7 +193,9 @@ def cost_reference(base, common, model_cfg, data, steps, device):
             raise ValueError(f'cached CoST reference covers different windows: {out}')
         rows = pd.read_csv(out / 'rq2_personalized.csv',
                            dtype={'participant': str, 'window_id': str}).to_dict('records')
-        return stored['cost_reference_adapter'], rows, json.loads((out / 'reference.json').read_text())['pair_block']
+        layout = json.loads((out / 'reference.json').read_text())
+        return (stored['cost_reference_adapter'], rows,
+                (layout['blocks'], tuple(layout['pair_block']) if layout['pair_block'] else None))
     out.mkdir(parents=True, exist_ok=True)
     lock = out / '.lock'
     try:
@@ -207,16 +209,16 @@ def cost_reference(base, common, model_cfg, data, steps, device):
         if (out / 'manifest.json').exists() and json.loads((out / 'manifest.json').read_text()) != manifest:
             raise ValueError(f'existing CoST reference manifest differs; use a new run name: {out}')
         write_json(out / 'manifest.json', manifest)
-        features, rows, pair = train_encoder(kwargs, 'cost_reference_adapter', out, data, steps)
+        features, rows, layout = train_encoder(kwargs, 'cost_reference_adapter', out, data, steps)
         np.savez_compressed(out / 'representations.npz', pids=data['pids'],
                             window_ids=data['window_ids'], cost_reference_adapter=features)
         pd.DataFrame(rows, columns=RQ2_COLUMNS).to_csv(out / 'rq2_personalized.csv', index=False)
-        write_json(out / 'reference.json', dict(pair_block=list(pair) if pair else None))
+        write_json(out / 'reference.json', dict(blocks=layout[0], pair_block=layout[1]))
         write_json(out / 'complete.json', dict(status='execution_smoke_only' if common['smoke'] else 'complete',
                                              windows=int(len(data['X']))))
     finally:
         lock.unlink(missing_ok=True)
-    return features, rows, (list(pair) if pair else None)
+    return features, rows, layout
 
 
 def main():
@@ -334,18 +336,19 @@ def main():
     features['random_projection'] = projection.encode(X)
     rq2_rows, rq2_status = personalized_records(projection, 'random_projection', X, raw, pids, window_ids,
                                                 fold.test_pids, c.bins_per_day, c.bin_minutes)
-    features['cost_reference_adapter'], reference_rows, reference_pair = reference
+    features['cost_reference_adapter'], reference_rows, reference_layout = reference
     rq2_rows.extend(reference_rows)
     features['untrained'] = untrained.encode(X, batch_size=16)
     rows, rq2_status = personalized_records(untrained, 'untrained', X, raw, pids, window_ids,
                                             fold.test_pids, c.bins_per_day, c.bin_minutes)
     rq2_rows.extend(rows)
+    # Branch column ranges and circular pairs, per encoder: (DSSL.blocks(), DSSL.pair_block()).
+    layouts = {'untrained': (untrained.blocks(), untrained.pair_block()),
+               'cost_reference_adapter': reference_layout}
     del untrained
-    features['dssl'], rows, pair = train_encoder(kwargs, 'dssl', out, data, steps)
+    features['dssl'], rows, layouts['dssl'] = train_encoder(kwargs, 'dssl', out, data, steps)
     rq2_rows.extend(rows)
-    pairs = {m: pair for m in ('dssl', 'untrained') if pair}
-    if reference_pair:
-        pairs['cost_reference_adapter'] = tuple(reference_pair)
+    pairs = {m: pair for m, (_, pair) in layouts.items() if pair}
     np.savez_compressed(out / 'representations.npz', pids=pids, window_ids=window_ids,
                         **{k: v for k, v in features.items() if k not in ('raw', 'distribution')})
     targets = individual_markers(raw, obs, c.bins_per_day, c.sensor_cols, cfg['marker_coverage'])
@@ -354,6 +357,8 @@ def main():
     write_json(out / 'rq2_status.json', rq2_status)
     evaluate(features, targets['values'], pids, labels, np.asarray(fold.train_pids),
              np.asarray(fold.test_pids), c.sensor_cols, out, fold.probe_seed, pair_blocks=pairs)
+    disentanglement(features, layouts, window_rhythm(X, c.bins_per_day), pids, window_ids,
+                    fold.test_pids, c.sensor_cols, out)
     write_json(out / 'complete.json', dict(status='execution_smoke_only' if args.smoke else 'complete',
                                          windows=len(X), training_windows=int(training.sum())))
     print(f'Completed: {out}')

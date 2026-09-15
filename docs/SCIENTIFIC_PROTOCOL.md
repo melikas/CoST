@@ -77,6 +77,19 @@ This supersedes the normalization and budget items of the operational amendment 
 - The CoST reference adapter keeps upstream CoST's settings and is trained once per seed × fold, then shared by every backbone variant.
 - With a circular phase readout, RQ1 and the logistic probe scale each (cos, sin) pair by one shared factor so phase geometry is preserved; the default angle readout has no pairs.
 
+## RQ1 disentanglement amendment, 2026-09-14 (investigator decision, before any Narval run)
+
+RQ1 adds the evaluation of the paper's central architectural claim: each branch carries its intended rhythm semantics, and the other branch does not. It is tested at the window level because within-person input normalization removes between-person level: on HRD, participants' mean input differs by SD 0.03–0.05 against 0.08–0.18 between one person's windows, so a person-level MESOR test would measure the normalization, not the trend branch.
+
+- Targets, per window × channel, from the model input: MESOR M (the window mean) and the 24-h cosinor amplitude A and acrophase φ of x(t) = M + A cos(2πt/24 h − φ), φ given as (cos φ, sin φ) and excluded where A ≤ 10⁻⁶.
+- Branches of the frozen readout (`DSSL.blocks()`): trend V^T (time mean), seasonal amplitude block, seasonal phase block. Own / leakage branch: MESOR ← V^T / amplitude + phase blocks; amplitude ← amplitude block / V^T; acrophase ← phase block / V^T.
+- Probe: ridge (α = 1, as in RQ1) on the standardized block (isotropic pairs for a circular phase readout), fitted on all windows of non-test participants; every window of the held-out participants is scored; no label is read.
+- Metric: held-out R² = 1 − Σ‖y − ŷ‖² / Σ‖y − ȳ‖², floored at 0; for acrophase y = (cos φ, sin φ). Pooled over the five folds within a seed, averaged over channels with equal weight, then over seeds. Disentanglement per target D = R²_own − R²_leakage. Acrophase is also reported as circular error in hours.
+- Intervals: participant bootstrap, 2,000 draws shared by all methods, targets and seeds, conditional on the fitted probes.
+- Compared: DSSL, the untrained encoder and the CoST reference adapter.
+- Pre-specified conditions: (i) DSSL's D is above 0 for all three targets (every 95% lower bound > 0); (ii) DSSL's D exceeds the untrained encoder's for all three targets. The CoST reference comparison is reported, not a condition.
+- Reading notes: the seasonal readout excludes frequency 0, so it cannot hold the window mean directly and low MESOR leakage is partly architectural; the level-equivariance term trains V^T on level offsets, so the untrained comparison shows what training adds. This is not the manuscript's time-resolved τ/σ decomposition recovery (section 4a), which needs time-resolved latents; the manuscript text must be aligned with this definition.
+
 ## Preservation
 
 Before repairs, 80 current source/manuscript/note files and the root staged/unstaged patches were preserved in `archive/rescue_20260914/before_repairs.zip`; `manifest.json` records source hashes. Raw datasets, historical result directories, caches and checkpoints remain intact. Git retains the reference and older model implementations.

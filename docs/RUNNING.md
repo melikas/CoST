@@ -47,8 +47,8 @@ reference  CoST reference adapter, 6,000 updates → results/<dataset>/<run>/cos
            seed_<s>/fold_<f>/  (trained once per seed × fold, reused by every variant)
 variant    within-person input → Yan cosinor + random projection baselines → untrained encoder
            → DSSL, 6,000 updates (checkpoint every 100) → saved encoders and representations
-           → RQ2 perturbation records (HRD) → RQ1 ridge recovery → RQ3 logistic and forest
-           probes → complete.json
+           → RQ2 perturbation records (HRD) → RQ1 ridge recovery → RQ1 disentanglement audit
+           → RQ3 logistic and forest probes → complete.json
 ```
 
 A variant loads the reference for its seed × fold and refuses it if its data, settings or code
@@ -116,6 +116,8 @@ default) holds:
 | `RQ1_families.csv` | Error reduction of DSSL vs each control, per marker family (headline) |
 | `RQ1_table.csv` | MAE of every method per marker × channel, DSSL gains vs population mean and untrained |
 | `RQ1_comparisons.csv` | Every paired marker/channel comparison with its interval |
+| `RQ1_disentanglement.csv` | Disentanglement audit: held-out R² of MESOR, 24-h amplitude and 24-h acrophase from the own branch vs the other branch, for DSSL, untrained and CoST reference (per channel: `rq1_disentanglement_channels.csv`) |
+| `RQ1_disentanglement_comparisons.csv` | DSSL minus each control in own − leakage, with intervals |
 | `RQ2_table.csv` | Timing and strength concordance per method, vs chance |
 | `RQ2_comparisons.csv` | DSSL minus each control, per perturbation |
 | `RQ3_table.csv` | AUROC (mean, seed SD), balanced accuracy, macro-F1, DSSL minus each rung |
