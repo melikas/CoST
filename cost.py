@@ -23,9 +23,21 @@ from torch.utils.data import DataLoader, Dataset
 from models import losses as O
 from models.encoder import CoSTEncoder
 
-__all__ = ["PretrainDataset", "CoSTModel", "DSSL", "WEIGHTS", "REFERENCE_SHARED",
+__all__ = ["PretrainDataset", "CoSTModel", "DSSL", "WEIGHTS", "REFERENCE_SHARED", "exact_numerics",
            "spectral_freqs", "spectral_readout", "band_keep",
            "smooth_bins_for"]
+
+
+def exact_numerics():
+    """Deterministic kernels and full float32 on GPU. By default an A100 runs convolutions in
+    TF32 (about 1e-3 relative precision) with a kernel chosen by batch shape, so a window's
+    encoding depended on its batch (up to 0.37% in Narval job 3068780) and a reloaded encoder
+    did not reproduce it. Full float32 is slower; scripts/time_steps.py measures it. No effect
+    on CPU."""
+    torch.use_deterministic_algorithms(True)
+    torch.backends.cudnn.benchmark = False
+    torch.backends.cuda.matmul.allow_tf32 = False
+    torch.backends.cudnn.allow_tf32 = False
 
 
 # --------------------------------------------------------------------------------------

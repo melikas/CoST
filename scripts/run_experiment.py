@@ -25,7 +25,7 @@ os.environ.setdefault('CUBLAS_WORKSPACE_CONFIG', ':4096:8')
 import numpy as np
 import pandas as pd
 import torch
-from cost import DSSL, REFERENCE_SHARED
+from cost import DSSL, REFERENCE_SHARED, exact_numerics
 from datautils import load_npz, make_folds
 from evaluation_protocol import disentanglement, evaluate, summarize, write_json
 from tasks.personalized import personalized_records
@@ -242,8 +242,7 @@ def main():
         raise ValueError('scientific runs need committed code: commit, or run '
                          'scripts/stamp_version.py on a clean checkout before uploading')
     torch.set_num_threads(min(4, int(os.environ.get('SLURM_CPUS_PER_TASK', '4'))))
-    torch.use_deterministic_algorithms(True)
-    torch.backends.cudnn.benchmark = False
+    exact_numerics()
     c = load_npz(ROOT / cfg['cache'])
     if c.raw_X is None or c.observed is None:
         raise ValueError('Rebuild rescue cache: physical inputs and observation masks are required')

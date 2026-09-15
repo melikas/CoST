@@ -18,7 +18,7 @@ ROOT = Path(__file__).resolve().parents[1]
 sys.path.insert(0, str(ROOT))
 os.environ.setdefault('CUBLAS_WORKSPACE_CONFIG', ':4096:8')
 import torch
-from cost import DSSL, REFERENCE_SHARED
+from cost import DSSL, REFERENCE_SHARED, exact_numerics
 from datautils import load_npz
 
 
@@ -40,8 +40,7 @@ def main():
     parser.add_argument('--device', choices=['cpu', 'cuda'], default='cuda')
     parser.add_argument('--updates', type=int, default=20, help='timed updates, after 3 warm-up updates')
     args = parser.parse_args()
-    torch.use_deterministic_algorithms(True)        # the study's settings
-    torch.backends.cudnn.benchmark = False
+    exact_numerics()                                # the study's settings
     if args.device == 'cuda':
         print('device:', torch.cuda.get_device_name(0), flush=True)
     for dataset in args.dataset:
@@ -53,7 +52,8 @@ def main():
         shared = {k: cfg['model'][k] for k in REFERENCE_SHARED if k in cfg['model']}
         for label, kwargs in (('dssl', dict(base, method='dssl', **cfg['model'])),
                               ('cost_reference', dict(base, method='cost_reference', **shared))):
-            per = (elapsed(kwargs, X, 3 + args.updates) - elapsed(kwargs, X, 3)) / args.updates
+            elapsed(kwargs, X, 3)                           # warm-up: CUDA/cuDNN initialise lazily
+            per = elapsed(kwargs, X, args.updates) / args.updates
             print(f"{dataset} {label}: {per:.3f} s/update -> {per * cfg['steps'] / 3600:.2f} h "
                   f"for {cfg['steps']} updates (training only)", flush=True)
 
