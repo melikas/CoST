@@ -12,6 +12,7 @@ from __future__ import annotations
 import math
 import random
 import hashlib
+from contextlib import contextmanager
 from pathlib import Path
 
 import numpy as np
@@ -24,7 +25,7 @@ from models import losses as O
 from models.encoder import CoSTEncoder
 
 __all__ = ["PretrainDataset", "CoSTModel", "DSSL", "WEIGHTS", "REFERENCE_SHARED", "exact_numerics",
-           "spectral_freqs", "spectral_readout", "band_keep",
+           "tf32_convolutions", "spectral_freqs", "spectral_readout", "band_keep",
            "smooth_bins_for"]
 
 
@@ -32,12 +33,26 @@ def exact_numerics():
     """Deterministic kernels and full float32 on GPU. By default an A100 runs convolutions in
     TF32 (about 1e-3 relative precision) with a kernel chosen by batch shape, so a window's
     encoding depended on its batch (up to 0.37% in Narval job 3068780) and a reloaded encoder
-    did not reproduce it. Full float32 is slower; scripts/time_steps.py measures it. No effect
-    on CPU."""
+    did not reproduce it. Training switches convolutions back to TF32 (`tf32_convolutions`);
+    every encoding is made in full float32. No effect on CPU."""
     torch.use_deterministic_algorithms(True)
     torch.backends.cudnn.benchmark = False
     torch.backends.cuda.matmul.allow_tf32 = False
     torch.backends.cudnn.allow_tf32 = False
+
+
+@contextmanager
+def tf32_convolutions():
+    """TF32 convolutions while training: PyTorch's default, which the reported runs (train.py
+    at 0a88999) never changed. Full float32 made the HRD CoST reference 8.6 s/update on a
+    3g.20gb slice (Narval job 3072689). Training batches always have one shape, so runs stay
+    deterministic."""
+    old = torch.backends.cudnn.allow_tf32
+    torch.backends.cudnn.allow_tf32 = True
+    try:
+        yield
+    finally:
+        torch.backends.cudnn.allow_tf32 = old
 
 
 # --------------------------------------------------------------------------------------
@@ -365,6 +380,7 @@ class DSSL:
                            model_seed=model_seed)
 
     # -- training ---------------------------------------------------------------------
+    @tf32_convolutions()
     def fit(self, train_data, n_iters=1000, val_data=None, log_every=100, verbose=True,
             checkpoint_path=None, checkpoint_every=200, stop_after=None):
         """Pretrain. `train_data` is (N, T, D) float32; no labels are used."""

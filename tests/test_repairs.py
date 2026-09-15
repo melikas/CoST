@@ -120,6 +120,17 @@ class EvaluationRepairs(unittest.TestCase):
             with self.assertRaises(ValueError):
                 restored.fit(x, n_iters=5, verbose=False)
 
+    def test_training_uses_tf32_convolutions_and_encoding_stays_float32(self):
+        torch.backends.cudnn.allow_tf32 = False                       # as exact_numerics() leaves it
+        model = DSSL(2, 28, 4, model_seed=3, **TINY)
+        seen, loss = [], model._loss
+        model._loss = lambda batch, update=True: (seen.append(torch.backends.cudnn.allow_tf32),
+                                                  loss(batch, update))[1]
+        model.fit(np.random.default_rng(3).normal(size=(8, 28, 2)).astype(np.float32),
+                  n_iters=2, verbose=False)
+        self.assertEqual(seen, [True, True])
+        self.assertFalse(torch.backends.cudnn.allow_tf32)
+
     def test_backbone_encoding_contract_and_reference_preset(self):
         x = np.random.default_rng(9).normal(size=(4, 28, 2)).astype(np.float32)
         for backbone in ["tcn", "transformer"]:
