@@ -73,5 +73,9 @@ archive/
 SSL_Rhythmicity/
 docs/audit/evidence/
 
+# A local copy of the cluster upload bundle (code + caches). Its datasets/cache/ sits one
+# level down, so the rule above does not cover it and participant data could be staged.
+rhythmssl_rescue/
+
 # Written by scripts/stamp_version.py for the cluster copy; derived from git.
 CODE_VERSION

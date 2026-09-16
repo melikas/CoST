@@ -91,6 +91,11 @@ def parse_args():
     parser.add_argument('--fold', type=int, default=0)
     parser.add_argument('--reference', action='store_true',
                         help='train (or load) only the CoST reference adapter for this seed x fold')
+    parser.add_argument('--skip-reference', action='store_true',
+                        help='ABLATIONS ONLY: evaluate without the CoST reference rung, which '
+                             'otherwise costs a second full training per task. The scientific '
+                             'matrix always includes it; a run started this way is not comparable '
+                             'to one that has it')
     parser.add_argument('--smoke', action='store_true')
     parser.add_argument('--summarize', action='store_true')
     parser.add_argument('--device', choices=['cpu', 'cuda'], default='cuda')
@@ -302,7 +307,10 @@ def main():
                   training_ids=sorted(map(str, np.unique(pids[training]))),
                   test_ids=list(fold.test_pids), windows=int(len(X)),
                   fit_windows=int(len(fit_idx)), monitor_windows=int(len(val_idx)))
-    reference = cost_reference(base, common, model_cfg, data, steps, args.device)
+    if args.skip_reference and args.reference:
+        raise ValueError('--reference trains only the reference; --skip-reference omits it')
+    reference = None if args.skip_reference else cost_reference(base, common, model_cfg, data,
+                                                                steps, args.device)
     if args.reference:
         print(f"CoST reference ready: {base / 'cost_reference'}")
         return
@@ -312,7 +320,8 @@ def main():
     kwargs = dict(input_dims=c.n_sensors, seq_len=c.seq_len, bins_per_day=c.bins_per_day,
                   method='dssl', device=args.device, model_seed=model_seed, **model_cfg)
     untrained = DSSL(**kwargs)
-    manifest = dict(common, variant=variant, config=cfg, resolved_model=untrained.config,
+    manifest = dict(common, variant=variant, skip_reference=args.skip_reference, config=cfg,
+                    resolved_model=untrained.config,
                     code_sha256=code_hashes(VARIANT_SOURCES),
                     versions=dict(python=sys.version, torch=torch.__version__, numpy=np.__version__,
                                   **{name: __import__('importlib.metadata', fromlist=['version']).version(name)
@@ -335,15 +344,17 @@ def main():
     features['random_projection'] = projection.encode(X)
     rq2_rows, rq2_status = personalized_records(projection, 'random_projection', X, raw, pids, window_ids,
                                                 fold.test_pids, c.bins_per_day, c.bin_minutes)
-    features['cost_reference_adapter'], reference_rows, reference_layout = reference
-    rq2_rows.extend(reference_rows)
+    if reference is not None:
+        features['cost_reference_adapter'], reference_rows, reference_layout = reference
+        rq2_rows.extend(reference_rows)
     features['untrained'] = untrained.encode(X, batch_size=16)
     rows, rq2_status = personalized_records(untrained, 'untrained', X, raw, pids, window_ids,
                                             fold.test_pids, c.bins_per_day, c.bin_minutes)
     rq2_rows.extend(rows)
     # Branch column ranges and circular pairs, per encoder: (DSSL.blocks(), DSSL.pair_block()).
-    layouts = {'untrained': (untrained.blocks(), untrained.pair_block()),
-               'cost_reference_adapter': reference_layout}
+    layouts = {'untrained': (untrained.blocks(), untrained.pair_block())}
+    if reference is not None:
+        layouts['cost_reference_adapter'] = reference_layout
     del untrained
     features['dssl'], rows, layouts['dssl'] = train_encoder(kwargs, 'dssl', out, data, steps)
     rq2_rows.extend(rows)
