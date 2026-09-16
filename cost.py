@@ -156,20 +156,39 @@ def band_keep(net):
     return torch.as_tensor(idx, dtype=torch.long)
 
 
-def spectral_readout(z, bins_per_day, phase_readout, harmonics=4, keep=None, eps=1e-6,
-                     readout_norm="timestep"):
+def spectral_readout(z, bins_per_day, phase_readout, harmonics=4, keep=None, eps=1e-3,
+                     readout_norm="none"):
     """Seasonal branch -> (amplitude, phase) at the readout bins (spectral_freqs).
 
     rFFT over time, then amplitude and either the raw angle ('angle') or its (cos, sin)
-    ('circular'). `keep` restricts both blocks to the band-matched columns.
+    ('circular'). `keep` restricts both blocks to the band-matched columns. This is a
+    frozen-feature READOUT choice, made only here and in CoSTModel._log_readout_amp; the
+    training loss (seasonal_loss) always L2-normalises independently of it, so `readout_norm`
+    changes what a trained encoder's representation looks like, never how it was trained.
 
-    `readout_norm="timestep"` L2-normalises each timestep over channels first, as upstream
-    CoST's seasonal loss does. THAT DESTROYS AMPLITUDE. DSSL's harmonic bands start at bin 1,
-    so the seasonal sequence has no constant component to anchor the norm and it saturates
-    toward a square wave: measured on an untrained HRD encoder, scaling the true 24 h
-    amplitude by 0.5 / 1.0 / 1.5 moved the 24 h amplitude feature only 8.06 / 12.20 / 14.09,
-    and RQ2's amplitude arm inverted (0.404 at a=0.5, chance 0.5). Without it the same
-    features move 1.34 / 2.67 / 3.99 -- proportional -- and the arm scores 0.663.
+    `eps` stabilises atan2 near a true amplitude of 0, where it is ill-conditioned: a bin with
+    Real, Imag both near 0 has an angle that swings wildly for a tiny change in either. Under
+    "none" many bins genuinely have amplitude at this scale (unlike "timestep", whose
+    normalisation happened to keep every bin away from true 0), so ordinary float32
+    non-associativity -- encoding the same window alone vs. in a larger batch shifted a bin's
+    seasonal output by 7.45e-08, negligible everywhere else -- swung that bin's angle by up to
+    0.65 rad when amplitude was close to eps (measured with the previous eps=1e-6, itself
+    already at the amplitude floor of the affected bins: HRD smoke run, job train_encoder's
+    save/reload check). eps=1e-3 is ~10,000x the measured noise floor (~1e-7) and, added inside
+    the sqrt/atan2, negligible against any real signal (>=0.01 in every measurement so far);
+    a near-zero bin now reports a stable, uninformative angle of pi/4 instead of noise.
+
+    DEFAULT "none": use the raw seasonal sequence. "timestep" L2-normalises each timestep over
+    channels first, as upstream CoST's seasonal loss does. THAT DESTROYS AMPLITUDE. DSSL's
+    harmonic bands start at bin 1, so the seasonal sequence has no constant component to anchor
+    the norm and it saturates toward a square wave: measured on an untrained HRD encoder,
+    scaling the true 24 h amplitude by 0.5 / 1.0 / 1.5 moved the 24 h amplitude feature only
+    8.06 / 12.20 / 14.09 with "timestep", and RQ2's amplitude arm inverted (0.404 at a=0.5,
+    chance 0.5); with "none" the same features move 1.34 / 2.67 / 3.99 -- proportional -- and
+    the arm scores 0.663. This is not free: on the same trained weights, switching only the
+    readout from "timestep" to "none" also collapsed HRD Steps' own-branch acrophase R2 from
+    0.765 to 0.0 (job 3183155, arm a2_amplitude) -- an unresolved side effect of this choice,
+    unrelated to training.
     """
     f = spectral_freqs(z.size(1), bins_per_day, harmonics)
     if readout_norm not in ("timestep", "none"):
@@ -194,11 +213,13 @@ class CoSTModel(nn.Module):
     """MoCo on the trend branch, within-batch instance discrimination on the seasonal one."""
 
     def __init__(self, encoder_q, encoder_k, *, dim=128, alpha=0.005, K=4096, m=0.999,
-                 T=0.07, phase_mode="circular_amp", weights: O.TermWeights = O.PAPER,
+                 T=0.07, phase_mode="circular_amp", readout_norm="none",
+                 weights: O.TermWeights = O.PAPER,
                  w_eq=0.0, eq_dims=0, w_ac=0.0, ac_gamma=0.7114, ac_queue=512, device="cuda"):
         super().__init__()
         self.alpha, self.K, self.m, self.T = alpha, K, m, T
-        self.phase_mode, self.weights, self.device = phase_mode, weights, device
+        self.phase_mode, self.readout_norm = phase_mode, readout_norm
+        self.weights, self.device = weights, device
 
         self.encoder_q, self.encoder_k = encoder_q, encoder_k
         self.head_q = nn.Sequential(nn.Linear(dim, dim), nn.ReLU(), nn.Linear(dim, dim))
@@ -224,7 +245,7 @@ class CoSTModel(nn.Module):
     def _log_readout_amp(self, z):
         """Log amplitude at every readout bin, B x bins x channels."""
         e = self.encoder_q
-        amp, _ = spectral_readout(z, e.bins_per_day, "angle", e.harmonics)
+        amp, _ = spectral_readout(z, e.bins_per_day, "angle", e.harmonics, readout_norm=self.readout_norm)
         return amp.view(amp.size(0), -1, e.seasonal_dims).log()
 
     @torch.no_grad()
@@ -313,7 +334,7 @@ class DSSL:
                  backbone="tcn", temporal_encoding="none", tcn_depth=None, n_layers=4,
                  n_heads=4, bidirectional=True, seasonal_bands="harmonics", harmonics=4,
                  trend_kernel_cap=None, seasonal_frac=0.5, band_readout=False, mask_mode="none",
-                 phase_readout="angle", readout_norm="timestep", phase_mode="circular_amp",
+                 phase_readout="angle", readout_norm="none", phase_mode="circular_amp",
                  weights="contracted",
                  alpha=0.005, w_eq=1.0, w_ac=0.0, ac_gamma=0.7114, ac_queue=512, moco_k=4096,
                  jitter_sigma=0.1, shift_sigma=0.5, smooth_minutes=75.0, lr=5e-4, batch_size=64,
@@ -366,8 +387,9 @@ class DSSL:
         encoder_k = CoSTEncoder(**enc).to(device)
         self.cost = CoSTModel(
             self.net, encoder_k, dim=self.net.trend_dims, alpha=alpha, K=moco_k,
-            phase_mode=phase_mode, weights=weights, w_eq=w_eq, eq_dims=input_dims,
-            w_ac=w_ac, ac_gamma=ac_gamma, ac_queue=ac_queue, device=device).to(device)
+            phase_mode=phase_mode, readout_norm=readout_norm, weights=weights, w_eq=w_eq,
+            eq_dims=input_dims, w_ac=w_ac, ac_gamma=ac_gamma, ac_queue=ac_queue,
+            device=device).to(device)
         self.n_iters = 0
         self._optimizer = None
         self._permutation = None

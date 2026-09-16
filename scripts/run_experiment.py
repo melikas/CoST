@@ -174,7 +174,14 @@ def train_encoder(kwargs, label, out, data, steps):
                                    data['test_ids'], data['bins_per_day'], data['bin_minutes'])
     model.save(out / f'{label}_encoder.pt')
     check = DSSL(**kwargs).load(out / f'{label}_encoder.pt')
-    np.testing.assert_allclose(check.encode(X[:2], batch_size=16), features[:2], rtol=1e-5, atol=1e-5)
+    # atol above rtol=1e-5's usual floor: a batch of 2 windows and the full batch run different
+    # conv paths, an ordinary ~1e-7 float32 difference (same weights, same inputs) that is inert
+    # everywhere except a seasonal bin whose true amplitude is near spectral_readout's eps -- there
+    # atan2 is ill-conditioned and the same ~1e-7 noise reaches ~8e-4 rad (HRD smoke, readout_norm
+    # "none"; never seen under "timestep", whose normalisation keeps every bin off true 0). A real
+    # bug -- wrong weights, wrong normalization -- differs by orders of magnitude more (this check
+    # caught exactly that on 2026-09-15, a TF32 training bug: >1e-1).
+    np.testing.assert_allclose(check.encode(X[:2], batch_size=16), features[:2], rtol=1e-5, atol=2e-3)
     write_json(out / f'{label}_model.json', dict(config=model.config,
                parameters=sum(p.numel() for p in model.net.parameters()), history=model.history))
     return features, rows, (model.blocks(), model.pair_block())

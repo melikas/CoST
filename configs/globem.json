@@ -13,7 +13,7 @@
     "tcn_depth": null, "n_layers": 4, "n_heads": 4, "bidirectional": true,
     "output_dims": 320, "hidden_dims": 64, "seasonal_frac": 0.5,
     "seasonal_bands": "harmonics", "harmonics": 4, "trend_kernel_cap": null,
-    "phase_readout": "angle", "readout_norm": "timestep", "phase_mode": "circular_amp",
+    "phase_readout": "angle", "readout_norm": "none", "phase_mode": "circular_amp",
     "weights": "contracted", "alpha": 0.005, "w_eq": 1.0,
     "moco_k": 4096, "jitter_sigma": 0.1, "shift_sigma": 0.5, "smooth_minutes": 75.0,
     "lr": 0.0005, "batch_size": 64
