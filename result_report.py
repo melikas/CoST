@@ -234,17 +234,24 @@ def write_report(root, smoke=False):
     if bridge:
         lines += ['', 'Exploratory bridge (DSSL; Spearman of rhythm-recovery error with log loss, by endpoint class; '
                   'observational only): ' + '; '.join(f'class {b["label"]}: rho {b["spearman"]:+.3f} (n={b["n"]})' for b in bridge)]
-    lines += ['', '## Baselines', '', markdown(coverage), '',
-              'Figures: `rq1_families.png`, `rq1_recovery.png`, `rq2_personalized.png` (HRD), `rq3_auroc.png`, '
-              '`secondary_endpoint_associations.png`. Full tables: `REPORT.html`.']
+    lines += ['', '## Baselines', '', markdown(coverage), '', '## Figures', '',
+              '| Figure | Question it answers | How to read it |',
+              '|---|---|---|',
+              '| `rq1_recovery.png` | How large is the rhythm-recovery error, per marker family? | Bars are mean error, lower is better; phase in hours, other markers in training-SD units (`rq1_absolute_error.csv`) |',
+              '| `rq1_families.png` | Does DSSL recover markers better than each control? | Right of the zero line favours DSSL; bars are paired 95% CIs (`RQ1_families.csv`) |',
+              '| `rq1_disentanglement.png` | Does each rhythm property come from its own branch? | Solid = own branch, hatched = the other branch; solid should exceed hatched (`RQ1_disentanglement.csv`) |',
+              '| `rq2_personalized.png` | Does the representation move with the size of a known rhythm change? | Concordance vs perturbation size; above the 0.5 chance line and rising is correct (`rq2_by_level.csv`) |',
+              '| `rq3_auroc.png` | Which representation predicts the endpoint, and is DSSL ahead? | Left: AUROC per method, points are seeds; right: DSSL minus each method with 95% CI (`RQ3_table.csv`) |',
+              '| `secondary_endpoint_associations.png` | Which raw rhythm markers differ by endpoint group? | Red bars are Holm-significant; negative = lower in the endpoint-positive group (`secondary_endpoint_associations.csv`) |',
+              '', 'Full tables: `REPORT.html`.']
     (root/'SUMMARY.md').write_text('\n'.join(lines) + '\n', encoding='utf-8')
     content = [f'<h1>{html.escape(title)}</h1>', f'<p>{html.escape(NOTES)}</p>']
     for heading, filename, table in tables:
         content += [f'<h2>{html.escape(heading)}</h2><p><code>{filename}</code></p>',
                     table.to_html(index=False, float_format=lambda v: f'{v:.4f}', na_rep='unavailable', escape=True)]
     content.append('<h2>Figures</h2>')
-    for name in ['rq1_families.png', 'rq1_recovery.png', 'rq2_personalized.png', 'rq3_auroc.png',
-                 'secondary_endpoint_associations.png']:
+    for name in ['rq1_recovery.png', 'rq1_families.png', 'rq1_disentanglement.png',
+                 'rq2_personalized.png', 'rq3_auroc.png', 'secondary_endpoint_associations.png']:
         if (root/name).exists():
             content.append(f'<p>{name}</p><img src="{name}" style="max-width:100%">')
     (root/'REPORT.html').write_text('<!doctype html><meta charset="utf-8"><style>body{font-family:sans-serif;'

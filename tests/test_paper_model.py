@@ -81,6 +81,18 @@ class PaperModel(unittest.TestCase):
         self.assertEqual(circular.blocks()["phase"], (960, 2560))
         self.assertEqual(circular.encode(x).shape, (2, 160 + 800 + 2 * 800))
 
+    def test_readout_norm_decides_whether_amplitude_survives(self):
+        """The measured cause of RQ2's inverted amplitude arm: per-timestep normalisation
+        removes the amplitude of the seasonal sequence entirely."""
+        from cost import spectral_readout
+        z = torch.randn(2, 672, 8, generator=torch.Generator().manual_seed(0))
+        for norm, factor in (("none", 2.0), ("timestep", 1.0)):
+            one, _ = spectral_readout(z, 96, "angle", readout_norm=norm)
+            two, _ = spectral_readout(2 * z, 96, "angle", readout_norm=norm)
+            torch.testing.assert_close(two, factor * one, rtol=2e-4, atol=1e-5)
+        with self.assertRaisesRegex(ValueError, "readout_norm"):
+            spectral_readout(z, 96, "angle", readout_norm="per_window")
+
     def test_globem_architecture(self):
         c = DSSL(14, **GLOBEM, device="cpu", **config("globem")["model"]).config
         self.assertEqual((c["tcn_depth"], c["receptive_field"]), (4, 125))

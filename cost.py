@@ -156,15 +156,26 @@ def band_keep(net):
     return torch.as_tensor(idx, dtype=torch.long)
 
 
-def spectral_readout(z, bins_per_day, phase_readout, harmonics=4, keep=None, eps=1e-6):
+def spectral_readout(z, bins_per_day, phase_readout, harmonics=4, keep=None, eps=1e-6,
+                     readout_norm="timestep"):
     """Seasonal branch -> (amplitude, phase) at the readout bins (spectral_freqs).
 
-    Each timestep is L2-normalised over channels, then rFFT over time. Phase is the raw
-    angle ('angle') or its (cos, sin) ('circular'). `keep` restricts both blocks to the
-    band-matched columns.
+    rFFT over time, then amplitude and either the raw angle ('angle') or its (cos, sin)
+    ('circular'). `keep` restricts both blocks to the band-matched columns.
+
+    `readout_norm="timestep"` L2-normalises each timestep over channels first, as upstream
+    CoST's seasonal loss does. THAT DESTROYS AMPLITUDE. DSSL's harmonic bands start at bin 1,
+    so the seasonal sequence has no constant component to anchor the norm and it saturates
+    toward a square wave: measured on an untrained HRD encoder, scaling the true 24 h
+    amplitude by 0.5 / 1.0 / 1.5 moved the 24 h amplitude feature only 8.06 / 12.20 / 14.09,
+    and RQ2's amplitude arm inverted (0.404 at a=0.5, chance 0.5). Without it the same
+    features move 1.34 / 2.67 / 3.99 -- proportional -- and the arm scores 0.663.
     """
     f = spectral_freqs(z.size(1), bins_per_day, harmonics)
-    Z = fft.rfft(F.normalize(z.float(), dim=-1), dim=1)[:, f]
+    if readout_norm not in ("timestep", "none"):
+        raise ValueError(f"readout_norm must be 'timestep' or 'none', got {readout_norm!r}")
+    seasonal = F.normalize(z.float(), dim=-1) if readout_norm == "timestep" else z.float()
+    Z = fft.rfft(seasonal, dim=1)[:, f]
     amp = torch.sqrt((Z.real + eps).pow(2) + (Z.imag + eps).pow(2))
     ang = torch.atan2(Z.imag, Z.real + eps)
     pha = (torch.cos(ang), torch.sin(ang)) if phase_readout == "circular" else (ang,)
@@ -282,7 +293,8 @@ WEIGHTS = {"paper": O.PAPER, "contracted": O.CONTRACTED}
 # The only settings the CoST reference adapter takes from the experiment configuration: the
 # shared readout, geometry and budget. Everything else is fixed to upstream CoST below.
 REFERENCE_SHARED = ("output_dims", "hidden_dims", "tcn_depth", "harmonics", "seasonal_frac",
-                    "phase_readout", "alpha", "moco_k", "lr", "batch_size", "mask_mode")
+                    "phase_readout", "readout_norm", "alpha", "moco_k", "lr", "batch_size",
+                    "mask_mode")
 
 
 class DSSL:
@@ -301,7 +313,8 @@ class DSSL:
                  backbone="tcn", temporal_encoding="none", tcn_depth=None, n_layers=4,
                  n_heads=4, bidirectional=True, seasonal_bands="harmonics", harmonics=4,
                  trend_kernel_cap=None, seasonal_frac=0.5, band_readout=False, mask_mode="none",
-                 phase_readout="angle", phase_mode="circular_amp", weights="contracted",
+                 phase_readout="angle", readout_norm="timestep", phase_mode="circular_amp",
+                 weights="contracted",
                  alpha=0.005, w_eq=1.0, w_ac=0.0, ac_gamma=0.7114, ac_queue=512, moco_k=4096,
                  jitter_sigma=0.1, shift_sigma=0.5, smooth_minutes=75.0, lr=5e-4, batch_size=64,
                  device="cuda", model_seed=None):
@@ -333,7 +346,7 @@ class DSSL:
 
         self.device = device
         self.seq_len, self.bins_per_day = seq_len, bins_per_day
-        self.phase_readout = phase_readout
+        self.phase_readout, self.readout_norm = phase_readout, readout_norm
         self.batch_size, self.lr = batch_size, lr
         self.jitter_sigma, self.shift_sigma = jitter_sigma, shift_sigma
         self.smooth_bins = smooth_bins_for(smooth_minutes, bins_per_day)
@@ -372,7 +385,8 @@ class DSSL:
                            harmonics=harmonics, trend_kernel_cap=trend_kernel_cap,
                            trend_kernels=self.net.kernels, seasonal_frac=seasonal_frac,
                            band_readout=band_readout, mask_mode=mask_mode,
-                           phase_readout=phase_readout, phase_mode=phase_mode,
+                           phase_readout=phase_readout, readout_norm=readout_norm,
+                           phase_mode=phase_mode,
                            weights=weights_name, alpha=alpha, w_eq=w_eq, w_ac=w_ac,
                            moco_k=moco_k, jitter_sigma=jitter_sigma, shift_sigma=shift_sigma,
                            scale_sigma=self.scale_sigma, smooth_minutes=smooth_minutes,
@@ -463,7 +477,7 @@ class DSSL:
     # -- readout ----------------------------------------------------------------------
     def _spectral(self, z):
         return spectral_readout(z, self.bins_per_day, self.phase_readout, self.net.harmonics,
-                                self._keep)
+                                self._keep, readout_norm=self.readout_norm)
 
     def blocks(self):
         """Column range (start, stop) of each branch in `encode` output: the trend readout,

@@ -306,6 +306,198 @@ def disentanglement_intervals(frame, rng, n_boot):
     return pd.DataFrame(rows), channels.unstack('role').reset_index()
 
 
+def figures(root):
+    """Draw the RQ1-RQ3 figures from the tables already saved in `root`.
+
+    Every figure answers one question, states its units and its direction, and is rebuilt from
+    a CSV next to it, so it can be regenerated without recomputing any statistic.
+    """
+    from result_report import LADDER
+    import matplotlib
+    matplotlib.use('Agg')
+    import matplotlib.pyplot as plt
+    root = Path(root)
+    order = [m for m, *_ in LADDER]
+
+    def read(name):
+        path = root / name
+        if not path.exists():
+            return pd.DataFrame()
+        try:
+            return pd.read_csv(path)
+        except pd.errors.EmptyDataError:
+            return pd.DataFrame()
+
+    def save(fig, name):
+        fig.tight_layout()
+        fig.savefig(root / name, dpi=180, bbox_inches='tight')
+        plt.close(fig)
+
+    def label(method):
+        return {'dssl': 'DSSL (ours)', 'untrained': 'Untrained DSSL (same architecture)',
+                'cost_reference_adapter': 'CoST reference', 'raw': 'Raw window',
+                'pca': 'PCA of raw window', 'random_projection': 'Random projection',
+                'training_mean': 'Population mean', 'training_prevalence': 'Training prevalence',
+                'yan_cosinor': 'Yan cosinor (HRD paper)', 'handcrafted': 'Handcrafted (all)',
+                'handcrafted_stack': 'Handcrafted super learner', 'nonparametric': 'IS / IV / RA',
+                'distribution': 'Channel mean and SD'}.get(method, method)
+
+    table, rq3_intervals = read('summary_by_seed.csv'), read('rq3_paired_intervals.csv')
+    err, families = read('rq1_errors.csv'), read('rq1_family_intervals.csv')
+    ent_intervals, assoc = read('rq1_disentanglement_intervals.csv'), read('secondary_endpoint_associations.csv')
+
+    # RQ3 - how well does each representation predict the endpoint, and is DSSL ahead?
+    if len(table):
+        primary = table[table.probe == 'logistic']
+        shown = [m for m in order if m in set(primary.method)]
+        interval = rq3_intervals[rq3_intervals.probe == 'logistic'].set_index('control') if len(rq3_intervals) else pd.DataFrame()
+        fig, (ax, bx) = plt.subplots(1, 2, figsize=(14, 0.45 * len(shown) + 2.6))
+        for i, method in enumerate(shown):
+            v = primary[primary.method == method].auroc.to_numpy()
+            ax.scatter(v, np.full(len(v), i), s=18, color='0.6', zorder=2,
+                       label='one seed' if i == 0 else None)
+            ax.errorbar(v.mean(), i, xerr=v.std(ddof=1) if len(v) > 1 else 0, fmt='o', color='k',
+                        capsize=3, zorder=3, label='mean ± SD over seeds' if i == 0 else None)
+        ax.axvline(.5, color='grey', ls=':')
+        ax.set(yticks=range(len(shown)), yticklabels=[label(m) for m in shown],
+               xlabel='Participant AUROC (0.5 = chance, higher is better)',
+               title='RQ3: endpoint discrimination')
+        ax.legend(fontsize=8, loc='lower right')
+        ax.invert_yaxis()
+        rows = [m for m in shown if m != 'dssl' and m in getattr(interval, 'index', [])]
+        if rows:
+            d = interval.loc[rows, 'difference'].to_numpy()
+            lo, hi = interval.loc[rows, 'low'].to_numpy(), interval.loc[rows, 'high'].to_numpy()
+            bx.errorbar(d, range(len(rows)), xerr=[d - lo, hi - d], fmt='o', capsize=3, color='tab:blue')
+            bx.axvline(0, color='grey')
+            bx.set(yticks=range(len(rows)), yticklabels=[label(m) for m in rows],
+                   xlabel='DSSL minus this method, AUROC (paired participant bootstrap 95% CI)',
+                   title='Right of the line favours DSSL')
+            bx.invert_yaxis()
+        save(fig, 'rq3_auroc.png')
+
+    # RQ1 - how large is the recovery error itself, per marker family and method?
+    if len(err):
+        absolute = (err.groupby(['seed', 'method', 'participant', 'marker']).family_error.mean()
+                    .groupby(['method', 'marker']).mean().unstack('method'))
+        absolute.to_csv(root / 'rq1_absolute_error.csv')
+        keep = [m for m in ('dssl', 'untrained', 'cost_reference_adapter', 'raw',
+                            'random_projection', 'training_mean') if m in absolute.columns]
+        fig, axes = plt.subplots(1, 2, figsize=(13, 4.2),
+                                 gridspec_kw={'width_ratios': [1, max(1, len(absolute) - 1)]})
+        for ax, (only, xlabel) in zip(axes, [('phase_hours', 'circular error (hours)'),
+                                             (None, 'error (training target SD units)')]):
+            markers = [m for m in absolute.index if (m == only if only else m != 'phase_hours')]
+            if not markers:
+                ax.axis('off')
+                continue
+            width = 0.8 / max(len(keep), 1)
+            for j, method in enumerate(keep):
+                ax.bar(np.arange(len(markers)) + j * width, absolute.loc[markers, method], width,
+                       label=label(method))
+            ax.set(xticks=np.arange(len(markers)) + 0.4 - width / 2, ylabel=xlabel,
+                   title='RQ1: recovery error, lower is better')
+            ax.set_xticklabels(markers, rotation=20, ha='right')
+        axes[1].legend(fontsize=8, ncol=2)
+        save(fig, 'rq1_recovery.png')
+
+    # RQ1 - DSSL minus each control, per marker family (the headline comparison).
+    if len(families):
+        markers = [m for m in ('amplitude', 'phase_hours', 'IS', 'IV', 'RA', 'MESOR')
+                   if m in set(families.marker)]
+        controls = [c for c in RQ1_CONTROLS if c in set(families.control)]
+        fig, ax = plt.subplots(figsize=(11, 0.55 * len(markers) * len(controls) / 2 + 2))
+        for k, control in enumerate(controls):
+            g = families[families.control == control].set_index('marker').reindex(markers).dropna()
+            y = [markers.index(m) + (k - (len(controls) - 1) / 2) * 0.14 for m in g.index]
+            d = g.difference.to_numpy()
+            ax.errorbar(d, y, xerr=[d - g.low.to_numpy(), g.high.to_numpy() - d], fmt='o',
+                        capsize=2, label=label(control))
+        ax.axvline(0, color='grey')
+        ax.set(yticks=range(len(markers)), yticklabels=markers,
+               xlabel='Control error minus DSSL error, paired 95% CI '
+                      '(phase in hours; other markers in training target SD units)',
+               title='RQ1: right of the line = DSSL recovers the marker better than that control')
+        ax.legend(fontsize=8, ncol=2)
+        ax.invert_yaxis()
+        save(fig, 'rq1_families.png')
+
+    # RQ1 - is each rhythm property really carried by its own branch?
+    if len(ent_intervals):
+        ent = ent_intervals.set_index(['method', 'target', 'quantity'])
+        targets = [t for t in ('MESOR', 'amplitude', 'acrophase')
+                   if t in set(ent.index.get_level_values('target'))]
+        methods = [m for m in ('dssl', 'untrained', 'cost_reference_adapter')
+                   if m in set(ent.index.get_level_values('method'))]
+        if targets and methods:
+            fig, ax = plt.subplots(figsize=(11, 4.4))
+            width = 0.8 / (2 * len(methods))
+            for j, method in enumerate(methods):
+                own = [ent.loc[(method, t, 'own'), 'estimate'] for t in targets]
+                leak = [ent.loc[(method, t, 'leakage'), 'estimate'] for t in targets]
+                x = np.arange(len(targets)) + j * 2 * width
+                ax.bar(x, own, width, color=f'C{j}', label=f'{label(method)} - own branch')
+                ax.bar(x + width, leak, width, color=f'C{j}', alpha=.45, hatch='//',
+                       label=f'{label(method)} - other branch (leakage)')
+            ax.set(xticks=np.arange(len(targets)) + 0.4 - width, xticklabels=targets, ylim=(0, 1.05),
+                   ylabel='Held-out R² (0-1, higher = better recovered)',
+                   title='RQ1 disentanglement: own branch should beat the other branch (solid > hatched)')
+            ax.legend(fontsize=7, ncol=3)
+            save(fig, 'rq1_disentanglement.png')
+
+    # RQ2 - does the representation move with the size of a known rhythm change?
+    parts = [pd.read_csv(p, dtype={'participant': str}).assign(seed=int(p.parent.parent.name.split('_')[1]))
+             for p in sorted(root.glob('seed_*/fold_*/rq2_personalized.csv'))]
+    rq2 = pd.concat([p for p in parts if len(p)], ignore_index=True) if any(len(p) for p in parts) else pd.DataFrame()
+    if len(rq2):
+        levels = []
+        for (method, perturbation, lv, seed), g in rq2.groupby(['method', 'perturbation', 'level', 'seed']):
+            if perturbation == 'phase':
+                keys = (g.participant.astype(str) + '|' + g.level.astype(str)).to_numpy()
+                value = concordance(stratum_pairs(g.representation_delta.to_numpy(),
+                                                  g.raw_delta.to_numpy(), keys))
+            else:
+                valid = g[g.raw_delta != 0]
+                value = float(np.mean(np.where(valid.representation_delta == 0, .5,
+                                               (np.sign(valid.representation_delta) ==
+                                                np.sign(valid.raw_delta)).astype(float)))) if len(valid) else np.nan
+            levels.append(dict(method=method, perturbation=perturbation, level=lv, seed=seed,
+                               concordance=value))
+        levels = pd.DataFrame(levels)
+        levels.to_csv(root / 'rq2_by_level.csv', index=False)
+        panels = [p for p in ('phase', 'amplitude') if p in set(levels.perturbation)]
+        fig, axes = plt.subplots(1, len(panels), figsize=(6.2 * len(panels), 4.2), squeeze=False)
+        for ax, perturbation in zip(axes[0], panels):
+            g = levels[levels.perturbation == perturbation]
+            for method in [m for m in order if m in set(g.method)]:
+                s = g[g.method == method].groupby('level').concordance.agg(['mean', 'std'])
+                ax.errorbar(s.index, s['mean'], yerr=s['std'].fillna(0), marker='o', capsize=3,
+                            label=label(method))
+            ax.axhline(.5, color='grey', ls=':')
+            ax.set(ylim=(0, 1),
+                   xlabel='shift applied (hours)' if perturbation == 'phase'
+                          else 'amplitude change applied (fraction of the 24 h component)',
+                   ylabel='Concordance with the true change (0.5 = chance)',
+                   title=('RQ2 timing' if perturbation == 'phase' else 'RQ2 intensity')
+                         + ': above 0.5 and rising is correct')
+            ax.legend(fontsize=8)
+        save(fig, 'rq2_personalized.png')
+
+    # Secondary - which raw rhythm markers differ between endpoint groups?
+    if len(assoc):
+        top = assoc.reindex(assoc.rank_biserial.abs().sort_values(ascending=False).index).head(18)
+        fig, ax = plt.subplots(figsize=(9, 0.32 * len(top) + 2))
+        colours = ['tab:red' if p < .05 else '0.7' for p in top.p_holm.fillna(1)]
+        ax.barh([f'{r.marker} - {r.channel}'[:52] for r in top.itertuples()],
+                top.rank_biserial, color=colours)
+        ax.axvline(0, color='grey')
+        ax.set(xlabel='Rank-biserial correlation with the endpoint '
+                      '(negative = lower in the endpoint-positive group)',
+               title='Secondary: raw marker differences (red = Holm-adjusted p < 0.05)')
+        ax.invert_yaxis()
+        save(fig, 'secondary_endpoint_associations.png')
+
+
 def paired_interval(diff, rng, n_boot):
     """Participant bootstrap of a mean paired difference, conditional on the fitted models."""
     boot = diff[rng.integers(len(diff), size=(n_boot, len(diff)))].mean(axis=1)
@@ -503,58 +695,5 @@ def summarize(root, seeds, folds, smoke=False):
             r,p=spearmanr(g.rhythm_error,g.log_loss)
             bridges.append(dict(method=method,label=int(label),n=len(g),spearman=float(r),p_exploratory=float(p)))
     write_json(root/'rq3_exploratory_bridge.json',bridges)
-    # ---- Figures, all from the saved tables above.
-    primary = table[table.probe == 'logistic']
-    shown = [m for m in order if m in set(primary.method)]
-    fig,(ax,bx)=plt.subplots(1,2,figsize=(15,5))
-    for i,m in enumerate(shown):
-        v=primary[primary.method==m].auroc.to_numpy()
-        ax.scatter(np.full(len(v),i),v,s=14,color='grey')
-        ax.errorbar(i,v.mean(),yerr=v.std(ddof=1) if len(v)>1 else 0,fmt='ko',capsize=4)
-    ax.axhline(.5,color='grey',ls=':')
-    ax.set(xticks=range(len(shown)),ylabel='Participant AUROC',title='RQ3 primary probe (points: seeds; black: mean ± SD)')
-    ax.set_xticklabels(shown,rotation=40,ha='right')
-    iv=rq3_intervals[rq3_intervals.probe=='logistic'].set_index('control').reindex([m for m in shown if m!='dssl']).dropna()
-    d,lo,hi=iv.difference.to_numpy(),iv.low.to_numpy(),iv.high.to_numpy()
-    bx.errorbar(d,range(len(iv)),xerr=[d-lo,hi-d],fmt='o',capsize=3)
-    bx.axvline(0,color='grey')
-    bx.set(yticks=range(len(iv)),yticklabels=iv.index,xlabel='DSSL minus control AUROC (paired participant bootstrap 95% CI)',
-           title='Positive favours DSSL')
-    fig.tight_layout(); fig.savefig(root/'rq3_auroc.png',dpi=180,bbox_inches='tight'); plt.close(fig)
-    if len(assoc):
-        fig,ax=plt.subplots(figsize=(9,max(4,len(assoc)*.18)))
-        ax.barh([f'{r.marker}: {r.channel}' for r in assoc.itertuples()],assoc.rank_biserial)
-        ax.set(xlabel='Rank-biserial association with exported endpoint');fig.tight_layout()
-        fig.savefig(root/'secondary_endpoint_associations.png',dpi=180);plt.close(fig)
-    if len(rq2_summary):
-        fig,ax=plt.subplots(figsize=(8,4))
-        pivot=rq2_summary.pivot_table(index='method',columns='perturbation',values='concordance')
-        pivot.plot.bar(ax=ax);ax.axhline(.5,color='grey');ax.set(ylabel='Within-person concordance (mean over seeds)',ylim=(0,1))
-        ax.tick_params(axis='x',rotation=25);fig.tight_layout();fig.savefig(root/'rq2_personalized.png',dpi=180);plt.close(fig)
-    if len(families):
-        labels=sorted(families.marker.unique())
-        controls=[c for c in RQ1_CONTROLS if c in set(families.control)]
-        fig,ax=plt.subplots(figsize=(10,max(4,len(labels)*.9)))
-        for k,control in enumerate(controls):
-            g=families[families.control==control]
-            y=[labels.index(m)+(k-(len(controls)-1)/2)*.12 for m in g.marker]
-            d,lo,hi=g.difference.to_numpy(),g.low.to_numpy(),g.high.to_numpy()
-            ax.errorbar(d,y,xerr=[d-lo,hi-d],fmt='o',capsize=2,label=control)
-        ax.axvline(0,color='grey');ax.legend(fontsize=8)
-        ax.set(yticks=range(len(labels)),yticklabels=labels,title='RQ1 marker families: positive favours DSSL',
-               xlabel='Control minus DSSL error, paired 95% CI (phase: hours; others: training-SD units)')
-        fig.tight_layout();fig.savefig(root/'rq1_families.png',dpi=180,bbox_inches='tight');plt.close(fig)
-    if display:
-        # Channels differ in physical units: scalar panels use training-SD units, phase hours.
-        display=pd.DataFrame(display)
-        panels=sorted(display.marker.unique())
-        fig,axes=plt.subplots(len(panels),1,figsize=(13,max(4,len(panels)*3.5)),squeeze=False)
-        for ax,marker in zip(axes[:,0],panels):
-            values=display[display.marker==marker].reset_index(drop=True)
-            d,lo,hi=values.difference.to_numpy(),values.low.to_numpy(),values.high.to_numpy()
-            ax.errorbar(d,values.index.to_numpy(),xerr=[np.maximum(d-lo,0),np.maximum(hi-d,0)],fmt='o')
-            ax.set(yticks=values.index,yticklabels=values.channel,title=marker,
-                   xlabel='Untrained minus DSSL MAE; paired 95% CI ('+('hours' if marker=='phase_hours' else 'training target SD units')+')')
-            ax.tick_params(axis='y',labelsize=7);ax.axvline(0,color='grey')
-        fig.tight_layout();fig.savefig(root/'rq1_recovery.png',dpi=180,bbox_inches='tight');plt.close(fig)
+    figures(root)
     write_report(root, smoke=smoke)
