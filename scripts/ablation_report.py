@@ -33,6 +33,37 @@ def r2(frame):
     return max(0.0, 1 - sse / sst) if sst > 0 else float('nan')
 
 
+def fold_headline(fold):
+    """The three numbers that decide the candidate, for ONE fold, so their spread is visible.
+
+    Pooling folds hides exactly what matters at this sample size: whether an arm's advantage
+    holds in every fold or comes from one.
+    """
+    recovery = pd.read_csv(fold / 'rq1_recovery.csv')
+    marker = recovery.assign(marker=recovery.marker.replace({'phase_cos': 'phase',
+                                                             'phase_sin': 'phase'}))
+    per = marker[marker.method.isin(['dssl', 'untrained'])].groupby(
+        ['method', 'marker']).normalized_absolute_error.mean().unstack('method')
+    gain = float('nan')
+    if {'dssl', 'untrained'} <= set(per.columns):
+        families = [m for m in per.index if m in FAMILIES or m == 'phase']
+        gain = float((per.loc[families, 'untrained'] - per.loc[families, 'dssl']).mean())
+    rq2 = pd.read_csv(fold / 'rq2_personalized.csv', dtype={'participant': str})
+    amplitude = rq2[(rq2.perturbation == 'amplitude') & (rq2.method == 'dssl')]
+    intensity = float('nan')
+    if len(amplitude):
+        strongest = amplitude[(amplitude.level == amplitude.level.max()) & (amplitude.raw_delta != 0)]
+        if len(strongest):
+            intensity = float(np.mean(np.where(
+                strongest.representation_delta == 0, .5,
+                (np.sign(strongest.representation_delta) == np.sign(strongest.raw_delta)).astype(float))))
+    ent = pd.read_csv(fold / 'rq1_disentanglement.csv', dtype={'participant': str})
+    steps = ent[(ent.method == 'dssl') & (ent.target == 'acrophase') & (ent.channel == 'Steps')]
+    own = r2(steps[steps.role == 'own']) if len(steps) else float('nan')
+    leak = r2(steps[steps.role == 'leakage']) if len(steps) else float('nan')
+    return gain, intensity, own, leak
+
+
 def arm_metrics(arm):
     folds = sorted((ROOT / 'results' / 'hrd' / arm / 'tcn_none').glob('seed_*/fold_*'))
     folds = [f for f in folds if (f / 'complete.json').exists()]
@@ -88,6 +119,23 @@ print()
 print(f'{"arm":14s} own/leak R2 - acrophase Steps, acrophase screen, MESOR HR')
 for m in rows:
     print(f'{m["arm"]:14s} {m.get("acrophase/Steps")}  {m.get("acrophase/screen")}  {m.get("MESOR/HR")}')
+print()
+print(f'{"arm":14s} {"fold":>4s} {"RQ1 gain":>9s} {"intensity":>10s}  Steps own/leak'
+      '     (per fold: does the advantage hold everywhere, or come from one fold?)')
+per_fold = {}
+for arm in ARMS:
+    folds = [f for f in sorted((ROOT / 'results' / 'hrd' / arm / 'tcn_none').glob('seed_*/fold_*'))
+             if (f / 'complete.json').exists()]
+    for fold in folds:
+        gain, intensity, own, leak = fold_headline(fold)
+        per_fold.setdefault(arm, []).append(
+            dict(fold=fold.name, rq1_gain=round(gain, 4), intensity_strongest=round(intensity, 3),
+                 steps_own=round(own, 3), steps_leak=round(leak, 3)))
+        print(f'{arm:14s} {fold.name.replace("fold_", ""):>4s} {gain:9.4f} {intensity:10.3f}'
+              f'  {own:6.3f} / {leak:<6.3f}')
+for m in rows:
+    m['per_fold'] = per_fold.get(m['arm'], [])
+
 out = ROOT / 'results' / 'hrd' / 'ablation_summary.json'
 out.write_text(json.dumps(rows, indent=1) + '\n')
 print('\nwritten to', out)
