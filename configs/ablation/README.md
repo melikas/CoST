@@ -70,3 +70,28 @@ Diagnosis (measured, no training):
 preserved; MESOR own intact. Risk named in advance: across disjoint days the most identifying cue
 measured was the daily-rhythm profile (0.016, vs 0.002–0.004 for level/variability), so the trend
 branch could learn rhythm and leakage could *rise*.
+
+**Result (5 folds, HRD seed 1, job 3277080): c1 FAILS the rule — not adopted.**
+
+| Condition | b3_eq_zero | c1_trend_days | |
+|---|---|---|---|
+| trend top-1 not saturated | 1.000 | **0.006** (chance 0.00024) | met, but the task is now barely learned at all |
+| **RQ1 gain > 0 or better** | **+0.0096** | **−0.0164** | **FAILED — worse in 5/5 paired folds, mean −0.026** |
+| Steps leakage not worse | 0.664 | **0.622** | met: down in 5/5 folds (mean −0.041) |
+| screen leakage not worse | 0.507 | **0.490** | met: down in 4/5 folds |
+| intensity > 0.5, rising | 0.654→0.730 | 0.645→0.730 | met, unchanged |
+| timing preserved | 0.693→0.972 | 0.686→0.974 | met, unchanged |
+| MESOR own intact | 1.000 (5/5) | 1.000 (5/5) | met |
+
+The mechanism worked and still lost: making the trend pair unmatchable by copying **did** drive rhythm
+out of the trend branch (leakage down in 5/5 Steps folds), which confirms the shared-backbone story.
+But top-1 fell from 1.000 to ~0.006, i.e. from trivially solved to essentially unsolved, and RQ1
+recovery regressed in every fold. It also produced new own-branch collapses (Steps fold 4
+0.705→0.000; screen folds 1 and 4 0.308→0.000 and 0.147→0.000), so branch separation counted over
+folds did not improve (Steps own>leak 4/5 → 3/5).
+
+Two points now bracket the difficulty knob — copy-easy (top-1 1.000, RQ1 +0.0096) and
+disjoint-hard (top-1 0.006, RQ1 −0.0164) — and RQ1 is better at the easy end. Note c1 bundled three
+changes (disjoint days, visible-mean readout, own-window keys masked), so it does not attribute the
+regression to disjointness alone. `trend_views` stays `"same"` by default; Failure A remains open and
+is documented as a limitation rather than fixed.
