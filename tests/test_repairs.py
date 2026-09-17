@@ -124,8 +124,8 @@ class EvaluationRepairs(unittest.TestCase):
         torch.backends.cudnn.allow_tf32 = False                       # as exact_numerics() leaves it
         model = DSSL(2, 28, 4, model_seed=3, **TINY)
         seen, loss = [], model._loss
-        model._loss = lambda batch, update=True: (seen.append(torch.backends.cudnn.allow_tf32),
-                                                  loss(batch, update))[1]
+        model._loss = lambda batch, update=True, ids=None: (
+            seen.append(torch.backends.cudnn.allow_tf32), loss(batch, update, ids))[1]
         model.fit(np.random.default_rng(3).normal(size=(8, 28, 2)).astype(np.float32),
                   n_iters=2, verbose=False)
         self.assertEqual(seen, [True, True])

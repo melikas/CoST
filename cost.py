@@ -214,12 +214,15 @@ class CoSTModel(nn.Module):
 
     def __init__(self, encoder_q, encoder_k, *, dim=128, alpha=0.005, K=4096, m=0.999,
                  T=0.07, phase_mode="circular_amp", readout_norm="none",
-                 weights: O.TermWeights = O.PAPER,
+                 weights: O.TermWeights = O.PAPER, trend_views="same",
                  w_eq=0.0, eq_dims=0, w_ac=0.0, ac_gamma=0.7114, ac_queue=512, device="cuda"):
         super().__init__()
+        if trend_views not in ("same", "disjoint_days"):
+            raise ValueError(f"trend_views must be 'same' or 'disjoint_days', got {trend_views!r}")
         self.alpha, self.K, self.m, self.T = alpha, K, m, T
         self.phase_mode, self.readout_norm = phase_mode, readout_norm
         self.weights, self.device = weights, device
+        self.trend_views = trend_views
 
         self.encoder_q, self.encoder_k = encoder_q, encoder_k
         self.head_q = nn.Sequential(nn.Linear(dim, dim), nn.ReLU(), nn.Linear(dim, dim))
@@ -231,6 +234,10 @@ class CoSTModel(nn.Module):
 
         self.register_buffer("queue", F.normalize(torch.randn(dim, K), dim=0))
         self.register_buffer("queue_ptr", torch.zeros(1, dtype=torch.long))
+        if trend_views == "disjoint_days":
+            # Which training window each key came from (-1: unknown), so a query's own week
+            # is never its negative. Only in this mode, so "same" checkpoints are unchanged.
+            self.register_buffer("queue_ids", torch.full((K,), -1, dtype=torch.long))
         self.last_top1 = float("nan")
 
         # Level equivariance. Built after the queue, so w_eq=0 draws no extra random numbers.
@@ -255,28 +262,76 @@ class CoSTModel(nn.Module):
                 pk.data.mul_(self.m).add_(pq.data, alpha=1.0 - self.m)
 
     @torch.no_grad()
-    def _enqueue(self, keys):
+    def _enqueue(self, keys, ids=None):
         b = keys.shape[0]
         if self.K % b != 0:
             raise ValueError(f"queue size {self.K} must be divisible by batch size {b}")
         ptr = int(self.queue_ptr)
         self.queue[:, ptr:ptr + b] = keys.T
+        if hasattr(self, "queue_ids"):
+            self.queue_ids[ptr:ptr + b] = -1 if ids is None else ids
         self.queue_ptr[0] = (ptr + b) % self.K
 
-    def forward(self, x_q, x_k, update=True, return_parts=False, delta=None):
+    def _disjoint_days(self, x_q, x_k):
+        """Hide all but a random half of the days in each view, and a different half in each.
+
+        The two views of a week then share no timestep: the pair can only be matched through
+        what persists across days, not by copying the input (raw pixels alone retrieve the
+        full-window pair at top-1 0.891 among 3,803 HRD weeks). Hidden bins are NaN, which the
+        encoder already zeroes. Returns the views and their visible-bin masks.
+        """
+        bpd = self.encoder_q.bins_per_day
+        b, t, _ = x_q.shape
+        days = t // bpd
+        if days < 2:
+            raise ValueError("disjoint_days needs at least two whole days per window")
+        half = days // 2
+        order = torch.argsort(torch.rand(b, days, device=x_q.device), dim=1)
+        visible = []
+        for chosen in (order[:, :half], order[:, half:2 * half]):
+            day = torch.zeros(b, days, dtype=torch.bool, device=x_q.device).scatter_(1, chosen, True)
+            per_bin = day.repeat_interleave(bpd, dim=1)
+            visible.append(F.pad(per_bin, (0, t - days * bpd), value=False))
+        views = [x.masked_fill(~v.unsqueeze(-1), float("nan")) for x, v in zip((x_q, x_k), visible)]
+        return views, visible
+
+    @staticmethod
+    def _visible_mean(z, visible):
+        w = visible.unsqueeze(-1).to(z.dtype)
+        return (z * w).sum(dim=1) / w.sum(dim=1)
+
+    def forward(self, x_q, x_k, update=True, return_parts=False, delta=None, ids=None):
         idx = np.random.randint(0, x_q.shape[1])            # the timestep the trend term contrasts
         q_t, q_s = self.encoder_q(x_q)
 
         q_level = q_t.mean(dim=1) if self.head_eq is not None else None   # the trend readout
-        q_t = F.normalize(self.head_q(q_t[:, idx]), dim=-1)
-        with torch.no_grad():
+        if self.trend_views == "same":
+            q_t = F.normalize(self.head_q(q_t[:, idx]), dim=-1)
+            with torch.no_grad():
+                if update:
+                    self._momentum_update()
+                k_t, _ = self.encoder_k(x_k)
+                k_t = F.normalize(self.head_k(k_t[:, idx]), dim=-1)
+            trend, self.last_top1 = O.moco_ce_loss(q_t, k_t, self.queue.clone().detach(), self.T)
             if update:
-                self._momentum_update()
-            k_t, _ = self.encoder_k(x_k)
-            k_t = F.normalize(self.head_k(k_t[:, idx]), dim=-1)
-        trend, self.last_top1 = O.moco_ce_loss(q_t, k_t, self.queue.clone().detach(), self.T)
-        if update:
-            self._enqueue(k_t)
+                self._enqueue(k_t)
+        else:
+            # Same week, different days: the query is days A of view 1, the key days B of
+            # view 2, each read out as the mean trend over its visible bins -- the quantity the
+            # frozen trend block reports. One extra encoder pass, for the query.
+            (x_a, x_b), (vis_a, vis_b) = self._disjoint_days(x_q, x_k)
+            q_a, _ = self.encoder_q(x_a)
+            q_h = F.normalize(self.head_q(self._visible_mean(q_a, vis_a)), dim=-1)
+            with torch.no_grad():
+                if update:
+                    self._momentum_update()
+                k_b, _ = self.encoder_k(x_b)
+                k_h = F.normalize(self.head_k(self._visible_mean(k_b, vis_b)), dim=-1)
+            own = None if ids is None else ids.unsqueeze(1) == self.queue_ids.unsqueeze(0)
+            trend, self.last_top1 = O.moco_ce_loss(q_h, k_h, self.queue.clone().detach(),
+                                                   self.T, neg_mask=own)
+            if update:
+                self._enqueue(k_h, ids)
 
         # Seasonal term as upstream: no queue and symmetric, so the key view also goes through
         # encoder_q with gradients (a third encoder pass).
@@ -322,8 +377,9 @@ class DSSL:
     """Fit the encoder, then read frozen representations out of it.
 
     The defaults are the paper's DSSL: four harmonic bands, causal trend experts up to T/8,
-    contracted seasonal weights, amplitude-weighted circular phase contrast, level
-    equivariance (w_eq = 1), smoothing up to 75 min, angle readout. method="cost_reference"
+    contracted seasonal weights, amplitude-weighted circular phase contrast, smoothing up to
+    75 min, angle readout -- except level equivariance, now off (w_eq = 0): on HRD, w_eq
+    1 / 0.05 / 0 gave RQ1 gain -0.0343 / -0.0136 / +0.0096 over 5 folds, ordered so in each. method="cost_reference"
     is upstream CoST behind the same readout: one full-spectrum band, trend experts up to
     T/2, raw-phase contrast, weights 1 / 0.5 / 0.5, no equivariance, scaling, jitter and
     shift augmentation at 0.5; callers pass it only REFERENCE_SHARED.
@@ -335,8 +391,8 @@ class DSSL:
                  n_heads=4, bidirectional=True, seasonal_bands="harmonics", harmonics=4,
                  trend_kernel_cap=None, seasonal_frac=0.5, band_readout=False, mask_mode="none",
                  phase_readout="angle", readout_norm="none", phase_mode="circular_amp",
-                 weights="contracted",
-                 alpha=0.005, w_eq=1.0, w_ac=0.0, ac_gamma=0.7114, ac_queue=512, moco_k=4096,
+                 weights="contracted", trend_views="same",
+                 alpha=0.005, w_eq=0.0, w_ac=0.0, ac_gamma=0.7114, ac_queue=512, moco_k=4096,
                  jitter_sigma=0.1, shift_sigma=0.5, smooth_minutes=75.0, lr=5e-4, batch_size=64,
                  device="cuda", model_seed=None):
         if method not in ("dssl", "cost_reference"):
@@ -348,6 +404,7 @@ class DSSL:
                 raise ValueError("the CoST reference adapter is sensor-only")
             backbone, temporal_encoding, seasonal_bands, band_readout = "tcn", "none", "single", False
             trend_kernel_cap, phase_mode, weights = max(1, seq_len // 2), "raw", "paper"
+            trend_views = "same"
             w_eq, w_ac, jitter_sigma, shift_sigma, smooth_minutes = 0.0, 0.0, 0.5, 0.5, 0.0
             self.scale_sigma = 0.5
         if trend_kernel_cap is None:
@@ -387,9 +444,9 @@ class DSSL:
         encoder_k = CoSTEncoder(**enc).to(device)
         self.cost = CoSTModel(
             self.net, encoder_k, dim=self.net.trend_dims, alpha=alpha, K=moco_k,
-            phase_mode=phase_mode, readout_norm=readout_norm, weights=weights, w_eq=w_eq,
-            eq_dims=input_dims, w_ac=w_ac, ac_gamma=ac_gamma, ac_queue=ac_queue,
-            device=device).to(device)
+            phase_mode=phase_mode, readout_norm=readout_norm, weights=weights,
+            trend_views=trend_views, w_eq=w_eq, eq_dims=input_dims, w_ac=w_ac,
+            ac_gamma=ac_gamma, ac_queue=ac_queue, device=device).to(device)
         self.n_iters = 0
         self._optimizer = None
         self._permutation = None
@@ -409,7 +466,8 @@ class DSSL:
                            band_readout=band_readout, mask_mode=mask_mode,
                            phase_readout=phase_readout, readout_norm=readout_norm,
                            phase_mode=phase_mode,
-                           weights=weights_name, alpha=alpha, w_eq=w_eq, w_ac=w_ac,
+                           weights=weights_name, trend_views=trend_views,
+                           alpha=alpha, w_eq=w_eq, w_ac=w_ac,
                            moco_k=moco_k, jitter_sigma=jitter_sigma, shift_sigma=shift_sigma,
                            scale_sigma=self.scale_sigma, smooth_minutes=smooth_minutes,
                            smooth_bins=self.smooth_bins, lr=lr, batch_size=batch_size,
@@ -451,7 +509,7 @@ class DSSL:
             self._cursor += self.batch_size
             batch = [torch.stack(v) for v in zip(*(ds[int(i)] for i in idx))]
             adjust_learning_rate(opt, self.lr, self.n_iters, n_iters)
-            loss = self._loss(batch)
+            loss = self._loss(batch, ids=(idx % ds.N).to(self.device))
             if not torch.isfinite(loss):
                 raise FloatingPointError("nonfinite SSL loss")
             opt.zero_grad(set_to_none=True)
@@ -481,9 +539,11 @@ class DSSL:
                              smooth_bins=self.smooth_bins, scale_sigma=self.scale_sigma, **kw)
         return DataLoader(ds, batch_size=self.batch_size, shuffle=shuffle, drop_last=True)
 
-    def _loss(self, batch, update=True):
+    def _loss(self, batch, update=True, ids=None):
+        """`ids`: each sample's training-window index; only trend_views="disjoint_days" reads
+        it, to keep a week's own earlier keys out of its negatives."""
         x_q, x_k = batch[0].to(self.device), batch[1].to(self.device)
-        return self.cost(x_q, x_k, update=update, delta=batch[2].to(self.device))
+        return self.cost(x_q, x_k, update=update, delta=batch[2].to(self.device), ids=ids)
 
     @torch.no_grad()
     def _validation_loss(self, loader):

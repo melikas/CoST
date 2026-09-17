@@ -60,9 +60,10 @@ class PaperModel(unittest.TestCase):
         self.assertAlmostEqual(cost.weights.phase, 1.0 / 1.174)
         self.assertEqual(cost.phase_mode, "circular_amp")
         self.assertEqual((cost.alpha, cost.K, cost.m, cost.T), (0.005, 4096, 0.999, 0.07))
-        self.assertEqual(cost.w_eq, 1.0)
-        self.assertEqual(tuple(cost.head_eq.weight.shape), (3, 160))
-        self.assertIsNone(cost.head_eq.bias)
+        # Working default since the w_eq dose-response (HRD, 5 folds): 1.0 / 0.05 / 0 gave RQ1
+        # gain -0.0343 / -0.0136 / +0.0096, ordered that way in every fold.
+        self.assertEqual(cost.w_eq, 0.0)
+        self.assertIsNone(cost.head_eq)
         self.assertEqual(cost.w_ac, 0.0)
         self.assertEqual(c["smooth_bins"], 5)                             # 75 min at 15-min bins
         self.assertEqual((c["jitter_sigma"], c["shift_sigma"], c["scale_sigma"]), (0.1, 0.5, 0.0))
@@ -127,6 +128,46 @@ class CoSTReference(unittest.TestCase):
                              trend_kernel_cap=2, smooth_minutes=75.0, jitter_sigma=0.1,
                              **tiny).config
         self.assertEqual(plain, dssl_settings)
+
+
+class TrendViews(unittest.TestCase):
+    TINY = dict(output_dims=8, hidden_dims=8, tcn_depth=0, batch_size=4, moco_k=8, device="cpu")
+
+    def test_default_is_same_and_the_reference_ignores_it(self):
+        self.assertEqual(DSSL(2, 28, 4, **self.TINY).config["trend_views"], "same")
+        self.assertFalse(hasattr(DSSL(2, 28, 4, **self.TINY).cost, "queue_ids"))   # checkpoints unchanged
+        ref = DSSL(2, 28, 4, method="cost_reference", trend_views="disjoint_days", **self.TINY)
+        self.assertEqual(ref.config["trend_views"], "same")
+        with self.assertRaisesRegex(ValueError, "trend_views"):
+            DSSL(2, 28, 4, trend_views="crop", **self.TINY)
+
+    def test_disjoint_day_views_share_no_timestep(self):
+        cost = DSSL(3, 28, 4, trend_views="disjoint_days", **self.TINY).cost    # 7 days of 4 bins
+        x = torch.randn(64, 28, 3, generator=torch.Generator().manual_seed(0))
+        (xa, xb), (va, vb) = cost._disjoint_days(x, x + 1)
+        self.assertFalse((va & vb).any())
+        self.assertTrue((va.sum(1) == 3 * 4).all() and (vb.sum(1) == 3 * 4).all())
+        days_a = va.view(64, 7, 4)
+        self.assertTrue((days_a.all(2) | ~days_a.any(2)).all())          # whole days only
+        self.assertTrue(torch.isnan(xa[~va]).all() and torch.isnan(xb[~vb]).all())
+        torch.testing.assert_close(xa[va], x[va])
+        torch.testing.assert_close(xb[vb], (x + 1)[vb])
+
+    def test_a_weeks_own_keys_are_not_its_negatives(self):
+        q = torch.nn.functional.normalize(torch.randn(2, 4, generator=torch.Generator().manual_seed(1)), dim=1)
+        queue = torch.cat([q, torch.nn.functional.normalize(-q, dim=1)]).T       # 4 x 4: copies, then opposites
+        own = torch.tensor([[True, False, False, False], [False, True, False, False]])
+        _, unmasked = O.moco_ce_loss(q, q, queue)
+        _, masked = O.moco_ce_loss(q, q, queue, neg_mask=own)
+        self.assertEqual((unmasked, masked), (0.0, 1.0))
+
+    def test_disjoint_days_trains_and_records_window_ids(self):
+        model = DSSL(2, 28, 4, trend_views="disjoint_days", model_seed=3, **self.TINY)
+        x = np.random.default_rng(0).normal(size=(6, 28, 2)).astype(np.float32)
+        history = model.fit(x, n_iters=4, log_every=2, verbose=False)
+        self.assertTrue(np.isfinite(history["train"]).all())
+        ids = model.cost.queue_ids
+        self.assertTrue(((ids >= 0) & (ids < 6)).all())                 # 4 steps x 4 = two full queues
 
 
 class BackboneRegistry(unittest.TestCase):

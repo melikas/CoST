@@ -37,3 +37,36 @@ smaller than phase's (≈34). Two single-scalar probes of the same hypothesis:
 Monitored: RQ1 gain vs untrained, RQ2 timing and intensity, phase own/leak for Steps and screen,
 MESOR own/leak. Everything here inherits `readout_norm=none` and its open Steps-phase issue;
 this batch is not expected to change that on its own, since `w_eq` never touches the readout.
+
+**Result (5 folds, HRD seed 1):** RQ1 gain w_eq 1.0 / 0.05 / 0 = −0.0343 / −0.0136 / **+0.0096**,
+ordered that way in every fold; phase leakage into the trend branch rises as w_eq falls (Steps leak
+b3 > b2 > a2 in 5/5 folds). **w_eq=0 adopted as the working default** (`configs/hrd.json`,
+`configs/globem.json`, `DSSL`'s own default).
+
+## Batch C — the trend branch, Failure A (2026-09-17, on top of w_eq=0, readout_norm=none)
+
+Diagnosis (measured, no training):
+- **The trend positive is a near-copy.** Two augmented views of the same full week: raw input alone
+  retrieves the pair at top-1 **0.891** among all 3,803 HRD weeks (a 24 h slice: 0.737). Any encoder
+  that preserves input identity solves it; training learns exactly that and saturates (full run:
+  top-1 ≥0.98 by ~1,600 iterations). Stronger augmentation is not the cause: the CoST reference, at
+  jitter/scale/shift 0.5, saturates too (0.985).
+- **The trend term is not weak at initialisation.** An earlier probe put it at 0.3% of the loss and a
+  5.2e-4 gradient — an artifact of the randomly initialised queue. Against real negatives it is the
+  largest term (weighted 1.39 vs amplitude 0.14, phase 0.14; gradient 1.64). Its signal disappears
+  during training, once the copy shortcut is learned.
+- **Its own window is among its negatives.** Queue 4,096 > ~2,900 training weeks: ~1.4 keys per query
+  come from the query's own week (and ~38 from its own participant).
+
+| Arm | Change | Rationale |
+|---|---|---|
+| `b3_eq_zero` | (baseline, already run at 5 folds) | identical to the working default |
+| `hrd_c1_trend_days.json` | `trend_views=disjoint_days` | query = days A of view 1, key = a disjoint half of the days of view 2, each read out as the mean trend over its visible bins (what the frozen trend block reports); a week's own earlier keys are masked out of its negatives. Views share no timestep, so copying cannot solve it: simple cross-day features retrieve at 0.002–0.016; untrained encoder with real negatives 0.688 → 0.062. One extra encoder pass: +23% per step |
+
+`trend_views="same"` (default) is bit-identical to commit a238a37, on which `b3_eq_zero` ran.
+
+**Pass only if all hold, c1 vs b3, 5 folds:** RQ1 gain stays > 0 or improves; trend top-1 no longer
+≈1.0; Steps and screen phase leakage improve or do not worsen; intensity above 0.5 and rising; timing
+preserved; MESOR own intact. Risk named in advance: across disjoint days the most identifying cue
+measured was the daily-rhythm profile (0.016, vs 0.002–0.004 for level/variability), so the trend
+branch could learn rhythm and leakage could *rise*.

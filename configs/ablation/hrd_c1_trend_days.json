@@ -1,0 +1,50 @@
+{
+  "cache": "datasets/cache/hrd_rescue_v1.npz",
+  "seeds": [
+    1,
+    2,
+    3
+  ],
+  "folds": 5,
+  "split_seed": 20260914,
+  "steps": 6000,
+  "val_frac": 0.1,
+  "normalization": "within_person",
+  "marker_coverage": 0.7,
+  "model": {
+    "backbone": "tcn",
+    "temporal_encoding": "none",
+    "tcn_depth": null,
+    "n_layers": 4,
+    "n_heads": 4,
+    "bidirectional": true,
+    "output_dims": 320,
+    "hidden_dims": 64,
+    "seasonal_frac": 0.5,
+    "seasonal_bands": "harmonics",
+    "harmonics": 4,
+    "trend_kernel_cap": null,
+    "phase_readout": "angle",
+    "readout_norm": "none",
+    "phase_mode": "circular_amp",
+    "weights": "contracted",
+    "trend_views": "disjoint_days",
+    "alpha": 0.005,
+    "w_eq": 0.0,
+    "moco_k": 4096,
+    "jitter_sigma": 0.1,
+    "shift_sigma": 0.5,
+    "smooth_minutes": 75.0,
+    "lr": 0.0005,
+    "batch_size": 64
+  },
+  "ablation": {
+    "arm": "c1_trend_days",
+    "batch": "C - trend branch (Failure A)",
+    "changed": {
+      "trend_views": "disjoint_days"
+    },
+    "baseline": "b3_eq_zero (identical settings: w_eq=0, readout_norm=none), HRD seed 1, 5 folds",
+    "rationale": "The trend positive was two augmented copies of the same week: raw input alone retrieves it at top-1 0.891 among 3,803 weeks, so training learns to copy and the task saturates (DSSL and the CoST reference both). Disjoint days of the same week share no timestep (simple features: top-1 0.002-0.016), and a week is kept out of its own negatives. Untrained, real negatives: top-1 0.688 -> 0.062."
+  }
+}

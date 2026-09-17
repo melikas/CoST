@@ -34,7 +34,7 @@ def r2(frame):
 
 
 def fold_headline(fold):
-    """The three numbers that decide the candidate, for ONE fold, so their spread is visible.
+    """The numbers that decide a candidate, for ONE fold, so their spread is visible.
 
     Pooling folds hides exactly what matters at this sample size: whether an arm's advantage
     holds in every fold or comes from one.
@@ -58,10 +58,15 @@ def fold_headline(fold):
                 strongest.representation_delta == 0, .5,
                 (np.sign(strongest.representation_delta) == np.sign(strongest.raw_delta)).astype(float))))
     ent = pd.read_csv(fold / 'rq1_disentanglement.csv', dtype={'participant': str})
-    steps = ent[(ent.method == 'dssl') & (ent.target == 'acrophase') & (ent.channel == 'Steps')]
-    own = r2(steps[steps.role == 'own']) if len(steps) else float('nan')
-    leak = r2(steps[steps.role == 'leakage']) if len(steps) else float('nan')
-    return gain, intensity, own, leak
+    phase = {}
+    for channel in ('Steps', 'screen'):
+        rows = ent[(ent.method == 'dssl') & (ent.target == 'acrophase') & (ent.channel == channel)]
+        phase[channel] = tuple(r2(rows[rows.role == role]) if len(rows) else float('nan')
+                               for role in ('own', 'leakage'))
+    mesor = ent[(ent.method == 'dssl') & (ent.target == 'MESOR')]
+    mesor_own = r2(mesor[mesor.role == 'own']) if len(mesor) else float('nan')
+    top1 = json.loads((fold / 'dssl_model.json').read_text())['history']['top1'][-1]
+    return gain, intensity, phase, mesor_own, top1
 
 
 def arm_metrics(arm):
@@ -99,7 +104,7 @@ def arm_metrics(arm):
             sub = ent[(ent.target == target) & (ent.channel == channel)]
             if len(sub):
                 own, leak = sub[sub.role == 'own'], sub[sub.role == 'leakage']
-                out[f'{target}/{channel}'] = (round(r2(own), 3), round(r2(leak), 3))
+                out[f'{target}/{channel}'] = (round(float(r2(own)), 3), round(float(r2(leak)), 3))
     return out
 
 
@@ -120,19 +125,25 @@ print(f'{"arm":14s} own/leak R2 - acrophase Steps, acrophase screen, MESOR HR')
 for m in rows:
     print(f'{m["arm"]:14s} {m.get("acrophase/Steps")}  {m.get("acrophase/screen")}  {m.get("MESOR/HR")}')
 print()
-print(f'{"arm":14s} {"fold":>4s} {"RQ1 gain":>9s} {"intensity":>10s}  Steps own/leak'
-      '     (per fold: does the advantage hold everywhere, or come from one fold?)')
+print(f'{"arm":14s} {"fold":>4s} {"top-1":>6s} {"RQ1 gain":>9s} {"intens.":>8s} '
+      f'{"Steps own/leak":>15s} {"screen own/leak":>16s} {"MESOR own":>9s}'
+      '   (per fold: does it hold everywhere, or come from one fold?)')
 per_fold = {}
 for arm in ARMS:
     folds = [f for f in sorted((ROOT / 'results' / 'hrd' / arm / 'tcn_none').glob('seed_*/fold_*'))
              if (f / 'complete.json').exists()]
     for fold in folds:
-        gain, intensity, own, leak = fold_headline(fold)
+        gain, intensity, phase, mesor_own, top1 = fold_headline(fold)
+        (s_own, s_leak), (c_own, c_leak) = phase['Steps'], phase['screen']
         per_fold.setdefault(arm, []).append(
-            dict(fold=fold.name, rq1_gain=round(gain, 4), intensity_strongest=round(intensity, 3),
-                 steps_own=round(own, 3), steps_leak=round(leak, 3)))
-        print(f'{arm:14s} {fold.name.replace("fold_", ""):>4s} {gain:9.4f} {intensity:10.3f}'
-              f'  {own:6.3f} / {leak:<6.3f}')
+            dict(fold=fold.name, top1=round(top1, 3), rq1_gain=round(gain, 4),
+                 intensity_strongest=round(intensity, 3),
+                 steps_own=round(float(s_own), 3), steps_leak=round(float(s_leak), 3),
+                 screen_own=round(float(c_own), 3), screen_leak=round(float(c_leak), 3),
+                 mesor_own=round(float(mesor_own), 3)))
+        print(f'{arm:14s} {fold.name.replace("fold_", ""):>4s} {top1:6.3f} {gain:9.4f} '
+              f'{intensity:8.3f} {s_own:7.3f}/{s_leak:<7.3f} {c_own:8.3f}/{c_leak:<7.3f} '
+              f'{mesor_own:9.3f}')
 for m in rows:
     m['per_fold'] = per_fold.get(m['arm'], [])
 

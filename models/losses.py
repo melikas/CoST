@@ -120,7 +120,7 @@ def instance_contrastive_loss(z1, z2):
     return (logits[:, i, b + i - 1].mean() + logits[:, b + i, i].mean()) / 2
 
 
-def moco_ce_loss(q, k, k_negs, temperature: float = 0.07):
+def moco_ce_loss(q, k, k_negs, temperature: float = 0.07, neg_mask=None):
     """MoCo InfoNCE for the trend branch, plus the top-1 retrieval rate.
 
     `top1` is the project's pretext-difficulty measure and is returned rather than logged
@@ -128,10 +128,15 @@ def moco_ce_loss(q, k, k_negs, temperature: float = 0.07):
     top1 ~ 1.0 the task is already solved at initialisation and its gradient teaches
     nothing, which is the measured state of the shipped window-pairing (0.8223, 6737x
     chance) and the reason the trend branch has never separated from its own control.
+
+    `neg_mask` (N x K, True = not a negative) drops queue entries that are the query's own
+    instance: a queue larger than the training set always holds some.
     """
     l_pos = torch.einsum("nc,nc->n", q, k).unsqueeze(-1)                    # N x 1
     l_neg = (torch.einsum("nc,nkc->nk", q, k_negs) if k_negs.dim() == 3
              else torch.einsum("nc,ck->nk", q, k_negs))                     # N x K
+    if neg_mask is not None:
+        l_neg = l_neg.masked_fill(neg_mask, float("-inf"))
     logits = torch.cat([l_pos, l_neg], dim=1) / temperature
     with torch.no_grad():
         top1 = float((l_pos > l_neg.max(dim=1, keepdim=True).values).float().mean())
