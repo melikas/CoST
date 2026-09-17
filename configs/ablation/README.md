@@ -110,9 +110,35 @@ not depend on the DSSL config); at seed 1, raw = 0.695 and untrained = 0.657.
 | `c1_trend_days` | 0.710 | +0.015 [−0.037, +0.071] | +0.053 [−0.007, +0.120] |
 | (narval_v1, 3 seeds) | 0.697 | +0.002 | +0.006 |
 
-`b3_eq_zero` is the best configuration on RQ3 as well as on RQ1 and RQ2, and is the **first time
-DSSL has beaten the untrained encoder on RQ3 with an interval excluding 0**. The conjunction is
-still **NOT met**: raw (0.695) is not beaten. Caveats, both material: one seed, so the interval is a
-participant bootstrap conditional on the fitted models and carries no seed-to-seed spread (untrained
-alone moves 0.657 → 0.690 between seed 1 and the 3-seed mean); and the w_eq order for RQ3 is not
-monotone (0.674 / 0.661 / 0.726), unlike RQ1. Treat the RQ3 gain as promising, not established.
+### Adversarial audit of that screen (`scripts/audit_rq3_arms.py`) — the RQ3 gain does NOT survive
+
+The pipeline itself is sound: participant-disjoint folds (asserted in the runner), every fit
+(probe CV, PCA, scaler, NNLS) on training participants only, windows averaged to one row per person
+before the probe so window count carries no weight, a fixed 0.5 threshold that is never tuned, and
+AUROC recomputed from the saved predictions matching the published table exactly. But the b3 result
+fails three independent checks:
+
+1. **`untrained` did not move because of seeds.** `narval_v1`'s per-seed untrained is
+   [0.713, 0.644, 0.714] — 0.713 at seed 1, not 0.657. All four arms report exactly 0.657 while
+   differing in `w_eq` and `trend_views`, which cannot affect an untrained encoder. The only
+   difference is `readout_norm` "timestep"→"none", which **lowers the untrained control by ~0.056**.
+   So most of b3's "+0.069 over untrained" is the control falling. Against `raw` (0.695, identical
+   in every run), DSSL moved 0.707 → 0.726: **+0.019**.
+2. **Each comparison hinges on one fold.** b3 per-fold DSSL vs raw: 0.524/0.580, 0.731/0.731,
+   0.817/0.833, 0.783/0.767, **0.867/0.625** — raw wins two folds, one ties, and the pooled gain is
+   fold 4. Leave-one-fold-out dssl−raw: +0.051, +0.044, +0.031, +0.028, **+0.006 when fold 4 is
+   dropped**. The untrained gap is likewise concentrated in fold 3 (untrained's worst fold, 0.550):
+   LOFO gives +0.112, +0.067, +0.075, **+0.009**, +0.081.
+3. **Fold-block bootstrap includes zero for both:** dssl−raw +0.032 **[−0.017, +0.119]**;
+   dssl−untrained +0.069 **[−0.027, +0.185]**. The participant bootstrap holds the fold structure
+   fixed, which is why it reported the untrained gap as excluding 0.
+
+Attribution is at least not a subgroup artifact: the a2→b3 change is +166 of 3,162 (pos, neg) pairs,
+spread over 52 of 113 participants (largest single contributor +35 pairs, rank correlation 0.838).
+Diffuse, but small and fold-dependent. Calibration also confirms fragility: b3's probabilities are
+compressed (range 0.225–0.802, sd 0.141, `C=0.001` in 5/5 folds) against raw's 0.132–0.950, which is
+why AUROC 0.726 sits with BAcc 0.618. Note c1_trend_days shows the same pattern (0.710, +114 pairs)
+while failing RQ1 — further evidence these RQ3 differences do not track representational quality.
+
+**Verdict: RQ3 is NOT met, and the b3 RQ3 number is not evidence of a gain.** It is retained only as
+the configuration validated on RQ1/RQ2 mechanisms.
