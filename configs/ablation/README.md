@@ -95,3 +95,24 @@ disjoint-hard (top-1 0.006, RQ1 −0.0164) — and RQ1 is better at the easy end
 changes (disjoint days, visible-mean readout, own-window keys masked), so it does not attribute the
 regression to disjointness alone. `trend_views` stays `"same"` by default; Failure A remains open and
 is documented as a limitation rather than fixed.
+
+## RQ3 screen of every arm (2026-09-17, `scripts/ablation_rq3.py`, no GPU)
+
+Each arm holds all 5 folds of seed 1 — one complete out-of-fold pass — so RQ3 is computed with the
+protocol's own aggregation, one seed instead of three. Controls are identical across arms (they do
+not depend on the DSSL config); at seed 1, raw = 0.695 and untrained = 0.657.
+
+| Arm | DSSL AUROC | vs raw (primary) | vs untrained (primary) |
+|---|---|---|---|
+| `a2_amplitude` (w_eq=1.0) | 0.674 | −0.021 [−0.093, +0.053] | +0.017 [−0.054, +0.094] |
+| `b2_eq_small` (w_eq=0.05) | 0.661 | −0.034 [−0.097, +0.033] | +0.004 [−0.067, +0.081] |
+| **`b3_eq_zero` (w_eq=0)** | **0.726** | +0.032 [−0.016, +0.084] | **+0.069 [+0.007, +0.136] favours DSSL** |
+| `c1_trend_days` | 0.710 | +0.015 [−0.037, +0.071] | +0.053 [−0.007, +0.120] |
+| (narval_v1, 3 seeds) | 0.697 | +0.002 | +0.006 |
+
+`b3_eq_zero` is the best configuration on RQ3 as well as on RQ1 and RQ2, and is the **first time
+DSSL has beaten the untrained encoder on RQ3 with an interval excluding 0**. The conjunction is
+still **NOT met**: raw (0.695) is not beaten. Caveats, both material: one seed, so the interval is a
+participant bootstrap conditional on the fitted models and carries no seed-to-seed spread (untrained
+alone moves 0.657 → 0.690 between seed 1 and the 3-seed mean); and the w_eq order for RQ3 is not
+monotone (0.674 / 0.661 / 0.726), unlike RQ1. Treat the RQ3 gain as promising, not established.
