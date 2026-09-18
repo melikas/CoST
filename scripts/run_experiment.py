@@ -91,6 +91,11 @@ def parse_args():
     parser.add_argument('--fold', type=int, default=0)
     parser.add_argument('--reference', action='store_true',
                         help='train (or load) only the CoST reference adapter for this seed x fold')
+    parser.add_argument('--dev-cohort', action='store_true',
+                        help='architecture development: restrict every participant to the TRAINING '
+                             'set of locked protocol fold 0, then run the normal seed x fold '
+                             'machinery inside it. Fold 0 test participants are never seen and the '
+                             'locked evaluation is untouched')
     parser.add_argument('--reuse-encoders', metavar='RUN_NAME',
                         help='read the encoders of an existing run out under this run\'s readout '
                              'instead of training: valid only when the configurations differ '
@@ -291,6 +296,19 @@ def main():
         eligible = np.array([years[p] == year for p in c.pids])
         take = np.array([years[p] == year for p in ids])
         ids, y = ids[take], y[take]
+    if args.dev_cohort:
+        # Architecture development runs inside the TRAINING participants of locked protocol fold 0.
+        # That fold's test participants are never seen here, and the locked evaluation keeps its
+        # own folds, so comparability with every previous run is preserved. Selection on these
+        # results must use the label-free criteria (RQ1, own-vs-leakage, RQ2); the RQ3 computed
+        # here is a development probe on development people, never the locked test.
+        locked = make_folds(ids, y, n_folds=cfg['folds'], n_repeats=1,
+                            master_seed=cfg['split_seed'])[0]
+        keep = np.isin(ids, locked.train_pids)
+        ids, y = ids[keep], y[keep]
+        eligible &= np.isin(c.pids, ids)
+        print(f'development cohort: {len(ids)} participants (fold 0 training set); '
+              f'{len(locked.test_pids)} locked-fold-0 test participants excluded')
     if args.smoke:
         # Execution-only subset: prefer broad observed coverage and, for HRD, a contiguous
         # six-week run so the central personalized-baseline path is genuinely exercised.
@@ -337,7 +355,7 @@ def main():
                   training_ids=sorted(map(str, np.unique(pids[training]))),
                   test_ids=list(fold.test_pids), windows=int(len(X)),
                   fit_windows=int(len(fit_idx)), monitor_windows=int(len(val_idx)),
-                  reused_encoders_from=args.reuse_encoders)
+                  reused_encoders_from=args.reuse_encoders, dev_cohort=args.dev_cohort)
     if args.skip_reference and args.reference:
         raise ValueError('--reference trains only the reference; --skip-reference omits it')
     reuse_base = None

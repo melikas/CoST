@@ -33,6 +33,8 @@ extra=()
 # the reference and collide on its lock. With an existing run name the reference is cached, and
 # submit.sh's SKIP_REFERENCE just avoids resubmitting that stage.
 [ -n "${SKIP_REFERENCE:-}" ] && [ "${STAGE:-variant}" != reference ] && extra+=(--skip-reference)
+# DEV_COHORT: architecture development inside locked fold 0's training participants.
+[ -n "${DEV_COHORT:-}" ] && extra+=(--dev-cohort)
 # REUSE: read an existing run's encoders out under this config's readout instead of training.
 [ -n "${REUSE:-}" ] && extra+=(--reuse-encoders "$REUSE")
 srun python scripts/run_experiment.py --dataset "$DATASET" --seed "$seed" --fold "$fold" \
