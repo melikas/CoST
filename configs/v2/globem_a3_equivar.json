@@ -19,7 +19,7 @@
     "n_heads": 4,
     "bidirectional": true,
     "output_dims": 320,
-    "hidden_dims": 224,
+    "hidden_dims": 208,
     "seasonal_frac": 0.5,
     "seasonal_bands": "harmonics",
     "harmonics": 4,
@@ -38,18 +38,17 @@
     "lr": 0.0005,
     "batch_size": 64,
     "decompose": true,
-    "seasonal_days": 2.0,
     "seasonal_objective": "equivariance"
   },
   "development": {
-    "arm": "a3_equivariance",
+    "arm": "a3_equivar",
     "changed": {
       "decompose": true,
-      "hidden_dims": 224,
-      "seasonal_days": 2.0,
+      "hidden_dims": 208,
       "seasonal_objective": "equivariance"
     },
-    "ladder": "A3 = A2 + the seasonal equivariance objective. Replaces the contrastive seasonal term, which makes amplitude and phase INVARIANT to augmentation and is why training currently degrades acrophase recovery below random initialisation (0.769 -> 0.587).",
-    "rq2_independence": "Equivariance trains on the 12-h harmonic (HRD bin 14); RQ2 perturbs whole-window timing and the 24-h amplitude, so RQ2 stays an independent probe. GLOBEM cannot resolve 12 h and has no RQ2, so its 24-h fallback contaminates nothing."
+    "note": "A1 + seasonal equivariance. One change from A1: no day-local cap here.",
+    "round": 2,
+    "baseline": "A1 (decomposed 7.51M) or A0 (shared 7.45M)"
   }
 }

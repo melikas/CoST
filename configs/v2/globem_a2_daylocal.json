@@ -47,7 +47,8 @@
       "hidden_dims": 224,
       "seasonal_days": 2.0
     },
-    "ladder": "A2 = A1 (decomposition at matched capacity) + a day-local oscillatory receptive field. Removes the week-identity shortcut architecturally.",
-    "note": "Run with --dev-cohort. Selection uses label-free criteria only."
+    "note": "A1 + day-local oscillatory receptive field.",
+    "round": 2,
+    "baseline": "A1 (decomposed 7.51M) or A0 (shared 7.45M)"
   }
 }

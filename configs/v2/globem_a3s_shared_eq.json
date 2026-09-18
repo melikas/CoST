@@ -1,5 +1,6 @@
 {
-  "cache": "datasets/cache/hrd_rescue_v1.npz",
+  "cache": "datasets/cache/globem_rescue_v1.npz",
+  "cohort_policy": "earliest study year only; exclude other years including unlabelled data",
   "seeds": [
     1,
     2
@@ -18,7 +19,7 @@
     "n_heads": 4,
     "bidirectional": true,
     "output_dims": 320,
-    "hidden_dims": 224,
+    "hidden_dims": 64,
     "seasonal_frac": 0.5,
     "seasonal_bands": "harmonics",
     "harmonics": 4,
@@ -36,17 +37,17 @@
     "smooth_minutes": 75.0,
     "lr": 0.0005,
     "batch_size": 64,
-    "decompose": true,
-    "seasonal_days": 2.0
+    "decompose": false,
+    "seasonal_objective": "equivariance"
   },
   "development": {
-    "arm": "a2_daylocal",
+    "arm": "a3s_shared_eq",
     "changed": {
-      "decompose": true,
-      "hidden_dims": 224,
-      "seasonal_days": 2.0
+      "decompose": false,
+      "hidden_dims": 64,
+      "seasonal_objective": "equivariance"
     },
-    "note": "A1 + day-local oscillatory receptive field.",
+    "note": "A0 + seasonal equivariance. Isolates the objective on the shared encoder, which won RQ1 recovery in round 1.",
     "round": 2,
     "baseline": "A1 (decomposed 7.51M) or A0 (shared 7.45M)"
   }

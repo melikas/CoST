@@ -21,8 +21,8 @@ account="${1:?usage: bash slurm/submit_dev_ladder.sh ACCOUNT [RUN_PREFIX]}"
 prefix="${2:-dev}"
 mkdir -p logs
 gpu_job=(--account="$account" --gres="${GPU:-gpu:a100_3g.20gb:1}" --time="${TIME:-12:00:00}")
-for dataset in hrd globem; do
-    for arm in a0_shared a1lo_decomposed a1_decomposed; do
+for dataset in hrd; do   # GLOBEM is a generalisation check on the winner, not a selection set
+    for arm in a2_daylocal a3_equivar a3s_shared_eq; do
         run="${prefix}_${arm}"
         config="configs/v2/${dataset}_${arm}.json"
         common="ALL,RUN_NAME=$run,DATASET=$dataset,CONFIG=$config,SKIP_REFERENCE=1,DEV_COHORT=1"
