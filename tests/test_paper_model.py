@@ -5,6 +5,7 @@ code under test.
 Run: python -m unittest discover -s tests -t . -v
 """
 import json
+import tempfile
 import unittest
 from pathlib import Path
 
@@ -185,6 +186,74 @@ class CoSTReference(unittest.TestCase):
                              trend_kernel_cap=2, smooth_minutes=75.0, jitter_sigma=0.1,
                              **tiny).config
         self.assertEqual(plain, dssl_settings)
+
+
+class PreEncoderDecomposition(unittest.TestCase):
+    """The 24-h filter and the two-encoder split that restricts each branch's INPUT."""
+
+    def test_daily_filter_is_zero_phase_and_nulls_the_daily_harmonics(self):
+        from models.encoder import daily_average_kernel
+        for bins_per_day, seq_len in ((96, 672), (4, 112)):
+            k = daily_average_kernel(bins_per_day)
+            self.assertEqual(k.numel(), bins_per_day + 1)          # odd: centred, zero phase
+            self.assertAlmostEqual(float(k.sum()), 1.0, places=6)
+            torch.testing.assert_close(k, k.flip(0))
+            padded = torch.nn.functional.pad(k, (0, seq_len - k.numel()))
+            H = torch.fft.rfft(torch.roll(padded, -(k.numel() // 2)))
+            self.assertLess(H.imag.abs().max().item(), 1e-6)       # real => zero phase
+            self.assertAlmostEqual(H.abs()[0].item(), 1.0, places=5)          # keeps the level
+            days = seq_len // bins_per_day
+            for harmonic in range(1, bins_per_day // 2 + 1):     # 24 h and every faster harmonic
+                self.assertLess(H.abs()[days * harmonic].item(), 1e-6, f'{bins_per_day}:{harmonic}')
+
+    def test_decomposition_reconstructs_and_keeps_missingness(self):
+        from models.encoder import daily_average_kernel, decompose_daily
+        x = torch.randn(4, 672, 3, generator=torch.Generator().manual_seed(0))
+        x[0, 5:9, 1] = float('nan')
+        trend, seasonal = decompose_daily(x, daily_average_kernel(96))
+        finite = torch.isfinite(x)
+        torch.testing.assert_close((trend + seasonal)[finite], x[finite], rtol=0, atol=1e-5)
+        self.assertTrue(torch.isnan(trend[~finite]).all() and torch.isnan(seasonal[~finite]).all())
+        self.assertTrue(torch.isfinite(trend[finite]).all())
+
+    def test_trend_view_cannot_see_the_daily_rhythm(self):
+        """The architectural claim, stated as an invariant: adding a 24-h component changes the
+        seasonal view and leaves the trend view alone."""
+        from models.encoder import daily_average_kernel, decompose_daily
+        t = torch.arange(672, dtype=torch.float)
+        base = torch.randn(1, 672, 1, generator=torch.Generator().manual_seed(1))
+        rhythm = torch.sin(2 * np.pi * t / 96 + 0.7).view(1, 672, 1)
+        kernel = daily_average_kernel(96)
+        trend_a, seasonal_a = decompose_daily(base, kernel)
+        trend_b, seasonal_b = decompose_daily(base + rhythm, kernel)
+        self.assertLess((trend_b - trend_a).abs().max().item(), 1e-5)
+        torch.testing.assert_close(seasonal_b - seasonal_a, rhythm, rtol=0, atol=1e-5)
+
+    def test_decomposed_encoder_matches_the_shared_readout_and_splits_its_heads(self):
+        from models.encoder import DecomposedEncoder
+        shared = DSSL(4, **HRD, device='cpu', model_seed=1)
+        split = DSSL(4, **HRD, device='cpu', model_seed=1, decompose=True)
+        self.assertIsInstance(split.net, DecomposedEncoder)
+        self.assertEqual(split.blocks(), shared.blocks())               # same readout geometry
+        self.assertEqual((split.net.trend_dims, split.net.seasonal_dims), (160, 160))
+        self.assertEqual(len(split.net.trend_net.sfd), 0)               # trend encoder: no seasonal head
+        self.assertEqual(len(split.net.seasonal_net.tfd), 0)            # seasonal encoder: no trend head
+        self.assertTrue(split.config['decompose'])
+        shared_params = {id(p) for p in split.net.trend_net.parameters()}
+        self.assertFalse(shared_params & {id(p) for p in split.net.seasonal_net.parameters()})
+
+    def test_decomposed_encoder_trains_and_reloads(self):
+        x = np.random.default_rng(0).normal(size=(8, 672, 4)).astype(np.float32)
+        model = DSSL(4, **HRD, device='cpu', model_seed=2, decompose=True, output_dims=16,
+                     hidden_dims=8, tcn_depth=0, batch_size=4, moco_k=8)
+        history = model.fit(x, n_iters=2, log_every=2, verbose=False)
+        self.assertTrue(np.isfinite(history['train']).all())
+        with tempfile.TemporaryDirectory() as tmp:
+            path = Path(tmp) / 'enc.pt'
+            model.save(path)
+            reloaded = DSSL(4, **HRD, device='cpu', model_seed=3, decompose=True, output_dims=16,
+                            hidden_dims=8, tcn_depth=0, batch_size=4, moco_k=8).load(path)
+            np.testing.assert_allclose(reloaded.encode(x), model.encode(x), rtol=1e-5, atol=2e-3)
 
 
 class TrendViews(unittest.TestCase):

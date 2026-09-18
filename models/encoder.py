@@ -13,13 +13,14 @@ from __future__ import annotations
 import math
 
 import torch
+import torch.nn.functional as F
 from torch import fft, nn
 
 from models.backbones import TemporalEncoding, build_backbone
 from models.dilated_conv import depth_for_window, receptive_field
 
 __all__ = ["receptive_field", "depth_for_window", "rhythm_bands", "BandedFourierLayer",
-           "CoSTEncoder"]
+           "CoSTEncoder", "DecomposedEncoder", "daily_average_kernel", "decompose_daily"]
 
 
 def rhythm_bands(seq_len: int, bins_per_day: int, max_harmonics: int = 4):
@@ -86,6 +87,95 @@ class BandedFourierLayer(nn.Module):
             return fft.irfft(out, n=t, dim=1)
 
 
+def daily_average_kernel(bins_per_day):
+    """Centred 24-h moving average: [0.5, 1, ..., 1, 0.5] / N over N+1 taps.
+
+    Odd length and symmetric, so the filter is ZERO PHASE -- a phase-shifted trend would
+    corrupt the phase of its complement, which is the quantity the decomposition exists to
+    protect. Its transfer function sin(pi f N)/(N sin(pi f)) has exact zeros at f = k/N, i.e.
+    at 1/day and every daily harmonic, so the trend view cannot carry the daily rhythm.
+    """
+    n = int(bins_per_day)
+    if n < 2:
+        raise ValueError(f"a 24-h average needs at least 2 bins per day, got {n}")
+    w = torch.ones(n + 1)
+    w[0] = w[-1] = 0.5
+    return w / n
+
+
+def decompose_daily(x, kernel):
+    """x -> (MA24h(x), x - MA24h(x)), circularly padded and preserving missingness.
+
+    Windows are whole days starting at midnight, so circular padding keeps the length and
+    every rhythm's phase exactly. Missing bins are filtered as 0 and restored as NaN in both
+    views, so each encoder sees the same missingness it would have seen on the raw input.
+    """
+    finite = torch.isfinite(x)
+    filled = torch.where(finite, x, torch.zeros_like(x))
+    b, t, c = filled.shape
+    pad = (kernel.numel() - 1) // 2
+    flat = filled.permute(0, 2, 1).reshape(b * c, 1, t)
+    trend = F.conv1d(F.pad(flat, (pad, pad), mode="circular"),
+                     kernel.to(flat.dtype).view(1, 1, -1)).reshape(b, c, t).permute(0, 2, 1)
+    missing = torch.full_like(x, float("nan"))
+    return (torch.where(finite, trend, missing),
+            torch.where(finite, filled - trend, missing))
+
+
+class DecomposedEncoder(nn.Module):
+    """Two independent encoders over a fixed 24-h decomposition of the INPUT.
+
+    The measured failure this addresses: with one shared backbone whose receptive field
+    (1021) exceeds the window (672), every timestep already encodes the whole window, so the
+    time-averaged trend readout carries rhythm regardless of what the branch is called. At
+    random initialisation the shared model's trend block already predicts 24-h amplitude at
+    R^2 0.827 and acrophase at 0.642 -- leakage is geometric, not learned, so no objective can
+    remove it. Splitting the INPUT removes the access: the trend encoder never sees the daily
+    rhythm, because the filter has exact zeros there.
+
+    Each sub-encoder takes half the width and builds only its own head, so the pair costs
+    about what the single shared encoder did. Nothing is shared after the split.
+    """
+
+    def __init__(self, **enc):
+        super().__init__()
+        width = enc.pop("output_dims")
+        if width % 2:
+            raise ValueError(f"decomposed output_dims must be even, got {width}")
+        self.register_buffer("daily_kernel", daily_average_kernel(enc["bins_per_day"]))
+        self.trend_net = CoSTEncoder(output_dims=width // 2, branch="trend", **enc)
+        self.seasonal_net = CoSTEncoder(output_dims=width // 2, branch="seasonal", **enc)
+        self.seq_len, self.bins_per_day = enc["seq_len"], enc["bins_per_day"]
+        self.harmonics = self.seasonal_net.harmonics
+        self.band_readout = self.seasonal_net.band_readout
+        self.trend_dims = self.trend_net.trend_dims
+        self.seasonal_dims = self.seasonal_net.seasonal_dims
+        self.depth = self.trend_net.depth
+        self.receptive_field = self.trend_net.receptive_field
+
+    # Read back by the readout and the recorded config; properties, so the submodules are not
+    # registered twice and the state dict keeps one name per parameter.
+    @property
+    def bands(self):
+        return self.seasonal_net.bands
+
+    @property
+    def sfd(self):
+        return self.seasonal_net.sfd
+
+    @property
+    def kernels(self):
+        return self.trend_net.kernels
+
+    def forward(self, x, tcn_output=False, mask=None):
+        x_trend, x_seasonal = decompose_daily(x, self.daily_kernel)
+        if tcn_output:
+            return self.seasonal_net(x_seasonal, tcn_output=True, mask=mask)
+        trend, _ = self.trend_net(x_trend, mask=mask)
+        _, season = self.seasonal_net(x_seasonal, mask=mask)
+        return trend, season
+
+
 class CoSTEncoder(nn.Module):
     """Sensor window -> (trend V^T, seasonal V^S), each B x T x width.
 
@@ -100,10 +190,13 @@ class CoSTEncoder(nn.Module):
                  mask_mode="none", mask_prob=0.5, max_harmonics=4, trend_kernel_cap=None,
                  seasonal_frac=0.5, band_readout=False, backbone="tcn",
                  temporal_encoding="none", tcn_depth=None, n_layers=4, n_heads=4,
-                 bidirectional=True):
+                 bidirectional=True, branch="both"):
         super().__init__()
         if seasonal_bands not in ("single", "harmonics"):
             raise ValueError(f"unsupported seasonal bands: {seasonal_bands}")
+        if branch not in ("both", "trend", "seasonal"):
+            raise ValueError(f"branch must be 'both', 'trend' or 'seasonal', got {branch!r}")
+        self.branch = branch
         self.backbone_name = backbone
         self.seq_len, self.bins_per_day = seq_len, bins_per_day
         self.harmonics = int(max_harmonics)          # read back by cost.spectral_readout
@@ -122,8 +215,15 @@ class CoSTEncoder(nn.Module):
         self.receptive_field = getattr(self.feature_extractor, "receptive_field", None)
         self.repr_dropout = nn.Dropout(p=0.1)
 
-        self.seasonal_dims = int(round(output_dims * seasonal_frac))
-        self.trend_dims = output_dims - self.seasonal_dims
+        # A single-branch encoder spends its whole width on that branch and builds no head for
+        # the other, so DecomposedEncoder's two encoders cost what one shared encoder does.
+        if branch == "trend":
+            self.trend_dims, self.seasonal_dims = output_dims, 0
+        elif branch == "seasonal":
+            self.trend_dims, self.seasonal_dims = 0, output_dims
+        else:
+            self.seasonal_dims = int(round(output_dims * seasonal_frac))
+            self.trend_dims = output_dims - self.seasonal_dims
 
         # Trend: causal convolution experts at powers-of-two kernels up to seq_len // 8
         # (upstream goes to seq_len // 2). The backbone already covers the window, so longer
@@ -131,7 +231,8 @@ class CoSTEncoder(nn.Module):
         cap = trend_kernel_cap if trend_kernel_cap is not None else max(1, seq_len // 8)
         self.kernels = [2 ** i for i in range(int(math.floor(math.log2(max(cap, 1)))) + 1)]
         self.tfd = nn.ModuleList(
-            [nn.Conv1d(output_dims, self.trend_dims, k, padding=k - 1) for k in self.kernels])
+            [nn.Conv1d(output_dims, self.trend_dims, k, padding=k - 1) for k in self.kernels]
+            if self.trend_dims else [])
 
         # Seasonal: one banded Fourier layer per band, widths splitting seasonal_dims.
         # seasonal_bands="single" is the upstream layer: one band over the whole spectrum.
@@ -141,7 +242,8 @@ class CoSTEncoder(nn.Module):
         widths = [self.seasonal_dims // nb] * nb
         widths[-1] += self.seasonal_dims - sum(widths)
         self.sfd = nn.ModuleList(
-            [BandedFourierLayer(output_dims, w, b, seq_len) for w, b in zip(widths, self.bands)])
+            [BandedFourierLayer(output_dims, w, b, seq_len) for w, b in zip(widths, self.bands)]
+            if self.seasonal_dims else [])
 
     def forward(self, x, tcn_output=False, mask=None):      # x: B x T x input_dims
         x_time = None
@@ -171,14 +273,18 @@ class CoSTEncoder(nn.Module):
         if tcn_output:
             return x.transpose(1, 2)
 
-        trend = []
-        for k, mod in zip(self.kernels, self.tfd):
-            out = mod(x)
-            if k != 1:                                      # left-trim: causal
-                out = out[..., :x.size(-1)]
-            trend.append(out.transpose(1, 2))
-        trend = torch.stack(trend, dim=0).mean(dim=0)       # B x T x trend_dims
+        if self.tfd:
+            trend = []
+            for k, mod in zip(self.kernels, self.tfd):
+                out = mod(x)
+                if k != 1:                                  # left-trim: causal
+                    out = out[..., :x.size(-1)]
+                trend.append(out.transpose(1, 2))
+            trend = torch.stack(trend, dim=0).mean(dim=0)   # B x T x trend_dims
+        else:
+            trend = x.new_zeros(x.size(0), x.size(2), 0)
 
         x = x.transpose(1, 2)                               # B x T x D
-        season = torch.cat([mod(x) for mod in self.sfd], dim=-1)
+        season = (torch.cat([mod(x) for mod in self.sfd], dim=-1) if self.sfd
+                  else x.new_zeros(x.size(0), x.size(1), 0))
         return trend, self.repr_dropout(season)

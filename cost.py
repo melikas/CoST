@@ -22,7 +22,7 @@ from torch import fft, nn
 from torch.utils.data import DataLoader, Dataset
 
 from models import losses as O
-from models.encoder import CoSTEncoder
+from models.encoder import CoSTEncoder, DecomposedEncoder
 
 __all__ = ["PretrainDataset", "CoSTModel", "DSSL", "WEIGHTS", "REFERENCE_SHARED", "exact_numerics",
            "tf32_convolutions", "spectral_freqs", "spectral_readout", "band_keep",
@@ -401,7 +401,7 @@ class DSSL:
                  n_heads=4, bidirectional=True, seasonal_bands="harmonics", harmonics=4,
                  trend_kernel_cap=None, seasonal_frac=0.5, band_readout=False, mask_mode="none",
                  phase_readout="angle", readout_norm="none", phase_mode="circular_amp",
-                 weights="contracted", trend_views="same",
+                 weights="contracted", trend_views="same", decompose=False,
                  alpha=0.005, w_eq=0.0, w_ac=0.0, ac_gamma=0.7114, ac_queue=512, moco_k=4096,
                  jitter_sigma=0.1, shift_sigma=0.5, smooth_minutes=75.0, lr=5e-4, batch_size=64,
                  device="cuda", model_seed=None):
@@ -447,11 +447,12 @@ class DSSL:
                    band_readout=band_readout, backbone=backbone, temporal_encoding=temporal_encoding,
                    tcn_depth=tcn_depth, n_layers=n_layers, n_heads=n_heads,
                    bidirectional=bidirectional)
-        self.net = CoSTEncoder(**enc).to(device)
+        build = DecomposedEncoder if decompose else CoSTEncoder
+        self.net = build(**enc).to(device)
         self._keep = band_keep(self.net)
         self.component_dims = self.net.seasonal_dims
 
-        encoder_k = CoSTEncoder(**enc).to(device)
+        encoder_k = build(**enc).to(device)
         self.cost = CoSTModel(
             self.net, encoder_k, dim=self.net.trend_dims, alpha=alpha, K=moco_k,
             phase_mode=phase_mode, readout_norm=readout_norm, weights=weights,
@@ -476,7 +477,7 @@ class DSSL:
                            band_readout=band_readout, mask_mode=mask_mode,
                            phase_readout=phase_readout, readout_norm=readout_norm,
                            phase_mode=phase_mode,
-                           weights=weights_name, trend_views=trend_views,
+                           weights=weights_name, trend_views=trend_views, decompose=decompose,
                            alpha=alpha, w_eq=w_eq, w_ac=w_ac,
                            moco_k=moco_k, jitter_sigma=jitter_sigma, shift_sigma=shift_sigma,
                            scale_sigma=self.scale_sigma, smooth_minutes=smooth_minutes,
