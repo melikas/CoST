@@ -178,6 +178,13 @@ def spectral_readout(z, bins_per_day, phase_readout, harmonics=4, keep=None, eps
     the sqrt/atan2, negligible against any real signal (>=0.01 in every measurement so far);
     a near-zero bin now reports a stable, uninformative angle of pi/4 instead of noise.
 
+    Three modes, the third being the measured amplitude/phase trade-off split apart:
+      "none"     (default) both blocks from the raw seasonal sequence
+      "timestep" both blocks from the per-timestep L2-normalised sequence
+      "split"    amplitude from the raw sequence, phase from the normalised one -- amplitude needs
+                 the unnormalised magnitude, while phase needs bins held away from 0 to keep atan2
+                 conditioned. Third variant tested; see docs/VALIDATION_RESULT.md.
+
     DEFAULT "none": use the raw seasonal sequence. "timestep" L2-normalises each timestep over
     channels first, as upstream CoST's seasonal loss does. THAT DESTROYS AMPLITUDE. DSSL's
     harmonic bands start at bin 1, so the seasonal sequence has no constant component to anchor
@@ -191,12 +198,15 @@ def spectral_readout(z, bins_per_day, phase_readout, harmonics=4, keep=None, eps
     unrelated to training.
     """
     f = spectral_freqs(z.size(1), bins_per_day, harmonics)
-    if readout_norm not in ("timestep", "none"):
-        raise ValueError(f"readout_norm must be 'timestep' or 'none', got {readout_norm!r}")
-    seasonal = F.normalize(z.float(), dim=-1) if readout_norm == "timestep" else z.float()
-    Z = fft.rfft(seasonal, dim=1)[:, f]
-    amp = torch.sqrt((Z.real + eps).pow(2) + (Z.imag + eps).pow(2))
-    ang = torch.atan2(Z.imag, Z.real + eps)
+    if readout_norm not in ("timestep", "none", "split"):
+        raise ValueError(f"readout_norm must be 'timestep', 'none' or 'split', got {readout_norm!r}")
+    plain, normed = z.float(), F.normalize(z.float(), dim=-1)
+    for_amp = normed if readout_norm == "timestep" else plain
+    for_phase = plain if readout_norm == "none" else normed
+    Z_amp = fft.rfft(for_amp, dim=1)[:, f]
+    Z_phase = Z_amp if for_phase is for_amp else fft.rfft(for_phase, dim=1)[:, f]
+    amp = torch.sqrt((Z_amp.real + eps).pow(2) + (Z_amp.imag + eps).pow(2))
+    ang = torch.atan2(Z_phase.imag, Z_phase.real + eps)
     pha = (torch.cos(ang), torch.sin(ang)) if phase_readout == "circular" else (ang,)
 
     def flat(p):

@@ -13,5 +13,6 @@ set -euo pipefail
 extra=()
 [ -n "${BACKBONE:-}" ] && extra+=(--backbone "$BACKBONE")
 [ -n "${ENCODING:-}" ] && extra+=(--temporal-encoding "$ENCODING")
+[ -n "${CONFIG:-}" ] && extra+=(--config "$CONFIG")
 srun python scripts/run_experiment.py --dataset "$DATASET" --summarize \
     --run-name "${RUN_NAME:-narval_v1}" "${extra[@]}"

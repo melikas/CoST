@@ -84,15 +84,72 @@ class PaperModel(unittest.TestCase):
 
     def test_readout_norm_decides_whether_amplitude_survives(self):
         """The measured cause of RQ2's inverted amplitude arm: per-timestep normalisation
-        removes the amplitude of the seasonal sequence entirely."""
+        removes the amplitude of the seasonal sequence entirely. "split" keeps it."""
         from cost import spectral_readout
         z = torch.randn(2, 672, 8, generator=torch.Generator().manual_seed(0))
-        for norm, factor in (("none", 2.0), ("timestep", 1.0)):
+        for norm, factor in (("none", 2.0), ("split", 2.0), ("timestep", 1.0)):
             one, _ = spectral_readout(z, 96, "angle", readout_norm=norm)
             two, _ = spectral_readout(2 * z, 96, "angle", readout_norm=norm)
             torch.testing.assert_close(two, factor * one, rtol=2e-4, atol=1e-5)
         with self.assertRaisesRegex(ValueError, "readout_norm"):
             spectral_readout(z, 96, "angle", readout_norm="per_window")
+
+    def test_split_readout_phase_tracks_a_known_shift(self):
+        """Rolling the sequence by k bins must rotate bin f's phase by -2*pi*f*k/T. Rolling
+        commutes with per-timestep normalisation, so the relation is exact in every mode."""
+        from cost import spectral_readout, spectral_freqs
+        z = torch.randn(3, 672, 6, generator=torch.Generator().manual_seed(2))
+        bins = spectral_freqs(672, 96)
+        k = 13
+        for norm in ("none", "timestep", "split"):
+            _, before = spectral_readout(z, 96, "angle", readout_norm=norm)
+            _, after = spectral_readout(torch.roll(z, k, dims=1), 96, "angle", readout_norm=norm)
+            expected = -2 * np.pi * torch.tensor(bins, dtype=torch.float) * k / 672
+            moved = (after - before).reshape(3, len(bins), 6)
+            wrapped = torch.atan2(torch.sin(moved - expected[None, :, None]),
+                                  torch.cos(moved - expected[None, :, None]))
+            self.assertLess(wrapped.abs().max().item(), 1e-2, norm)   # eps=1e-3 biases the angle
+
+    def test_split_readout_is_amplitude_of_none_and_phase_of_timestep(self):
+        """The mode's whole contract, and the reason it is a clean test of the trade-off: it
+        changes nothing except which sequence each block is read from.
+
+        Note the two sequences are NOT related by a positive scalar -- per-timestep normalisation
+        divides by the time-varying norm ||z(t)||, which reshapes the spectrum -- so "none" and
+        "timestep" give genuinely different angles, not merely differently conditioned ones.
+        """
+        from cost import spectral_readout
+        z = torch.randn(3, 672, 7, generator=torch.Generator().manual_seed(4))
+        amp_split, phase_split = spectral_readout(z, 96, "angle", readout_norm="split")
+        amp_plain, phase_plain = spectral_readout(z, 96, "angle", readout_norm="none")
+        amp_norm, phase_norm = spectral_readout(z, 96, "angle", readout_norm="timestep")
+        torch.testing.assert_close(amp_split, amp_plain, rtol=0, atol=0)
+        torch.testing.assert_close(phase_split, phase_norm, rtol=0, atol=0)
+        self.assertGreater((phase_plain - phase_norm).abs().max().item(), 0.1)
+        self.assertGreater((amp_plain - amp_norm).abs().max().item(), 0.1)
+
+    def test_eps_already_conditions_near_zero_amplitude_in_every_mode(self):
+        """Guards the eps=1e-3 fix: at amplitudes near the floor, the measured batch-to-batch
+        jitter (7.5e-08) must not move any mode's angle. It moved 'none' by 0.65 rad at the old
+        eps=1e-6, which is what that fix addressed -- so conditioning is NOT what separates the
+        modes now.
+        The realistic regime is the one the encoder produces: ||z(t)|| is O(1) and individual BINS
+        are silent. (With a uniformly tiny z, normalisation instead divides by a tiny norm and
+        amplifies the noise -- 3.03 rad -- so neither mode is unconditionally safer.)
+        """
+        from cost import spectral_readout, spectral_freqs
+        g = torch.Generator().manual_seed(5)
+        z = torch.randn(4, 672, 5, generator=g)
+        silent = spectral_freqs(672, 96)[2]                     # empty this bin exactly
+        Z = torch.fft.rfft(z, dim=1)
+        Z[:, silent] = 0
+        z = torch.fft.irfft(Z, n=672, dim=1)
+        noise = 7.5e-8 * torch.randn(4, 672, 5, generator=g)    # the measured batch-to-batch jitter
+        for norm in ("none", "timestep", "split"):
+            _, a = spectral_readout(z, 96, "angle", readout_norm=norm)
+            _, b = spectral_readout(z + noise, 96, "angle", readout_norm=norm)
+            swing = torch.atan2(torch.sin(b - a), torch.cos(b - a)).abs().max().item()
+            self.assertLess(swing, 0.05, norm)
 
     def test_globem_architecture(self):
         c = DSSL(14, **GLOBEM, device="cpu", **config("globem")["model"]).config

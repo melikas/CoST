@@ -1,0 +1,46 @@
+{
+  "cache": "datasets/cache/hrd_rescue_v1.npz",
+  "seeds": [
+    1,
+    2,
+    3
+  ],
+  "folds": 5,
+  "split_seed": 20260914,
+  "steps": 6000,
+  "val_frac": 0.1,
+  "normalization": "within_person",
+  "marker_coverage": 0.7,
+  "model": {
+    "backbone": "tcn",
+    "temporal_encoding": "none",
+    "tcn_depth": null,
+    "n_layers": 4,
+    "n_heads": 4,
+    "bidirectional": true,
+    "output_dims": 320,
+    "hidden_dims": 64,
+    "seasonal_frac": 0.5,
+    "seasonal_bands": "harmonics",
+    "harmonics": 4,
+    "trend_kernel_cap": null,
+    "phase_readout": "angle",
+    "readout_norm": "timestep",
+    "phase_mode": "circular_amp",
+    "weights": "contracted",
+    "trend_views": "same",
+    "alpha": 0.005,
+    "w_eq": 0.0,
+    "moco_k": 4096,
+    "jitter_sigma": 0.1,
+    "shift_sigma": 0.5,
+    "smooth_minutes": 75.0,
+    "lr": 0.0005,
+    "batch_size": 64
+  },
+  "readout_variant": {
+    "arm": "timestep",
+    "readout_norm": "timestep",
+    "note": "Readout-only comparison on the narval_v2 encoders (--reuse-encoders). The readout never enters training, so all three arms share identical weights and differ only in how the frozen seasonal branch is read. narval_v1 is NOT this comparison: it also had w_eq=1.0 and eps=1e-6."
+  }
+}

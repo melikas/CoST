@@ -91,6 +91,10 @@ def parse_args():
     parser.add_argument('--fold', type=int, default=0)
     parser.add_argument('--reference', action='store_true',
                         help='train (or load) only the CoST reference adapter for this seed x fold')
+    parser.add_argument('--reuse-encoders', metavar='RUN_NAME',
+                        help='read the encoders of an existing run out under this run\'s readout '
+                             'instead of training: valid only when the configurations differ '
+                             'solely in readout settings, which never enter training')
     parser.add_argument('--skip-reference', action='store_true',
                         help='ABLATIONS ONLY: evaluate without the CoST reference rung, which '
                              'otherwise costs a second full training per task. The scientific '
@@ -158,17 +162,33 @@ def pretext_split(training, val_frac, model_seed):
     return pre[perm[n_val:]], pre[perm[:n_val]]
 
 
-def train_encoder(kwargs, label, out, data, steps):
+def train_encoder(kwargs, label, out, data, steps, reuse=None):
     """Fit (resuming from the checkpoint), encode every window, collect RQ2 records, save and
-    re-load the encoder to check the saved weights reproduce the representation."""
+    re-load the encoder to check the saved weights reproduce the representation.
+
+    `reuse`: a finished seed x fold directory whose `<label>_encoder.pt` is loaded INSTEAD of
+    training, to read an existing encoder out under a different readout. Sound only because the
+    readout never enters training -- seasonal_loss normalises independently of `readout_norm`, and
+    the one other use (_log_readout_amp) is inert at w_ac=0 -- so the weights are identical either
+    way. Anything that does change training must be retrained, not reused.
+    """
     X, fit_idx, val_idx = data['X'], data['fit_idx'], data['val_idx']
     model = DSSL(**kwargs)
-    checkpoint = out / f'{label}_training.pt'
-    if checkpoint.exists():
-        model.load_training(checkpoint)
-    model.fit(X[fit_idx], n_iters=steps, val_data=X[val_idx] if len(val_idx) else None,
-              checkpoint_path=checkpoint, checkpoint_every=min(100, steps),
-              log_every=max(1, min(100, steps)))
+    if reuse is not None:
+        source = Path(reuse) / f'{label}_encoder.pt'
+        if not source.exists():
+            raise FileNotFoundError(f'--reuse-encoders: no saved encoder at {source}')
+        model.load(source)
+        record = Path(reuse) / f'{label}_model.json'
+        if record.exists():                       # keep the training history with the weights
+            model.history = json.loads(record.read_text())['history']
+    else:
+        checkpoint = out / f'{label}_training.pt'
+        if checkpoint.exists():
+            model.load_training(checkpoint)
+        model.fit(X[fit_idx], n_iters=steps, val_data=X[val_idx] if len(val_idx) else None,
+                  checkpoint_path=checkpoint, checkpoint_every=min(100, steps),
+                  log_every=max(1, min(100, steps)))
     features = model.encode(X, batch_size=16)
     rows, _ = personalized_records(model, label, X, data['raw'], data['pids'], data['window_ids'],
                                    data['test_ids'], data['bins_per_day'], data['bin_minutes'])
@@ -187,7 +207,7 @@ def train_encoder(kwargs, label, out, data, steps):
     return features, rows, (model.blocks(), model.pair_block())
 
 
-def cost_reference(base, common, model_cfg, data, steps, device):
+def cost_reference(base, common, model_cfg, data, steps, device, reuse=None):
     """The CoST reference adapter for this seed x fold: loaded when a matching complete copy
     exists, otherwise trained here under an exclusive lock and cached for every variant."""
     out = base / 'cost_reference' / f"seed_{common['seed']}" / f"fold_{common['fold']['fold']}"
@@ -221,7 +241,10 @@ def cost_reference(base, common, model_cfg, data, steps, device):
         if (out / 'manifest.json').exists() and json.loads((out / 'manifest.json').read_text()) != manifest:
             raise ValueError(f'existing CoST reference manifest differs; use a new run name: {out}')
         write_json(out / 'manifest.json', manifest)
-        features, rows, layout = train_encoder(kwargs, 'cost_reference_adapter', out, data, steps)
+        features, rows, layout = train_encoder(
+            kwargs, 'cost_reference_adapter', out, data, steps,
+            reuse=None if reuse is None else Path(reuse) / 'cost_reference' /
+            f"seed_{common['seed']}" / f"fold_{common['fold']['fold']}")
         np.savez_compressed(out / 'representations.npz', pids=data['pids'],
                             window_ids=data['window_ids'], cost_reference_adapter=features)
         pd.DataFrame(rows, columns=RQ2_COLUMNS).to_csv(out / 'rq2_personalized.csv', index=False)
@@ -313,11 +336,17 @@ def main():
                   normalization=normalization, code_version=version,
                   training_ids=sorted(map(str, np.unique(pids[training]))),
                   test_ids=list(fold.test_pids), windows=int(len(X)),
-                  fit_windows=int(len(fit_idx)), monitor_windows=int(len(val_idx)))
+                  fit_windows=int(len(fit_idx)), monitor_windows=int(len(val_idx)),
+                  reused_encoders_from=args.reuse_encoders)
     if args.skip_reference and args.reference:
         raise ValueError('--reference trains only the reference; --skip-reference omits it')
+    reuse_base = None
+    if args.reuse_encoders:
+        reuse_base = ROOT / 'results' / args.dataset / args.reuse_encoders
+        if not reuse_base.is_dir():
+            raise ValueError(f'--reuse-encoders: no such run {reuse_base}')
     reference = None if args.skip_reference else cost_reference(base, common, model_cfg, data,
-                                                                steps, args.device)
+                                                                steps, args.device, reuse=reuse_base)
     if args.reference:
         print(f"CoST reference ready: {base / 'cost_reference'}")
         return
@@ -363,7 +392,9 @@ def main():
     if reference is not None:
         layouts['cost_reference_adapter'] = reference_layout
     del untrained
-    features['dssl'], rows, layouts['dssl'] = train_encoder(kwargs, 'dssl', out, data, steps)
+    features['dssl'], rows, layouts['dssl'] = train_encoder(
+        kwargs, 'dssl', out, data, steps,
+        reuse=None if reuse_base is None else reuse_base / variant / f'seed_{args.seed}' / f'fold_{args.fold}')
     rq2_rows.extend(rows)
     pairs = {m: pair for m, (_, pair) in layouts.items() if pair}
     np.savez_compressed(out / 'representations.npz', pids=pids, window_ids=window_ids,

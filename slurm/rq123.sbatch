@@ -28,5 +28,8 @@ extra=()
 [ -n "${BACKBONE:-}" ] && extra+=(--backbone "$BACKBONE")
 [ -n "${ENCODING:-}" ] && extra+=(--temporal-encoding "$ENCODING")
 [ "${STAGE:-variant}" = reference ] && extra+=(--reference)
+[ -n "${CONFIG:-}" ] && extra+=(--config "$CONFIG")
+# REUSE: read an existing run's encoders out under this config's readout instead of training.
+[ -n "${REUSE:-}" ] && extra+=(--reuse-encoders "$REUSE")
 srun python scripts/run_experiment.py --dataset "$DATASET" --seed "$seed" --fold "$fold" \
     --device cuda --run-name "$RUN_NAME" "${extra[@]}"
