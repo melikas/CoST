@@ -13,6 +13,7 @@ import math
 import random
 import hashlib
 from contextlib import contextmanager
+from functools import partial
 from pathlib import Path
 
 import numpy as np
@@ -156,6 +157,22 @@ def band_keep(net):
     return torch.as_tensor(idx, dtype=torch.long)
 
 
+def harmonic_transform(x, bin_index, scale, rotation):
+    """Scale and rotate ONE rFFT bin of the input, leaving every other frequency untouched.
+
+    A whole-day time shift rotates the 24-h harmonic by exactly 2*pi -- no change -- so a
+    meaningful equivariance target has to act on a chosen frequency rather than on the clock.
+    Acting in the frequency domain also keeps the transform exact and disjoint from RQ2, which
+    perturbs whole-window timing and the 24-h amplitude: training on a different harmonic keeps
+    RQ2 an independent probe rather than a manipulation check.
+    """
+    length = x.size(1)
+    spectrum = fft.rfft(x.float(), dim=1)
+    factor = (scale * torch.exp(1j * rotation)).to(spectrum.dtype)
+    spectrum[:, bin_index] = spectrum[:, bin_index] * factor.view(-1, 1)
+    return fft.irfft(spectrum, n=length, dim=1).to(x.dtype)
+
+
 def spectral_readout(z, bins_per_day, phase_readout, harmonics=4, keep=None, eps=1e-3,
                      readout_norm="none"):
     """Seasonal branch -> (amplitude, phase) at the readout bins (spectral_freqs).
@@ -225,10 +242,15 @@ class CoSTModel(nn.Module):
     def __init__(self, encoder_q, encoder_k, *, dim=128, alpha=0.005, K=4096, m=0.999,
                  T=0.07, phase_mode="circular_amp", readout_norm="none",
                  weights: O.TermWeights = O.PAPER, trend_views="same",
+                 seasonal_objective="contrastive", equivariance_bin=None,
                  w_eq=0.0, eq_dims=0, w_ac=0.0, ac_gamma=0.7114, ac_queue=512, device="cuda"):
         super().__init__()
         if trend_views not in ("same", "disjoint_days"):
             raise ValueError(f"trend_views must be 'same' or 'disjoint_days', got {trend_views!r}")
+        if seasonal_objective not in ("contrastive", "equivariance"):
+            raise ValueError(f"seasonal_objective must be 'contrastive' or 'equivariance', "
+                             f"got {seasonal_objective!r}")
+        self.seasonal_objective, self.equivariance_bin = seasonal_objective, equivariance_bin
         self.alpha, self.K, self.m, self.T = alpha, K, m, T
         self.phase_mode, self.readout_norm = phase_mode, readout_norm
         self.weights, self.device = weights, device
@@ -281,6 +303,40 @@ class CoSTModel(nn.Module):
         if hasattr(self, "queue_ids"):
             self.queue_ids[ptr:ptr + b] = -1 if ids is None else ids
         self.queue_ptr[0] = (ptr + b) % self.K
+
+    def _equivariance_target_bin(self):
+        """The rFFT bin the equivariance term acts on.
+
+        Prefer the SECOND daily harmonic (12 h): RQ2 perturbs whole-window timing and the 24-h
+        amplitude, so training on 12 h keeps RQ2 an independent probe instead of a manipulation
+        check. Where 12 h is not resolvable -- GLOBEM's 6-h bins put Nyquist at a 12-h period --
+        fall back to the first daily harmonic, which is safe there because GLOBEM has no RQ2.
+        """
+        if self.equivariance_bin is not None:
+            return int(self.equivariance_bin)
+        e = self.encoder_q
+        bins = spectral_freqs(e.seq_len, e.bins_per_day, e.harmonics)
+        days = e.seq_len // e.bins_per_day
+        for harmonic in (2, 1):
+            bin_index = days * harmonic
+            if bin_index in bins and bin_index <= e.seq_len // 2:
+                return bin_index
+        return bins[-1]
+
+    def _seasonal_equivariance(self, x_q, q_s):
+        """Scale and rotate one input harmonic; require the latent coefficient to follow."""
+        bin_index = self._equivariance_target_bin()
+        b = x_q.size(0)
+        scale = torch.empty(b, device=x_q.device).uniform_(0.5, 1.5)
+        rotation = torch.empty(b, device=x_q.device).uniform_(-math.pi, math.pi)
+        _, t_s = self.encoder_q(harmonic_transform(x_q, bin_index, scale, rotation))
+        with torch.autocast(device_type="cuda", enabled=False):
+            coef = fft.rfft(q_s.float(), dim=1)[:, bin_index]
+            coef_t = fft.rfft(t_s.float(), dim=1)[:, bin_index]
+            loss = O.seasonal_equivariance_loss(coef, coef_t, scale, rotation)
+        # Reported in the amplitude slot so the recorded parts stay two-valued; the phase slot is
+        # zero because one complex target now covers magnitude and angle together.
+        return self.weights.amp * loss, loss.new_zeros(())
 
     def _disjoint_days(self, x_q, x_k):
         """Hide all but a random half of the days in each view, and a different half in each.
@@ -346,7 +402,10 @@ class CoSTModel(nn.Module):
         # Seasonal term as upstream: no queue and symmetric, so the key view also goes through
         # encoder_q with gradients (a third encoder pass).
         k_tq, k_s = self.encoder_q(x_k)
-        amp, pha = O.seasonal_loss(q_s, k_s, self.weights, self.phase_mode)
+        if self.seasonal_objective == "equivariance":
+            amp, pha = self._seasonal_equivariance(x_q, q_s)
+        else:
+            amp, pha = O.seasonal_loss(q_s, k_s, self.weights, self.phase_mode)
         total = O.total_loss(trend, amp, pha, self.weights, self.alpha)
         if self.head_eq is not None:
             if delta is None:
@@ -401,7 +460,8 @@ class DSSL:
                  n_heads=4, bidirectional=True, seasonal_bands="harmonics", harmonics=4,
                  trend_kernel_cap=None, seasonal_frac=0.5, band_readout=False, mask_mode="none",
                  phase_readout="angle", readout_norm="none", phase_mode="circular_amp",
-                 weights="contracted", trend_views="same", decompose=False,
+                 weights="contracted", trend_views="same", decompose=False, seasonal_days=None,
+                 seasonal_objective="contrastive",
                  alpha=0.005, w_eq=0.0, w_ac=0.0, ac_gamma=0.7114, ac_queue=512, moco_k=4096,
                  jitter_sigma=0.1, shift_sigma=0.5, smooth_minutes=75.0, lr=5e-4, batch_size=64,
                  device="cuda", model_seed=None):
@@ -447,7 +507,10 @@ class DSSL:
                    band_readout=band_readout, backbone=backbone, temporal_encoding=temporal_encoding,
                    tcn_depth=tcn_depth, n_layers=n_layers, n_heads=n_heads,
                    bidirectional=bidirectional)
-        build = DecomposedEncoder if decompose else CoSTEncoder
+        if seasonal_days is not None and not decompose:
+            raise ValueError('seasonal_days caps the decomposed oscillatory tower; it needs decompose=True')
+        build = (partial(DecomposedEncoder, seasonal_days=seasonal_days) if decompose
+                 else CoSTEncoder)
         self.net = build(**enc).to(device)
         self._keep = band_keep(self.net)
         self.component_dims = self.net.seasonal_dims
@@ -456,7 +519,8 @@ class DSSL:
         self.cost = CoSTModel(
             self.net, encoder_k, dim=self.net.trend_dims, alpha=alpha, K=moco_k,
             phase_mode=phase_mode, readout_norm=readout_norm, weights=weights,
-            trend_views=trend_views, w_eq=w_eq, eq_dims=input_dims, w_ac=w_ac,
+            trend_views=trend_views, seasonal_objective=seasonal_objective,
+            w_eq=w_eq, eq_dims=input_dims, w_ac=w_ac,
             ac_gamma=ac_gamma, ac_queue=ac_queue, device=device).to(device)
         self.n_iters = 0
         self._optimizer = None
@@ -478,6 +542,11 @@ class DSSL:
                            phase_readout=phase_readout, readout_norm=readout_norm,
                            phase_mode=phase_mode,
                            weights=weights_name, trend_views=trend_views, decompose=decompose,
+                           seasonal_days=seasonal_days, seasonal_objective=seasonal_objective,
+                           equivariance_bin=self.cost._equivariance_target_bin()
+                           if seasonal_objective == 'equivariance' else None,
+                           seasonal_receptive_field=getattr(self.net, 'seasonal_net', None)
+                           and self.net.seasonal_net.receptive_field,
                            alpha=alpha, w_eq=w_eq, w_ac=w_ac,
                            moco_k=moco_k, jitter_sigma=jitter_sigma, shift_sigma=shift_sigma,
                            scale_sigma=self.scale_sigma, smooth_minutes=smooth_minutes,

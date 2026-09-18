@@ -137,14 +137,30 @@ class DecomposedEncoder(nn.Module):
     about what the single shared encoder did. Nothing is shared after the split.
     """
 
-    def __init__(self, **enc):
+    def __init__(self, seasonal_days=None, **enc):
+        """`seasonal_days` caps the oscillatory tower's receptive field at that many days.
+
+        The trend tower keeps a window-long view -- slow structure is a window-level property.
+        The oscillatory tower does not need one: a daily rhythm is a within-day property, and a
+        tower that cannot see the week cannot encode week identity. That removes the measured
+        shortcut (raw input retrieves the contrastive positive at top-1 0.891 among 3,803 weeks)
+        architecturally rather than by reweighting a loss. The cap must still span at least one
+        day, or the 24-h cycle itself is not representable.
+        """
         super().__init__()
         width = enc.pop("output_dims")
         if width % 2:
             raise ValueError(f"decomposed output_dims must be even, got {width}")
         self.register_buffer("daily_kernel", daily_average_kernel(enc["bins_per_day"]))
+        seasonal_enc = dict(enc)
+        if seasonal_days:
+            span = int(round(seasonal_days * enc["bins_per_day"]))
+            if span < enc["bins_per_day"]:
+                raise ValueError(f"seasonal_days={seasonal_days} spans {span} bins, under one day")
+            seasonal_enc["tcn_depth"] = depth_for_window(span)
+        self.seasonal_days = seasonal_days
         self.trend_net = CoSTEncoder(output_dims=width // 2, branch="trend", **enc)
-        self.seasonal_net = CoSTEncoder(output_dims=width // 2, branch="seasonal", **enc)
+        self.seasonal_net = CoSTEncoder(output_dims=width // 2, branch="seasonal", **seasonal_enc)
         self.seq_len, self.bins_per_day = enc["seq_len"], enc["bins_per_day"]
         self.harmonics = self.seasonal_net.harmonics
         self.band_readout = self.seasonal_net.band_readout

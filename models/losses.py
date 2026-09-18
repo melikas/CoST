@@ -182,6 +182,31 @@ def equivariance_loss(pred, delta):
     return F.mse_loss(pred, delta)
 
 
+def seasonal_equivariance_loss(coef, coef_transformed, scale, rotation):
+    """Seasonal equivariance: the latent harmonic must MOVE with a known input change.
+
+    The contrastive seasonal term asks the two views to agree, i.e. it makes amplitude and phase
+    INVARIANT to the augmentations -- and by the same argument as `equivariance_loss`, an
+    augmentation defines what the representation discards. RQ1 and RQ2 measure the opposite:
+    whether the representation tracks amplitude and phase. That is why training currently makes
+    acrophase recovery worse than random initialisation (own R^2 0.769 -> 0.587 shared,
+    0.768 -> 0.506 decomposed) -- the objective optimises against the criteria.
+
+    Here the input's harmonic is scaled by `scale` and rotated by `rotation`, and the latent
+    coefficient is required to do the same: coef_transformed ~= scale * e^{i*rotation} * coef.
+    In complex coordinates intensity is a radial scaling and timing is a rotation -- orthogonal
+    actions on one number, instead of two real blocks that trade against each other.
+
+    `coef`, `coef_transformed`: complex (B, D). `scale`, `rotation`: real (B,).
+    """
+    if coef.shape != coef_transformed.shape:
+        raise ValueError("equivariance needs matching coefficient shapes")
+    factor = (scale * torch.exp(1j * rotation)).unsqueeze(-1)
+    target = factor.to(coef.dtype) * coef
+    return (F.mse_loss(coef_transformed.real, target.real)
+            + F.mse_loss(coef_transformed.imag, target.imag))
+
+
 def anticollapse_loss(cur, mem, gamma: float, mu: float = 25.0, nu: float = 1.0,
                       eps: float = 1e-4):
     """VICReg variance and covariance terms (Bardes, Ponce & LeCun, ICLR 2022) on the seasonal

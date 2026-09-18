@@ -242,6 +242,24 @@ class PreEncoderDecomposition(unittest.TestCase):
         shared_params = {id(p) for p in split.net.trend_net.parameters()}
         self.assertFalse(shared_params & {id(p) for p in split.net.seasonal_net.parameters()})
 
+    def test_day_local_seasonal_tower_cannot_see_the_week(self):
+        """A2's architectural claim: the oscillatory tower's receptive field must span at least a
+        day (or the 24-h cycle is not representable) and must NOT span the window (or it can
+        encode week identity, the shortcut measured at raw top-1 0.891)."""
+        for channels, geometry in ((4, HRD), (14, GLOBEM)):
+            model = DSSL(channels, **geometry, device='cpu', model_seed=1, decompose=True,
+                         seasonal_days=2.0)
+            rf = model.net.seasonal_net.receptive_field
+            bins_per_day, seq_len = geometry['bins_per_day'], geometry['seq_len']
+            self.assertGreaterEqual(rf, bins_per_day, f'{geometry}: RF must cover a day')
+            self.assertLess(rf, seq_len, f'{geometry}: RF must not cover the window')
+            self.assertGreaterEqual(model.net.trend_net.receptive_field, seq_len)  # trend keeps it
+            self.assertEqual(model.config['seasonal_days'], 2.0)
+        with self.assertRaisesRegex(ValueError, 'under one day'):
+            DSSL(4, **HRD, device='cpu', decompose=True, seasonal_days=0.5)
+        with self.assertRaisesRegex(ValueError, 'decompose=True'):
+            DSSL(4, **HRD, device='cpu', seasonal_days=2.0)
+
     def test_decomposed_encoder_trains_and_reloads(self):
         x = np.random.default_rng(0).normal(size=(8, 672, 4)).astype(np.float32)
         model = DSSL(4, **HRD, device='cpu', model_seed=2, decompose=True, output_dims=16,
@@ -254,6 +272,48 @@ class PreEncoderDecomposition(unittest.TestCase):
             reloaded = DSSL(4, **HRD, device='cpu', model_seed=3, decompose=True, output_dims=16,
                             hidden_dims=8, tcn_depth=0, batch_size=4, moco_k=8).load(path)
             np.testing.assert_allclose(reloaded.encode(x), model.encode(x), rtol=1e-5, atol=2e-3)
+
+
+class SeasonalEquivariance(unittest.TestCase):
+    """A3: the seasonal branch must MOVE with a known harmonic change, not be invariant to it."""
+
+    def test_harmonic_transform_is_exact_and_frequency_selective(self):
+        from cost import harmonic_transform
+        x = torch.randn(3, 672, 4, generator=torch.Generator().manual_seed(0))
+        scale, rotation = torch.tensor([2.0, 0.5, 1.0]), torch.tensor([0.0, 1.0, -0.7])
+        y = harmonic_transform(x, 14, scale, rotation)
+        X, Y = torch.fft.rfft(x, dim=1), torch.fft.rfft(y, dim=1)
+        other = [b for b in range(X.size(1)) if b != 14]
+        torch.testing.assert_close(Y[:, other], X[:, other], rtol=1e-4, atol=1e-4)
+        factor = (scale * torch.exp(1j * rotation)).view(-1, 1).to(X.dtype)
+        torch.testing.assert_close(Y[:, 14], X[:, 14] * factor, rtol=1e-4, atol=1e-4)
+
+    def test_equivariance_trains_on_a_harmonic_rq2_does_not_probe(self):
+        """RQ2 perturbs whole-window timing and the 24-h amplitude. Training on 12 h keeps RQ2 an
+        independent probe. GLOBEM cannot resolve 12 h, and has no RQ2, so the fallback is safe."""
+        hrd = DSSL(4, **HRD, device='cpu', model_seed=1, seasonal_objective='equivariance')
+        self.assertEqual(hrd.cost._equivariance_target_bin(), 14)        # 672/14 bins = 12 h
+        self.assertEqual(hrd.config['equivariance_bin'], 14)
+        globem = DSSL(14, **GLOBEM, device='cpu', model_seed=1, seasonal_objective='equivariance')
+        self.assertEqual(globem.cost._equivariance_target_bin(), 28)     # 24 h; no RQ2 on GLOBEM
+        with self.assertRaisesRegex(ValueError, 'seasonal_objective'):
+            DSSL(4, **HRD, device='cpu', seasonal_objective='invariance')
+
+    def test_equivariance_loss_is_zero_exactly_when_the_latent_follows(self):
+        coef = torch.randn(6, 5, dtype=torch.cfloat, generator=torch.Generator().manual_seed(3))
+        scale = torch.rand(6) + 0.5
+        rotation = torch.rand(6) * 2 - 1
+        followed = (scale * torch.exp(1j * rotation)).unsqueeze(-1) * coef
+        self.assertLess(O.seasonal_equivariance_loss(coef, followed, scale, rotation).item(), 1e-10)
+        self.assertGreater(O.seasonal_equivariance_loss(coef, coef, scale, rotation).item(), 1e-3)
+
+    def test_equivariance_objective_trains(self):
+        x = np.random.default_rng(0).normal(size=(8, 672, 4)).astype(np.float32)
+        model = DSSL(4, **HRD, device='cpu', model_seed=2, decompose=True, seasonal_days=2.0,
+                     seasonal_objective='equivariance', output_dims=16, hidden_dims=8,
+                     tcn_depth=0, batch_size=4, moco_k=8)
+        history = model.fit(x, n_iters=3, log_every=3, verbose=False)
+        self.assertTrue(np.isfinite(history['train']).all())
 
 
 class TrendViews(unittest.TestCase):
