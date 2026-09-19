@@ -4,8 +4,8 @@ MoCo on the trend branch, within-batch instance contrast of amplitude and phase 
 seasonal branch, as upstream. Derived from salesforce/CoST (BSD-3), which vendors TS2Vec
 (MIT); see NOTICE. Differences from upstream: harmonic bands (models.encoder.rhythm_bands), a
 smoothing augmentation in place of scaling, an amplitude-weighted circular phase contrast
-(models.losses.seasonal_loss), the optional level-equivariance (w_eq) and anti-collapse (w_ac)
-terms, and a readout of amplitude and phase at the daily harmonics.
+(models.losses.seasonal_loss), and a readout of amplitude and phase at the daily harmonics,
+read from the raw seasonal sequence.
 """
 from __future__ import annotations
 
@@ -13,7 +13,6 @@ import math
 import random
 import hashlib
 from contextlib import contextmanager
-from functools import partial
 from pathlib import Path
 
 import numpy as np
@@ -23,7 +22,7 @@ from torch import fft, nn
 from torch.utils.data import DataLoader, Dataset
 
 from models import losses as O
-from models.encoder import CoSTEncoder, DecomposedEncoder
+from models.encoder import CoSTEncoder
 
 __all__ = ["PretrainDataset", "CoSTModel", "DSSL", "WEIGHTS", "REFERENCE_SHARED", "exact_numerics",
            "tf32_convolutions", "spectral_freqs", "spectral_readout", "band_keep",
@@ -66,7 +65,7 @@ def smooth_bins_for(minutes, bins_per_day):
 
 
 class PretrainDataset(Dataset):
-    """Two independently augmented views of the same window, and their level offset.
+    """Two independently augmented views of the same window.
 
     `multiplier` revisits each window that many times per epoch with fresh augmentations.
     """
@@ -85,18 +84,13 @@ class PretrainDataset(Dataset):
         return self.N * self.multiplier
 
     def __getitem__(self, item):
-        """(view 1, view 2, per-channel offset d1 - d2). Only the equivariance term reads the
-        offset, and tracking it draws no extra random numbers."""
         x = self.data[item % self.N]
-        v1, d1 = self.transform(x)
-        v2, d2 = self.transform(x)
-        return v1, v2, d1 - d2
+        return self.transform(x), self.transform(x)
 
     def transform(self, x):
         if self.scale_sigma and random.random() <= self.p:
             x = x * (1 + torch.randn(x.size(-1)) * self.scale_sigma)
-        x, d = self.shift(self.smooth(x))
-        return self.jitter(x), d
+        return self.jitter(self.shift(self.smooth(x)))
 
     def smooth(self, x):
         """Circular box filter of random odd width up to `smooth_bins`. Circular and odd, so
@@ -114,12 +108,10 @@ class PretrainDataset(Dataset):
         return x + torch.randn(x.shape) * self.jitter_sigma
 
     def shift(self, x):
-        """Constant per-channel offset: changes only the f=0 bin (the MESOR). Returns the
-        offset too, zero when no shift is applied."""
+        """Constant per-channel offset: changes only the f=0 bin (the MESOR)."""
         if random.random() > self.p:
-            return x, torch.zeros(x.size(-1))
-        d = torch.randn(x.size(-1)) * self.shift_sigma
-        return x + d, d
+            return x
+        return x + torch.randn(x.size(-1)) * self.shift_sigma
 
 
 # --------------------------------------------------------------------------------------
@@ -157,35 +149,17 @@ def band_keep(net):
     return torch.as_tensor(idx, dtype=torch.long)
 
 
-def harmonic_transform(x, bin_index, scale, rotation):
-    """Scale and rotate ONE rFFT bin of the input, leaving every other frequency untouched.
-
-    A whole-day time shift rotates the 24-h harmonic by exactly 2*pi -- no change -- so a
-    meaningful equivariance target has to act on a chosen frequency rather than on the clock.
-    Acting in the frequency domain also keeps the transform exact and disjoint from RQ2, which
-    perturbs whole-window timing and the 24-h amplitude: training on a different harmonic keeps
-    RQ2 an independent probe rather than a manipulation check.
-    """
-    length = x.size(1)
-    spectrum = fft.rfft(x.float(), dim=1)
-    factor = (scale * torch.exp(1j * rotation)).to(spectrum.dtype)
-    spectrum[:, bin_index] = spectrum[:, bin_index] * factor.view(-1, 1)
-    return fft.irfft(spectrum, n=length, dim=1).to(x.dtype)
-
-
-def spectral_readout(z, bins_per_day, phase_readout, harmonics=4, keep=None, eps=1e-3,
-                     readout_norm="none"):
+def spectral_readout(z, bins_per_day, phase_readout, harmonics=4, keep=None, eps=1e-3):
     """Seasonal branch -> (amplitude, phase) at the readout bins (spectral_freqs).
 
     rFFT over time, then amplitude and either the raw angle ('angle') or its (cos, sin)
     ('circular'). `keep` restricts both blocks to the band-matched columns. This is a
-    frozen-feature READOUT choice, made only here and in CoSTModel._log_readout_amp; the
-    training loss (seasonal_loss) always L2-normalises independently of it, so `readout_norm`
-    changes what a trained encoder's representation looks like, never how it was trained.
+    frozen-feature READOUT choice. The training loss (seasonal_loss) normalises independently of
+    it, so this affects what a trained encoder's representation looks like, never how it trained.
 
     `eps` stabilises atan2 near a true amplitude of 0, where it is ill-conditioned: a bin with
-    Real, Imag both near 0 has an angle that swings wildly for a tiny change in either. Under
-    "none" many bins genuinely have amplitude at this scale (unlike "timestep", whose
+    Real, Imag both near 0 has an angle that swings wildly for a tiny change in either. Reading
+    the sequence raw leaves many bins genuinely at this scale (the rejected per-timestep
     normalisation happened to keep every bin away from true 0), so ordinary float32
     non-associativity -- encoding the same window alone vs. in a larger batch shifted a bin's
     seasonal output by 7.45e-08, negligible everywhere else -- swung that bin's angle by up to
@@ -195,35 +169,20 @@ def spectral_readout(z, bins_per_day, phase_readout, harmonics=4, keep=None, eps
     the sqrt/atan2, negligible against any real signal (>=0.01 in every measurement so far);
     a near-zero bin now reports a stable, uninformative angle of pi/4 instead of noise.
 
-    Three modes, the third being the measured amplitude/phase trade-off split apart:
-      "none"     (default) both blocks from the raw seasonal sequence
-      "timestep" both blocks from the per-timestep L2-normalised sequence
-      "split"    amplitude from the raw sequence, phase from the normalised one -- amplitude needs
-                 the unnormalised magnitude, while phase needs bins held away from 0 to keep atan2
-                 conditioned. Third variant tested; see docs/VALIDATION_RESULT.md.
-
-    DEFAULT "none": use the raw seasonal sequence. "timestep" L2-normalises each timestep over
-    channels first, as upstream CoST's seasonal loss does. THAT DESTROYS AMPLITUDE. DSSL's
-    harmonic bands start at bin 1, so the seasonal sequence has no constant component to anchor
-    the norm and it saturates toward a square wave: measured on an untrained HRD encoder,
-    scaling the true 24 h amplitude by 0.5 / 1.0 / 1.5 moved the 24 h amplitude feature only
-    8.06 / 12.20 / 14.09 with "timestep", and RQ2's amplitude arm inverted (0.404 at a=0.5,
-    chance 0.5); with "none" the same features move 1.34 / 2.67 / 3.99 -- proportional -- and
-    the arm scores 0.663. This is not free: on the same trained weights, switching only the
-    readout from "timestep" to "none" also collapsed HRD Steps' own-branch acrophase R2 from
-    0.765 to 0.0 (job 3183155, arm a2_amplitude) -- an unresolved side effect of this choice,
-    unrelated to training.
+    The seasonal sequence is read RAW. Upstream CoST L2-normalises each timestep across channels
+    first, and that destroys amplitude: DSSL's harmonic bands start at bin 1, so the sequence has
+    no constant component to anchor the norm and it saturates toward a square wave. Measured on an
+    untrained HRD encoder, scaling a window's true 24 h amplitude by 0.5 / 1.0 / 1.5 moved the
+    amplitude feature to 8.06 / 12.20 / 14.09 under normalisation (compressive) versus
+    1.34 / 2.67 / 3.99 without it (proportional). At protocol grade the raw readout moved RQ2's
+    strength arm from 0.438, below the 0.5 chance level, to 0.713. Two alternatives (normalised,
+    and a split taking amplitude raw and phase normalised) were evaluated at protocol grade and
+    rejected; see FAILED_EXPERIMENTS.md section 6.
     """
     f = spectral_freqs(z.size(1), bins_per_day, harmonics)
-    if readout_norm not in ("timestep", "none", "split"):
-        raise ValueError(f"readout_norm must be 'timestep', 'none' or 'split', got {readout_norm!r}")
-    plain, normed = z.float(), F.normalize(z.float(), dim=-1)
-    for_amp = normed if readout_norm == "timestep" else plain
-    for_phase = plain if readout_norm == "none" else normed
-    Z_amp = fft.rfft(for_amp, dim=1)[:, f]
-    Z_phase = Z_amp if for_phase is for_amp else fft.rfft(for_phase, dim=1)[:, f]
-    amp = torch.sqrt((Z_amp.real + eps).pow(2) + (Z_amp.imag + eps).pow(2))
-    ang = torch.atan2(Z_phase.imag, Z_phase.real + eps)
+    Z = fft.rfft(z.float(), dim=1)[:, f]
+    amp = torch.sqrt((Z.real + eps).pow(2) + (Z.imag + eps).pow(2))
+    ang = torch.atan2(Z.imag, Z.real + eps)
     pha = (torch.cos(ang), torch.sin(ang)) if phase_readout == "circular" else (ang,)
 
     def flat(p):
@@ -240,21 +199,11 @@ class CoSTModel(nn.Module):
     """MoCo on the trend branch, within-batch instance discrimination on the seasonal one."""
 
     def __init__(self, encoder_q, encoder_k, *, dim=128, alpha=0.005, K=4096, m=0.999,
-                 T=0.07, phase_mode="circular_amp", readout_norm="none",
-                 weights: O.TermWeights = O.PAPER, trend_views="same",
-                 seasonal_objective="contrastive", equivariance_bin=None,
-                 w_eq=0.0, eq_dims=0, w_ac=0.0, ac_gamma=0.7114, ac_queue=512, device="cuda"):
+                 T=0.07, phase_mode="circular_amp", weights: O.TermWeights = O.PAPER,
+                 device="cuda"):
         super().__init__()
-        if trend_views not in ("same", "disjoint_days"):
-            raise ValueError(f"trend_views must be 'same' or 'disjoint_days', got {trend_views!r}")
-        if seasonal_objective not in ("contrastive", "equivariance"):
-            raise ValueError(f"seasonal_objective must be 'contrastive' or 'equivariance', "
-                             f"got {seasonal_objective!r}")
-        self.seasonal_objective, self.equivariance_bin = seasonal_objective, equivariance_bin
         self.alpha, self.K, self.m, self.T = alpha, K, m, T
-        self.phase_mode, self.readout_norm = phase_mode, readout_norm
-        self.weights, self.device = weights, device
-        self.trend_views = trend_views
+        self.phase_mode, self.weights, self.device = phase_mode, weights, device
 
         self.encoder_q, self.encoder_k = encoder_q, encoder_k
         self.head_q = nn.Sequential(nn.Linear(dim, dim), nn.ReLU(), nn.Linear(dim, dim))
@@ -266,26 +215,8 @@ class CoSTModel(nn.Module):
 
         self.register_buffer("queue", F.normalize(torch.randn(dim, K), dim=0))
         self.register_buffer("queue_ptr", torch.zeros(1, dtype=torch.long))
-        if trend_views == "disjoint_days":
-            # Which training window each key came from (-1: unknown), so a query's own week
-            # is never its negative. Only in this mode, so "same" checkpoints are unchanged.
-            self.register_buffer("queue_ids", torch.full((K,), -1, dtype=torch.long))
         self.last_top1 = float("nan")
 
-        # Level equivariance. Built after the queue, so w_eq=0 draws no extra random numbers.
-        # Bias-free: it maps a difference of readouts to a difference of offsets.
-        self.w_eq = w_eq
-        self.head_eq = nn.Linear(dim, eq_dims, bias=False) if w_eq > 0 else None
-        # Anti-collapse on the readout's log amplitudes. `_ac_mem` holds detached rows of
-        # recent batches: one batch cannot estimate a full-rank covariance of 160 channels.
-        self.w_ac, self.ac_gamma, self.ac_queue = w_ac, ac_gamma, int(ac_queue)
-        self._ac_mem = None
-
-    def _log_readout_amp(self, z):
-        """Log amplitude at every readout bin, B x bins x channels."""
-        e = self.encoder_q
-        amp, _ = spectral_readout(z, e.bins_per_day, "angle", e.harmonics, readout_norm=self.readout_norm)
-        return amp.view(amp.size(0), -1, e.seasonal_dims).log()
 
     @torch.no_grad()
     def _momentum_update(self):
@@ -294,132 +225,32 @@ class CoSTModel(nn.Module):
                 pk.data.mul_(self.m).add_(pq.data, alpha=1.0 - self.m)
 
     @torch.no_grad()
-    def _enqueue(self, keys, ids=None):
+    def _enqueue(self, keys):
         b = keys.shape[0]
         if self.K % b != 0:
             raise ValueError(f"queue size {self.K} must be divisible by batch size {b}")
         ptr = int(self.queue_ptr)
         self.queue[:, ptr:ptr + b] = keys.T
-        if hasattr(self, "queue_ids"):
-            self.queue_ids[ptr:ptr + b] = -1 if ids is None else ids
         self.queue_ptr[0] = (ptr + b) % self.K
 
-    def _equivariance_target_bin(self):
-        """The rFFT bin the equivariance term acts on.
-
-        Prefer the SECOND daily harmonic (12 h): RQ2 perturbs whole-window timing and the 24-h
-        amplitude, so training on 12 h keeps RQ2 an independent probe instead of a manipulation
-        check. Where 12 h is not resolvable -- GLOBEM's 6-h bins put Nyquist at a 12-h period --
-        fall back to the first daily harmonic, which is safe there because GLOBEM has no RQ2.
-        """
-        if self.equivariance_bin is not None:
-            return int(self.equivariance_bin)
-        e = self.encoder_q
-        bins = spectral_freqs(e.seq_len, e.bins_per_day, e.harmonics)
-        days = e.seq_len // e.bins_per_day
-        for harmonic in (2, 1):
-            bin_index = days * harmonic
-            if bin_index in bins and bin_index <= e.seq_len // 2:
-                return bin_index
-        return bins[-1]
-
-    def _seasonal_equivariance(self, x_q, q_s):
-        """Scale and rotate one input harmonic; require the latent coefficient to follow."""
-        bin_index = self._equivariance_target_bin()
-        b = x_q.size(0)
-        scale = torch.empty(b, device=x_q.device).uniform_(0.5, 1.5)
-        rotation = torch.empty(b, device=x_q.device).uniform_(-math.pi, math.pi)
-        _, t_s = self.encoder_q(harmonic_transform(x_q, bin_index, scale, rotation))
-        with torch.autocast(device_type="cuda", enabled=False):
-            coef = fft.rfft(q_s.float(), dim=1)[:, bin_index]
-            coef_t = fft.rfft(t_s.float(), dim=1)[:, bin_index]
-            loss = O.seasonal_equivariance_loss(coef, coef_t, scale, rotation)
-        # Reported in the amplitude slot so the recorded parts stay two-valued; the phase slot is
-        # zero because one complex target now covers magnitude and angle together.
-        return self.weights.amp * loss, loss.new_zeros(())
-
-    def _disjoint_days(self, x_q, x_k):
-        """Hide all but a random half of the days in each view, and a different half in each.
-
-        The two views of a week then share no timestep: the pair can only be matched through
-        what persists across days, not by copying the input (raw pixels alone retrieve the
-        full-window pair at top-1 0.891 among 3,803 HRD weeks). Hidden bins are NaN, which the
-        encoder already zeroes. Returns the views and their visible-bin masks.
-        """
-        bpd = self.encoder_q.bins_per_day
-        b, t, _ = x_q.shape
-        days = t // bpd
-        if days < 2:
-            raise ValueError("disjoint_days needs at least two whole days per window")
-        half = days // 2
-        order = torch.argsort(torch.rand(b, days, device=x_q.device), dim=1)
-        visible = []
-        for chosen in (order[:, :half], order[:, half:2 * half]):
-            day = torch.zeros(b, days, dtype=torch.bool, device=x_q.device).scatter_(1, chosen, True)
-            per_bin = day.repeat_interleave(bpd, dim=1)
-            visible.append(F.pad(per_bin, (0, t - days * bpd), value=False))
-        views = [x.masked_fill(~v.unsqueeze(-1), float("nan")) for x, v in zip((x_q, x_k), visible)]
-        return views, visible
-
-    @staticmethod
-    def _visible_mean(z, visible):
-        w = visible.unsqueeze(-1).to(z.dtype)
-        return (z * w).sum(dim=1) / w.sum(dim=1)
-
-    def forward(self, x_q, x_k, update=True, return_parts=False, delta=None, ids=None):
+    def forward(self, x_q, x_k, update=True, return_parts=False):
         idx = np.random.randint(0, x_q.shape[1])            # the timestep the trend term contrasts
         q_t, q_s = self.encoder_q(x_q)
-
-        q_level = q_t.mean(dim=1) if self.head_eq is not None else None   # the trend readout
-        if self.trend_views == "same":
-            q_t = F.normalize(self.head_q(q_t[:, idx]), dim=-1)
-            with torch.no_grad():
-                if update:
-                    self._momentum_update()
-                k_t, _ = self.encoder_k(x_k)
-                k_t = F.normalize(self.head_k(k_t[:, idx]), dim=-1)
-            trend, self.last_top1 = O.moco_ce_loss(q_t, k_t, self.queue.clone().detach(), self.T)
+        q_t = F.normalize(self.head_q(q_t[:, idx]), dim=-1)
+        with torch.no_grad():
             if update:
-                self._enqueue(k_t)
-        else:
-            # Same week, different days: the query is days A of view 1, the key days B of
-            # view 2, each read out as the mean trend over its visible bins -- the quantity the
-            # frozen trend block reports. One extra encoder pass, for the query.
-            (x_a, x_b), (vis_a, vis_b) = self._disjoint_days(x_q, x_k)
-            q_a, _ = self.encoder_q(x_a)
-            q_h = F.normalize(self.head_q(self._visible_mean(q_a, vis_a)), dim=-1)
-            with torch.no_grad():
-                if update:
-                    self._momentum_update()
-                k_b, _ = self.encoder_k(x_b)
-                k_h = F.normalize(self.head_k(self._visible_mean(k_b, vis_b)), dim=-1)
-            own = None if ids is None else ids.unsqueeze(1) == self.queue_ids.unsqueeze(0)
-            trend, self.last_top1 = O.moco_ce_loss(q_h, k_h, self.queue.clone().detach(),
-                                                   self.T, neg_mask=own)
-            if update:
-                self._enqueue(k_h, ids)
+                self._momentum_update()
+            k_t, _ = self.encoder_k(x_k)
+            k_t = F.normalize(self.head_k(k_t[:, idx]), dim=-1)
+        trend, self.last_top1 = O.moco_ce_loss(q_t, k_t, self.queue.clone().detach(), self.T)
+        if update:
+            self._enqueue(k_t)
 
         # Seasonal term as upstream: no queue and symmetric, so the key view also goes through
         # encoder_q with gradients (a third encoder pass).
-        k_tq, k_s = self.encoder_q(x_k)
-        if self.seasonal_objective == "equivariance":
-            amp, pha = self._seasonal_equivariance(x_q, q_s)
-        else:
-            amp, pha = O.seasonal_loss(q_s, k_s, self.weights, self.phase_mode)
+        _, k_s = self.encoder_q(x_k)
+        amp, pha = O.seasonal_loss(q_s, k_s, self.weights, self.phase_mode)
         total = O.total_loss(trend, amp, pha, self.weights, self.alpha)
-        if self.head_eq is not None:
-            if delta is None:
-                raise ValueError("w_eq > 0 but the batch carries no level offsets")
-            total = total + self.w_eq * O.equivariance_loss(
-                self.head_eq(q_level - k_tq.mean(dim=1)), delta)
-        if self.w_ac > 0:
-            # The queue holds training-mode rows (dropout on), so validation uses its own rows.
-            cur = torch.cat([self._log_readout_amp(q_s), self._log_readout_amp(k_s)], dim=0)
-            total = total + self.w_ac * O.anticollapse_loss(
-                cur, self._ac_mem if self.training else None, self.ac_gamma)
-            if update:
-                mem = cur.detach() if self._ac_mem is None else torch.cat([cur.detach(), self._ac_mem])
-                self._ac_mem = mem[:self.ac_queue]
         return (total, trend, amp + pha) if return_parts else total
 
 
@@ -438,17 +269,17 @@ WEIGHTS = {"paper": O.PAPER, "contracted": O.CONTRACTED}
 # The only settings the CoST reference adapter takes from the experiment configuration: the
 # shared readout, geometry and budget. Everything else is fixed to upstream CoST below.
 REFERENCE_SHARED = ("output_dims", "hidden_dims", "tcn_depth", "harmonics", "seasonal_frac",
-                    "phase_readout", "readout_norm", "alpha", "moco_k", "lr", "batch_size",
-                    "mask_mode")
+                    "phase_readout", "alpha", "moco_k", "lr", "batch_size", "mask_mode")
 
 
 class DSSL:
     """Fit the encoder, then read frozen representations out of it.
 
-    The defaults are the paper's DSSL: four harmonic bands, causal trend experts up to T/8,
+    The defaults are the canonical DSSL: four harmonic bands, causal trend experts up to T/8,
     contracted seasonal weights, amplitude-weighted circular phase contrast, smoothing up to
-    75 min, angle readout -- except level equivariance, now off (w_eq = 0): on HRD, w_eq
-    1 / 0.05 / 0 gave RQ1 gain -0.0343 / -0.0136 / +0.0096 over 5 folds, ordered so in each. method="cost_reference"
+    75 min, and an angle readout of the raw seasonal sequence. Options tested and rejected
+    (level equivariance, alternative readouts, disjoint-day trend pairing, pre-encoder
+    decomposition) are recorded in FAILED_EXPERIMENTS.md and are no longer configurable. method="cost_reference"
     is upstream CoST behind the same readout: one full-spectrum band, trend experts up to
     T/2, raw-phase contrast, weights 1 / 0.5 / 0.5, no equivariance, scaling, jitter and
     shift augmentation at 0.5; callers pass it only REFERENCE_SHARED.
@@ -459,10 +290,8 @@ class DSSL:
                  backbone="tcn", temporal_encoding="none", tcn_depth=None, n_layers=4,
                  n_heads=4, bidirectional=True, seasonal_bands="harmonics", harmonics=4,
                  trend_kernel_cap=None, seasonal_frac=0.5, band_readout=False, mask_mode="none",
-                 phase_readout="angle", readout_norm="none", phase_mode="circular_amp",
-                 weights="contracted", trend_views="same", decompose=False, seasonal_days=None,
-                 seasonal_objective="contrastive",
-                 alpha=0.005, w_eq=0.0, w_ac=0.0, ac_gamma=0.7114, ac_queue=512, moco_k=4096,
+                 phase_readout="angle", phase_mode="circular_amp",
+                 weights="contracted", alpha=0.005, moco_k=4096,
                  jitter_sigma=0.1, shift_sigma=0.5, smooth_minutes=75.0, lr=5e-4, batch_size=64,
                  device="cuda", model_seed=None):
         if method not in ("dssl", "cost_reference"):
@@ -474,8 +303,7 @@ class DSSL:
                 raise ValueError("the CoST reference adapter is sensor-only")
             backbone, temporal_encoding, seasonal_bands, band_readout = "tcn", "none", "single", False
             trend_kernel_cap, phase_mode, weights = max(1, seq_len // 2), "raw", "paper"
-            trend_views = "same"
-            w_eq, w_ac, jitter_sigma, shift_sigma, smooth_minutes = 0.0, 0.0, 0.5, 0.5, 0.0
+            jitter_sigma, shift_sigma, smooth_minutes = 0.5, 0.5, 0.0
             self.scale_sigma = 0.5
         if trend_kernel_cap is None:
             trend_kernel_cap = max(1, seq_len // 8)
@@ -494,7 +322,7 @@ class DSSL:
 
         self.device = device
         self.seq_len, self.bins_per_day = seq_len, bins_per_day
-        self.phase_readout, self.readout_norm = phase_readout, readout_norm
+        self.phase_readout = phase_readout
         self.batch_size, self.lr = batch_size, lr
         self.jitter_sigma, self.shift_sigma = jitter_sigma, shift_sigma
         self.smooth_bins = smooth_bins_for(smooth_minutes, bins_per_day)
@@ -507,21 +335,14 @@ class DSSL:
                    band_readout=band_readout, backbone=backbone, temporal_encoding=temporal_encoding,
                    tcn_depth=tcn_depth, n_layers=n_layers, n_heads=n_heads,
                    bidirectional=bidirectional)
-        if seasonal_days is not None and not decompose:
-            raise ValueError('seasonal_days caps the decomposed oscillatory tower; it needs decompose=True')
-        build = (partial(DecomposedEncoder, seasonal_days=seasonal_days) if decompose
-                 else CoSTEncoder)
-        self.net = build(**enc).to(device)
+        self.net = CoSTEncoder(**enc).to(device)
         self._keep = band_keep(self.net)
         self.component_dims = self.net.seasonal_dims
 
-        encoder_k = build(**enc).to(device)
+        encoder_k = CoSTEncoder(**enc).to(device)
         self.cost = CoSTModel(
             self.net, encoder_k, dim=self.net.trend_dims, alpha=alpha, K=moco_k,
-            phase_mode=phase_mode, readout_norm=readout_norm, weights=weights,
-            trend_views=trend_views, seasonal_objective=seasonal_objective,
-            w_eq=w_eq, eq_dims=input_dims, w_ac=w_ac,
-            ac_gamma=ac_gamma, ac_queue=ac_queue, device=device).to(device)
+            phase_mode=phase_mode, weights=weights, device=device).to(device)
         self.n_iters = 0
         self._optimizer = None
         self._permutation = None
@@ -539,15 +360,8 @@ class DSSL:
                            harmonics=harmonics, trend_kernel_cap=trend_kernel_cap,
                            trend_kernels=self.net.kernels, seasonal_frac=seasonal_frac,
                            band_readout=band_readout, mask_mode=mask_mode,
-                           phase_readout=phase_readout, readout_norm=readout_norm,
-                           phase_mode=phase_mode,
-                           weights=weights_name, trend_views=trend_views, decompose=decompose,
-                           seasonal_days=seasonal_days, seasonal_objective=seasonal_objective,
-                           equivariance_bin=self.cost._equivariance_target_bin()
-                           if seasonal_objective == 'equivariance' else None,
-                           seasonal_receptive_field=getattr(self.net, 'seasonal_net', None)
-                           and self.net.seasonal_net.receptive_field,
-                           alpha=alpha, w_eq=w_eq, w_ac=w_ac,
+                           phase_readout=phase_readout, phase_mode=phase_mode,
+                           weights=weights_name, alpha=alpha,
                            moco_k=moco_k, jitter_sigma=jitter_sigma, shift_sigma=shift_sigma,
                            scale_sigma=self.scale_sigma, smooth_minutes=smooth_minutes,
                            smooth_bins=self.smooth_bins, lr=lr, batch_size=batch_size,
@@ -589,7 +403,7 @@ class DSSL:
             self._cursor += self.batch_size
             batch = [torch.stack(v) for v in zip(*(ds[int(i)] for i in idx))]
             adjust_learning_rate(opt, self.lr, self.n_iters, n_iters)
-            loss = self._loss(batch, ids=(idx % ds.N).to(self.device))
+            loss = self._loss(batch)
             if not torch.isfinite(loss):
                 raise FloatingPointError("nonfinite SSL loss")
             opt.zero_grad(set_to_none=True)
@@ -619,11 +433,9 @@ class DSSL:
                              smooth_bins=self.smooth_bins, scale_sigma=self.scale_sigma, **kw)
         return DataLoader(ds, batch_size=self.batch_size, shuffle=shuffle, drop_last=True)
 
-    def _loss(self, batch, update=True, ids=None):
-        """`ids`: each sample's training-window index; only trend_views="disjoint_days" reads
-        it, to keep a week's own earlier keys out of its negatives."""
+    def _loss(self, batch, update=True):
         x_q, x_k = batch[0].to(self.device), batch[1].to(self.device)
-        return self.cost(x_q, x_k, update=update, delta=batch[2].to(self.device), ids=ids)
+        return self.cost(x_q, x_k, update=update)
 
     @torch.no_grad()
     def _validation_loss(self, loader):
@@ -639,7 +451,7 @@ class DSSL:
     # -- readout ----------------------------------------------------------------------
     def _spectral(self, z):
         return spectral_readout(z, self.bins_per_day, self.phase_readout, self.net.harmonics,
-                                self._keep, readout_norm=self.readout_norm)
+                                self._keep)
 
     def blocks(self):
         """Column range (start, stop) of each branch in `encode` output: the trend readout,

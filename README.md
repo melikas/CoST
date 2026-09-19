@@ -3,19 +3,28 @@
 This repository studies whether CoST-derived self-supervised wearable representations
 retain **individual rhythmic characteristics** and support mental-health endpoints.
 
-**Start with [the experiment guide](docs/RUNNING.md).** It specifies supported commands,
-the model matrix, output files, cluster submission and remaining scientific limitations.
+**Start with [the full report](REPORT_TO_PROFESSOR.md).** It is the single authoritative
+document: the objective, the data, the final architecture layer by layer, the RQ1–RQ3
+results, how the model was chosen, the limitations and exact reproduction commands.
+For day-to-day commands see [the experiment guide](docs/RUNNING.md).
 
+- [**Full report — architecture, results, reproduction**](REPORT_TO_PROFESSOR.md)
+- [**Experiments tested and not retained**](FAILED_EXPERIMENTS.md)
 - [Scientific protocol and adjudication](docs/SCIENTIFIC_PROTOCOL.md)
+- [Pre-registration of the canonical run](docs/VALIDATION_PRECOMMIT.md) and [its outcome](docs/VALIDATION_RESULT.md)
+- [**Where every output comes from**](docs/OUTPUT_PROVENANCE.md) — the single results location, what `manifest.json` records, and the one upload/download procedure
+- [Consolidation manifest](docs/CONSOLIDATION_MANIFEST.md) — what was removed and why
+- [Inventory of removed legacy outputs](docs/REMOVED_LEGACY_OUTPUTS.md)
 - [Delivery status, RQ table and dataset audit](docs/RESCUE_STATUS.md)
 - [Repository discrepancy audit](docs/audit/README.md)
 - [Applied repairs](docs/audit/REPAIRS.md)
-- [Corrected manuscript](SSL_Rhythmicity/Main.tex) and [dated methods/RQ amendment](SSL_Rhythmicity/sections/rescue-protocol.tex)
+- [Corrected manuscript](SSL_Rhythmicity/Main.tex); the dated methods/RQ amendments live in [the scientific protocol](docs/SCIENTIFIC_PROTOCOL.md)
 
 The active entry point is `scripts/run_experiment.py`. It trains each fold once and
 evaluates RQ1–RQ3 from the same frozen features. `configs/hrd.json` and
-`configs/globem.json` instantiate the paper's DSSL (harmonic bands, trend experts up to
-T/8, contracted weights, level equivariance, within-person input); `--backbone` and
+`configs/globem.json` are the **one canonical configuration per dataset** (harmonic bands,
+trend experts up to T/8, contracted weights, raw seasonal readout, within-person input);
+`--backbone` and
 `--temporal-encoding` select other variants, each written to its own
 `results/<dataset>/<run>/<backbone>_<encoding>/`. RQ1 includes a disentanglement audit: each
 window's MESOR, 24-h amplitude and acrophase from its own branch versus the other branch. The CoST reference adapter is trained

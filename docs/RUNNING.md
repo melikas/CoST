@@ -16,7 +16,7 @@ order, is in [CLUSTER.md](../CLUSTER.md).**
 | Trend branch | Causal convolution experts at kernels 1, 2, 4, …, T/8 (1–64 on HRD, 1–8 on GLOBEM); MoCo, queue 4096 |
 | Seasonal branch | One banded Fourier layer per daily harmonic: HRD bins (1,10), (10,17), (17,24), (24,31); GLOBEM (1,42), (42,57) |
 | Seasonal loss | Amplitude-weighted circular phase contrast; contracted weights w_T 0.277, w_A 0.148, w_Φ 0.852; α = 0.005 |
-| Level equivariance | w_eq = 1 (trend readout predicts the per-channel level offset between views) |
+| Seasonal readout | Read from the **raw** seasonal sequence (no per-timestep normalisation); `eps = 1e-3` conditions `atan2` near zero amplitude |
 | Augmentation | Jitter σ 0.1, level shift σ 0.5, circular smoothing up to 75 min (5 bins on HRD, off on GLOBEM's 6-h bins) |
 | Optimisation | SGD, lr 5e-4 with cosine decay, batch 64, 6,000 updates; 10% of training windows only monitor the pretext loss |
 | Readout | Trend time-mean, amplitude and angle at bins 1, 7, 14, 21, 28 (HRD) / 4, 28 (GLOBEM); 1,760 columns on HRD |
@@ -33,7 +33,7 @@ stretched into an ellipse; the default angle readout has no pairs.
 
 The **CoST reference adapter** is upstream CoST behind the same readout, trained on the same
 data and budget: one full-spectrum seasonal band, trend kernels up to T/2, raw-phase contrast,
-weights 1 / 0.5 / 0.5, no equivariance, scaling, jitter and shift at 0.5, no smoothing. It
+weights 1 / 0.5 / 0.5, scaling, jitter and shift at 0.5, no smoothing. It
 takes only the shared settings from the config (`cost.REFERENCE_SHARED`). On HRD its encoder
 has 44,036,288 parameters.
 
@@ -103,10 +103,10 @@ python scripts/run_experiment.py --dataset hrd --smoke --device cpu --summarize
 
 ## What to open
 
-Start with `results/SUMMARY_narval_v1.md`: every dataset and variant, one section per RQ, each
+Start with `results/SUMMARY_narval_v2.md`: every dataset and variant, one section per RQ, each
 with its headline table and the protocol's pre-specified evidence conditions marked met / not met.
 
-Per dataset and variant, `results/<dataset>/narval_v1/<backbone>_<encoding>/` (`tcn_none` by
+Per dataset and variant, `results/<dataset>/narval_v2/<backbone>_<encoding>/` (`tcn_none` by
 default) holds:
 
 | File | Content |

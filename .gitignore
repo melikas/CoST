@@ -15,8 +15,12 @@ datasets/HRD_RAW_MinuteLevel.csv
 *.pth
 *.ckpt
 
-# Run outputs: results_hrd/ alone is ~13 GB across ~18k files. Keep the code in
-# git and the results on the cluster / in the scratch copy.
+# Run outputs. Since 2026-09-18 there is exactly ONE location for experiment output,
+# results/, and every fold in it carries a manifest.json recording the git commit, the
+# data cache hash and the participant split (docs/OUTPUT_PROVENANCE.md). The three names
+# below are the pre-rescue generation: they had no provenance metadata and were removed,
+# and the rules stay so that recreating them cannot stage anything.
+results/
 results_hrd/
 results_hrd_energy/
 results_globem/
@@ -34,7 +38,7 @@ __pycache__/
 
 # Transfer archives: the tarballs used to push code to the cluster and pull
 # results back. Both are derived -- the working tree is the source of truth for
-# what goes up, and results_hrd/ (already ignored) for what comes down.
+# what goes up, and results/ (already ignored) for what comes down.
 *.tgz
 *.tar.gz
 
@@ -44,7 +48,7 @@ __pycache__/
 
 # Stray caches. tasks/rhythm.py writes paper_cosinor_topk<N>_cache.npz next to
 # the variant dir; running against a variant dir at the repo root lands it here
-# instead of under results_hrd/.
+# instead of under results/.
 /*.npz
 _randinit_cache/
 audit_fast_*.json
@@ -73,9 +77,14 @@ archive/
 SSL_Rhythmicity/
 docs/audit/evidence/
 
-# A local copy of the cluster upload bundle (code + caches). Its datasets/cache/ sits one
-# level down, so the rule above does not cover it and participant data could be staged.
+# Artefacts of the cluster round-trip documented in CLUSTER.md. All are regenerable: the
+# bundle from `git archive HEAD`, the extracted copy from that bundle, and the downloaded
+# results from the cluster. None belongs in the repository, and each has staged participant
+# data at some point -- rhythmssl_rescue/ carries its own datasets/cache/ one level down, so
+# the cache rule above does not reach it.
 rhythmssl_rescue/
+rescue_upload.tgz
+rescue_results_*/
 
 # Written by scripts/stamp_version.py for the cluster copy; derived from git.
 CODE_VERSION

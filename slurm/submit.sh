@@ -9,7 +9,7 @@
 #                                                       another variant, reusing the reference
 set -euo pipefail
 account="${1:?usage: bash slurm/submit.sh ACCOUNT [RUN_NAME]}"
-run="${2:-narval_v1}"
+run="${2:-narval_v2}"
 mkdir -p logs
 gpu_job=(--account="$account" --gres="${GPU:-gpu:a100_3g.20gb:1}" --time="${TIME:-03:00:00}")
 export_vars="ALL,RUN_NAME=$run,BACKBONE=${BACKBONE:-},ENCODING=${ENCODING:-}"

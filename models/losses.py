@@ -1,8 +1,7 @@
 """The SSL objective: a MoCo trend term and a within-batch seasonal term, with the
 seasonal term split into amplitude and phase and each term separately weighted.
 
-    L  =  w_trend * L_trend  +  alpha * ( w_amp * L_amp  +  w_phase * L_phase )  [+ w_eq * L_eq]
-                                                                              [+ w_ac * L_ac]
+    L  =  w_trend * L_trend  +  alpha * ( w_amp * L_amp  +  w_phase * L_phase )
 
 Upstream fixes w_trend = 1 and w_amp = w_phase = 1/2. Making the three weights explicit
 is the only structural change here, and it is what lets the objective be contracted onto
@@ -120,7 +119,7 @@ def instance_contrastive_loss(z1, z2):
     return (logits[:, i, b + i - 1].mean() + logits[:, b + i, i].mean()) / 2
 
 
-def moco_ce_loss(q, k, k_negs, temperature: float = 0.07, neg_mask=None):
+def moco_ce_loss(q, k, k_negs, temperature: float = 0.07):
     """MoCo InfoNCE for the trend branch, plus the top-1 retrieval rate.
 
     `top1` is the project's pretext-difficulty measure and is returned rather than logged
@@ -129,14 +128,10 @@ def moco_ce_loss(q, k, k_negs, temperature: float = 0.07, neg_mask=None):
     nothing, which is the measured state of the shipped window-pairing (0.8223, 6737x
     chance) and the reason the trend branch has never separated from its own control.
 
-    `neg_mask` (N x K, True = not a negative) drops queue entries that are the query's own
-    instance: a queue larger than the training set always holds some.
     """
     l_pos = torch.einsum("nc,nc->n", q, k).unsqueeze(-1)                    # N x 1
     l_neg = (torch.einsum("nc,nkc->nk", q, k_negs) if k_negs.dim() == 3
              else torch.einsum("nc,ck->nk", q, k_negs))                     # N x K
-    if neg_mask is not None:
-        l_neg = l_neg.masked_fill(neg_mask, float("-inf"))
     logits = torch.cat([l_pos, l_neg], dim=1) / temperature
     with torch.no_grad():
         top1 = float((l_pos > l_neg.max(dim=1, keepdim=True).values).float().mean())
@@ -166,66 +161,6 @@ def seasonal_loss(q_s, k_s, weights: TermWeights, phase_mode: str = "circular_am
             k_pha = circular_phase(k_pha, k_amp if w else None)
     return (weights.amp * instance_contrastive_loss(q_amp, k_amp),
             weights.phase * instance_contrastive_loss(q_pha, k_pha))
-
-
-def equivariance_loss(pred, delta):
-    """Level equivariance for the trend branch (Dangovski et al., ICLR 2022).
-
-    `shift` adds a per-channel offset -- the MESOR, the f=0 bin -- to each view, and the trend
-    branch is read out as its time-mean, i.e. that same content. Contrasting the two views
-    therefore trains the trend branch to DISCARD the quantity it is read out as: an
-    augmentation defines what the representation throws away (Xiao et al., ICLR 2021). This
-    term makes the branch predict the offset between the views instead. `pred` is a bias-free
-    linear map of the difference of the two views' time-mean trend, and `delta` is d1 - d2,
-    so at the optimum level is a linear direction of the trend readout.
-    """
-    return F.mse_loss(pred, delta)
-
-
-def seasonal_equivariance_loss(coef, coef_transformed, scale, rotation):
-    """Seasonal equivariance: the latent harmonic must MOVE with a known input change.
-
-    The contrastive seasonal term asks the two views to agree, i.e. it makes amplitude and phase
-    INVARIANT to the augmentations -- and by the same argument as `equivariance_loss`, an
-    augmentation defines what the representation discards. RQ1 and RQ2 measure the opposite:
-    whether the representation tracks amplitude and phase. That is why training currently makes
-    acrophase recovery worse than random initialisation (own R^2 0.769 -> 0.587 shared,
-    0.768 -> 0.506 decomposed) -- the objective optimises against the criteria.
-
-    Here the input's harmonic is scaled by `scale` and rotated by `rotation`, and the latent
-    coefficient is required to do the same: coef_transformed ~= scale * e^{i*rotation} * coef.
-    In complex coordinates intensity is a radial scaling and timing is a rotation -- orthogonal
-    actions on one number, instead of two real blocks that trade against each other.
-
-    `coef`, `coef_transformed`: complex (B, D). `scale`, `rotation`: real (B,).
-    """
-    if coef.shape != coef_transformed.shape:
-        raise ValueError("equivariance needs matching coefficient shapes")
-    factor = (scale * torch.exp(1j * rotation)).unsqueeze(-1)
-    target = factor.to(coef.dtype) * coef
-    return (F.mse_loss(coef_transformed.real, target.real)
-            + F.mse_loss(coef_transformed.imag, target.imag))
-
-
-def anticollapse_loss(cur, mem, gamma: float, mu: float = 25.0, nu: float = 1.0,
-                      eps: float = 1e-4):
-    """VICReg variance and covariance terms (Bardes, Ponce & LeCun, ICLR 2022) on the seasonal
-    readout's LOG amplitudes, one frequency bin at a time.
-
-    `cur` is B x F x C with gradient, `mem` M x F x C detached rows from earlier batches (or
-    None). Statistics are taken over both, because one batch of 64 cannot estimate a full-rank
-    covariance of 160 channels; only `cur` carries gradient. Per bin: every channel's standard
-    deviation across windows is held above `gamma` (the variance floor), and the channels are
-    decorrelated (the covariance term) -- which is what the readout's effective rank measures.
-    The loss depends on |Z| only, so its gradient with respect to every phase is exactly zero.
-    """
-    x = cur if mem is None or len(mem) == 0 else torch.cat([cur, mem], dim=0)
-    x = x - x.mean(dim=0, keepdim=True)
-    n, _, c = x.shape
-    var = F.relu(gamma - torch.sqrt(x.var(dim=0) + eps)).mean()
-    cov = torch.einsum("nfc,nfd->fcd", x, x) / (n - 1)
-    off = cov - torch.diag_embed(torch.diagonal(cov, dim1=1, dim2=2))
-    return mu * var + nu * off.pow(2).sum(dim=(1, 2)).div(c).mean()
 
 
 def total_loss(trend_term, amp_term, phase_term, weights: TermWeights, alpha: float):

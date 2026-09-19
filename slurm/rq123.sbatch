@@ -18,7 +18,7 @@ cd "${SLURM_SUBMIT_DIR:?Submit from the repository root}"
 source slurm/env.sh
 set -euo pipefail
 : "${DATASET:?Export DATASET=hrd or globem when submitting}"
-RUN_NAME="${RUN_NAME:-narval_v1}"
+RUN_NAME="${RUN_NAME:-narval_v2}"
 case "$DATASET" in hrd|globem) ;; *) echo 'Invalid DATASET' >&2; exit 2;; esac
 task=${SLURM_ARRAY_TASK_ID:?}
 if (( task < 0 || task >= 15 )); then exit 2; fi
@@ -35,7 +35,5 @@ extra=()
 [ -n "${SKIP_REFERENCE:-}" ] && [ "${STAGE:-variant}" != reference ] && extra+=(--skip-reference)
 # DEV_COHORT: architecture development inside locked fold 0's training participants.
 [ -n "${DEV_COHORT:-}" ] && extra+=(--dev-cohort)
-# REUSE: read an existing run's encoders out under this config's readout instead of training.
-[ -n "${REUSE:-}" ] && extra+=(--reuse-encoders "$REUSE")
 srun python scripts/run_experiment.py --dataset "$DATASET" --seed "$seed" --fold "$fold" \
     --device cuda --run-name "$RUN_NAME" "${extra[@]}"

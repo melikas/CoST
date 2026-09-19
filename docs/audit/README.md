@@ -2,7 +2,7 @@
 
 Audit date: 2026-09-14. **The existing results are exploratory, and this repository is not yet ready for a confirmatory Narval run.** Basic model execution works; the scientific protocol, data provenance, controls, and result provenance do not yet support the manuscript's strongest claims.
 
-This is an audit of an existing project, not a replacement implementation. No existing source, dataset, checkpoint, result, or staged change was removed or rewritten during this audit. The changes in this phase are this report, the [RQ specification](RQ_SPECIFICATION.md), the [audit program](validate_audit.py), and its [evidence](evidence/). In the findings below, **Fix means the recommended next change, not a change already applied**.
+This is an audit of an existing project, not a replacement implementation. No existing source, dataset, checkpoint, result, or staged change was removed or rewritten during this audit. The changes in this phase are this report, the [RQ specification](RQ_SPECIFICATION.md), the [audit program](../../archive/docs_audit/validate_audit.py), and its [evidence](evidence/). In the findings below, **Fix means the recommended next change, not a change already applied**.
 
 ## 1. Scope and reference hierarchy
 
@@ -276,7 +276,7 @@ Current important files, with disposition:
 | `README.md`, `CLUSTER.md`, `CC.md` | Existing usage and experiment notes; preserve history, consolidate supported instructions. |
 | `requirements.txt`, `NOTICE`, `third_party/` | Environment and upstream attribution; KEEP attribution, pin supported environments. |
 | `SSL_Rhythmicity/` | Manuscript and its independent Git history; preserve and reconcile scientific authority. |
-| `docs/audit/validate_audit.py` | Reproduces this audit's inventory, data summaries, counterexamples and tiny execution checks. |
+| `archive/docs_audit/validate_audit.py` (moved) | Reproduces this audit's inventory, data summaries, counterexamples and tiny execution checks. |
 
 A suitable next structure needs only dataset modules, a DSSL module, an encoder module, losses/augmentations, three RQ modules, shared evaluation/statistics, one training CLI, one RQ CLI and a SLURM dispatcher. Avoid a top-level Python package named `ssl`, which can shadow Python's standard-library `ssl`. Moving working files solely to resemble a template would add churn without fixing the science.
 
@@ -285,9 +285,9 @@ A suitable next structure needs only dataset modules, a DSSL module, an encoder 
 These commands were executed locally from the repository root:
 
 ```powershell
-python docs/audit/validate_audit.py --raw-hrd
-python docs/audit/validate_audit.py --section checks
-python docs/audit/validate_audit.py --section provenance
+python archive/docs_audit/validate_audit.py --raw-hrd
+python archive/docs_audit/validate_audit.py --section checks
+python archive/docs_audit/validate_audit.py --section provenance
 ```
 
 The first command inventories and validates the existing data/model, including a streaming HRD pass. The second reruns focused checks; the third requires the inventory and hashes existing artifacts. Evidence is written only under `docs/audit/evidence/`. Re-running refreshes evidence but preserves the initial Git snapshots. These are audit commands, not final experiment commands.

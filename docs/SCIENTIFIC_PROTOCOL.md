@@ -90,6 +90,31 @@ RQ1 adds the evaluation of the paper's central architectural claim: each branch 
 - Pre-specified conditions: (i) DSSL's D is above 0 for all three targets (every 95% lower bound > 0); (ii) DSSL's D exceeds the untrained encoder's for all three targets. The CoST reference comparison is reported, not a condition.
 - Reading notes: the seasonal readout excludes frequency 0, so it cannot hold the window mean directly and low MESOR leakage is partly architectural; the level-equivariance term trains V^T on level offsets, so the untrained comparison shows what training adds. This is not the manuscript's time-resolved τ/σ decomposition recovery (section 4a), which needs time-resolved latents; the manuscript text must be aligned with this definition.
 
+## Model amendment, 2026-09-18 (post-run consolidation; no RQ, endpoint, metric, threshold, baseline or split is changed)
+
+This amendment records two model settings that changed **after** the 2026-09-14 amendment above,
+so that the earlier text is preserved as written rather than edited. Neither change alters any
+research question, criterion or comparison. Both were decided before the canonical run and are
+recorded in `docs/VALIDATION_PRECOMMIT.md` (committed `8bc9b6e`, before launch).
+
+- **Level equivariance is withdrawn: `w_eq = 0`.** The 2026-09-14 amendment lists "level
+  equivariance w_eq = 1" as part of the proposed method. A dose-response over 5 folds gave an RQ1
+  proxy of -0.0343 / -0.0136 / +0.0096 for w_eq = 1.0 / 0.05 / 0, ordered identically in all 5
+  folds. The coefficient, its loss term, its projection head and the third element of each training
+  batch have since been removed from the code, because a coefficient established at zero is not a
+  hyperparameter. The reading note in the RQ1 disentanglement amendment that refers to "the
+  level-equivariance term trains V^T on level offsets" no longer applies to the canonical model;
+  the untrained comparison it justifies is unaffected and remains in force.
+- **The seasonal readout is read raw; per-timestep L2 normalisation is withdrawn.** Established
+  mechanistically on an *untrained* encoder (scaling a window's true 24 h amplitude by 0.5/1.0/1.5
+  moved the amplitude feature to 8.06/12.20/14.09 normalised versus 1.34/2.67/3.99 raw). The
+  alternatives ("timestep", "split") were evaluated at full protocol grade and rejected. The option
+  is now hard-wired, and `eps = 1e-3` conditions `atan2` near zero amplitude.
+
+The canonical configuration is `configs/hrd.json` and `configs/globem.json`; there is exactly one
+per dataset. `REPORT_TO_PROFESSOR.md` gives the full specification and the evidence for both
+changes; `FAILED_EXPERIMENTS.md` sections 4 and 6 give the rejected alternatives.
+
 ## Preservation
 
 Before repairs, 80 current source/manuscript/note files and the root staged/unstaged patches were preserved in `archive/rescue_20260914/before_repairs.zip`; `manifest.json` records source hashes. Raw datasets, historical result directories, caches and checkpoints remain intact. Git retains the reference and older model implementations.
