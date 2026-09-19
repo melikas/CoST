@@ -114,9 +114,9 @@ class CoSTReference(unittest.TestCase):
 
 class BackboneRegistry(unittest.TestCase):
     def test_registry_and_decoupled_depth(self):
-        self.assertEqual(sorted(BACKBONES), ["mamba", "tcn", "transformer"])
+        self.assertEqual(sorted(BACKBONES), ["lstm", "mamba", "mlp", "tcn", "transformer"])
         with self.assertRaisesRegex(ValueError, "unknown backbone"):
-            build_backbone("lstm", width=8, output_dims=8, seq_len=28)
+            build_backbone("gru", width=8, output_dims=8, seq_len=28)
         with self.assertRaisesRegex(ValueError, "already registered"):
             register("tcn")(lambda **kw: None)
         x = torch.randn(2, 28, 8)
@@ -132,6 +132,21 @@ class BackboneRegistry(unittest.TestCase):
         self.assertEqual(len(transformer.layers), 3)
         self.assertEqual(transformer.layers[0].self_attn.num_heads, 2)
         self.assertEqual(tuple(transformer(x).shape), (2, 28, 16))
+        # RQ4 backbones obey the same contract: (B, T, H) -> (B, T, D), T preserved.
+        lstm = build_backbone("lstm", width=8, output_dims=16, seq_len=28, n_layers=2)
+        self.assertEqual((lstm.rnn.num_layers, lstm.rnn.bidirectional), (2, True))
+        self.assertEqual(tuple(lstm(x).shape), (2, 28, 16))
+        mlp = build_backbone("mlp", width=8, output_dims=16, seq_len=28, n_layers=2)
+        self.assertEqual(tuple(mlp(x).shape), (2, 28, 16))
+        # The MLP mixes nothing across time: perturbing one timestep must leave the others
+        # bit-identical. This is what makes it the receptive-field-1 control.
+        mlp.eval()
+        before = mlp(x)
+        perturbed = x.clone()
+        perturbed[:, 0] += 10.0
+        after = mlp(perturbed)
+        self.assertTrue(torch.equal(before[:, 1:], after[:, 1:]))
+        self.assertFalse(torch.equal(before[:, 0], after[:, 0]))
 
     def test_mamba_has_no_substitute(self):
         try:

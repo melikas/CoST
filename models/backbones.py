@@ -12,9 +12,18 @@ Each backbone reads only its own options:
     tcn          tcn_depth                  dilation levels; None = smallest RF >= T
     transformer  n_layers, n_heads
     mamba        n_layers, bidirectional    official mamba-ssm CUDA kernels
+    lstm         n_layers, bidirectional    recurrent state, no explicit receptive field
+    mlp          n_layers                   per-timestep only; NO temporal mixing at all
 
-The heads, losses and evaluation never branch on the backbone. Transformer and Mamba are
-RQ4 building blocks, not parameter-matched to the TCN.
+The heads, losses and evaluation never branch on the backbone. The non-TCN backbones are
+RQ4 building blocks, not parameter-matched to the TCN: RQ4 asks what the choice of sequence
+operator does under a fixed framework, not what a fixed parameter budget buys.
+
+`mlp` is the floor of that comparison. It applies the same position-wise network to every
+timestep and mixes no information across time, so its receptive field is exactly 1. Any
+rhythm structure surviving in its representation therefore comes from the frequency-domain
+head and the readout, not from the backbone -- which is what makes it the right control for
+"how much does the sequence operator actually contribute?".
 """
 import math
 
@@ -124,6 +133,44 @@ class MambaBackbone(nn.Module):
         return self.output(x)
 
 
+class LSTMBackbone(nn.Module):
+    """Stacked LSTM over the full window. With `bidirectional`, the two directions are
+    concatenated before the output projection, as the window is fully observed."""
+
+    def __init__(self, width, output_dims, layers, bidirectional=True):
+        super().__init__()
+        self.rnn = nn.LSTM(width, width, num_layers=layers, batch_first=True,
+                           dropout=.1 if layers > 1 else 0., bidirectional=bidirectional)
+        self.output = nn.Linear(width * (2 if bidirectional else 1), output_dims)
+
+    def forward(self, x):
+        # cuDNN's RNN kernels have no deterministic implementation, and exact_numerics()
+        # turns deterministic algorithms on for every encode; run this one on the portable
+        # path so a reloaded encoder reproduces its own outputs bit for bit.
+        with torch.backends.cudnn.flags(enabled=False):
+            h, _ = self.rnn(x)
+        return self.output(h)
+
+
+class MLPBackbone(nn.Module):
+    """Position-wise network: the same MLP at every timestep, no mixing across time.
+
+    Receptive field 1 by construction. This is the control that isolates what the sequence
+    operator contributes, since every other part of the framework is unchanged.
+    """
+
+    def __init__(self, width, output_dims, layers):
+        super().__init__()
+        body = []
+        for _ in range(max(layers, 1)):
+            body += [nn.Linear(width, width), nn.GELU(), nn.Dropout(.1)]
+        self.body = nn.Sequential(*body)
+        self.output = nn.Linear(width, output_dims)
+
+    def forward(self, x):
+        return self.output(self.body(x))
+
+
 @register("tcn")
 def _tcn(*, width, output_dims, seq_len, tcn_depth, n_layers, n_heads, bidirectional):
     return TCNBackbone(width, output_dims, seq_len, depth=tcn_depth)
@@ -137,3 +184,13 @@ def _transformer(*, width, output_dims, seq_len, tcn_depth, n_layers, n_heads, b
 @register("mamba")
 def _mamba(*, width, output_dims, seq_len, tcn_depth, n_layers, n_heads, bidirectional):
     return MambaBackbone(width, output_dims, n_layers, bidirectional)
+
+
+@register("lstm")
+def _lstm(*, width, output_dims, seq_len, tcn_depth, n_layers, n_heads, bidirectional):
+    return LSTMBackbone(width, output_dims, n_layers, bidirectional)
+
+
+@register("mlp")
+def _mlp(*, width, output_dims, seq_len, tcn_depth, n_layers, n_heads, bidirectional):
+    return MLPBackbone(width, output_dims, n_layers)
