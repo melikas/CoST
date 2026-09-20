@@ -26,6 +26,7 @@ from models.encoder import CoSTEncoder
 
 __all__ = ["PretrainDataset", "CoSTModel", "DSSL", "WEIGHTS", "REFERENCE_SHARED", "exact_numerics",
            "tf32_convolutions", "spectral_freqs", "spectral_readout", "band_keep",
+           "band_support",
            "smooth_bins_for"]
 
 
@@ -130,23 +131,61 @@ def spectral_freqs(seq_len, bins_per_day, harmonics=4):
     return sorted({i for i in bins if 0 < i < seq_len / 2})
 
 
+def band_support(net):
+    """Which (readout bin, seasonal channel) pairs the band structure can actually support.
+
+    A `BandedFourierLayer` zeroes every frequency outside its own band before the inverse
+    transform, so in the frequency domain its output is exactly zero at any bin outside that
+    band. The readout, however, reads EVERY seasonal channel at EVERY bin in `spectral_freqs`.
+    A (bin, channel) pair is therefore "supported" only when the band owning that channel
+    contains that bin; every other pair is structurally zero and carries no signal.
+
+    Returns (mask, report) where `mask` is a (n_bins, seasonal_dims) boolean array and
+    `report` is a JSON-serialisable summary recorded in `DSSL.config`, so that every run
+    states on the record how much of its own readout is structurally empty.
+
+    The mask is built only from the band edges and the channel allocation. It never looks at
+    data, labels or any score.
+    """
+    freqs = spectral_freqs(net.seq_len, net.bins_per_day, net.harmonics)
+    widths = [layer.out_channels for layer in net.sfd]
+    starts = np.cumsum([0] + widths[:-1]).tolist()
+    mask = np.zeros((len(freqs), net.seasonal_dims), dtype=bool)
+    for i, f in enumerate(freqs):
+        for (lo, hi), s, w in zip(net.bands, starts, widths):
+            if lo <= f < hi:
+                mask[i, s:s + w] = True
+    # A band read at no readout bin can never contribute a supported coordinate. On GLOBEM
+    # the second harmonic lands exactly on the Nyquist bin, which `spectral_freqs` excludes
+    # because the rFFT coefficient there is real and its phase is degenerate; the band is
+    # still built, so its channels reach the objective but never the readout.
+    unread = [list(b) for b in net.bands if not any(b[0] <= f < b[1] for f in freqs)]
+    report = dict(readout_bins=list(freqs), band_widths=widths,
+                  supported=int(mask.sum()), total=int(mask.size),
+                  unsupported=int(mask.size - mask.sum()),
+                  unsupported_fraction=round(float(1 - mask.mean()), 4),
+                  bands_never_read=unread)
+    return mask, report
+
+
 def band_keep(net):
     """Flat (bin, dim) indices of the band-matched readout, or None to keep every column.
 
-    Under `band_readout` each band's dims are read only at the harmonics inside that band.
-    Intended for 12 harmonics, where the other columns are ~92% of the readout; at 4 it
-    lowers RQ3. Ordered bin-major, as the readout flattens.
+    Under `band_readout` each band's dims are read only at the harmonics inside that band,
+    i.e. exactly the supported pairs of `band_support`. Ordered bin-major, as the readout
+    flattens, so column order is a deterministic function of the geometry alone.
+
+    Off by default: the full readout is what every reported result used. Restricting to the
+    supported pairs is a change of representation, not a bug fix applied in place, so it is
+    kept as a separate configuration to be compared under the protocol rather than switched
+    on silently. Prior evidence is mixed -- at 12 harmonics the unsupported columns are ~92%
+    of the readout and removing them helps, while at the canonical 4 harmonics an earlier
+    screen lowered RQ3.
     """
     if not getattr(net, "band_readout", False):
         return None
-    d = net.seasonal_dims
-    widths = [layer.out_channels for layer in net.sfd]
-    starts = np.cumsum([0] + widths[:-1])
-    idx = [i * d + int(s) + j
-           for i, f in enumerate(spectral_freqs(net.seq_len, net.bins_per_day, net.harmonics))
-           for (lo, hi), s, w in zip(net.bands, starts, widths) if lo <= f < hi
-           for j in range(w)]
-    return torch.as_tensor(idx, dtype=torch.long)
+    mask, _ = band_support(net)
+    return torch.as_tensor(np.flatnonzero(mask.reshape(-1)), dtype=torch.long)
 
 
 def spectral_readout(z, bins_per_day, phase_readout, harmonics=4, keep=None, eps=1e-3):

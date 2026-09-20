@@ -25,7 +25,7 @@ os.environ.setdefault('CUBLAS_WORKSPACE_CONFIG', ':4096:8')
 import numpy as np
 import pandas as pd
 import torch
-from cost import DSSL, REFERENCE_SHARED, exact_numerics
+from cost import DSSL, band_support, REFERENCE_SHARED, exact_numerics
 from datautils import load_npz, make_folds
 from evaluation_protocol import disentanglement, evaluate, summarize, write_json
 from tasks.personalized import personalized_records
@@ -347,6 +347,9 @@ def main():
     untrained = DSSL(**kwargs)
     manifest = dict(common, variant=variant, skip_reference=args.skip_reference, config=cfg,
                     resolved_model=untrained.config,
+                    # Derived from the geometry, not part of the model's identity: how much of
+                    # this run's own seasonal readout the band structure can actually support.
+                    readout_support=band_support(untrained.net)[1],
                     code_sha256=code_hashes(VARIANT_SOURCES),
                     versions=dict(python=sys.version, torch=torch.__version__, numpy=np.__version__,
                                   **{name: __import__('importlib.metadata', fromlist=['version']).version(name)

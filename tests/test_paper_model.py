@@ -11,14 +11,18 @@ from pathlib import Path
 
 import numpy as np
 import torch
+from sklearn.preprocessing import StandardScaler
 
-from cost import DSSL, REFERENCE_SHARED, spectral_freqs
+from cost import (DSSL, REFERENCE_SHARED, spectral_freqs, spectral_readout,
+                  band_keep, band_support)
 from models import losses as O
 from models.backbones import BACKBONES, build_backbone, register
 
 ROOT = Path(__file__).resolve().parents[1]
 HRD = dict(seq_len=672, bins_per_day=96)       # 7 days of 15-min bins
 GLOBEM = dict(seq_len=112, bins_per_day=4)     # 28 days of 6-h bins
+TINY = dict(output_dims=8, hidden_dims=8, tcn_depth=0, n_layers=1, trend_kernel_cap=2,
+            batch_size=4, moco_k=8, device="cpu")
 
 
 def config(dataset):
@@ -156,6 +160,136 @@ class BackboneRegistry(unittest.TestCase):
                 build_backbone("mamba", width=8, output_dims=16, seq_len=28, n_layers=2)
         else:
             self.skipTest("mamba-ssm is installed; its CUDA path is checked on the cluster")
+
+
+class ReadoutContract(unittest.TestCase):
+    """The three levels of the architecture contract, and the band/readout consistency.
+
+    (a) backbone      -> (B, T, output_dims)
+    (b) two branches  -> V^T, V^S each (B, T, output_dims/2)
+    (c) frozen vector -> one readout of those sequences
+
+    The FFT acts on the time axis only; the channel count is set by the learned complex map
+    inside each band, not by the transform. Amplitude and phase are read from the same V^S,
+    so they are two views of one branch, not two encoders.
+    """
+
+    def geometry(self, dataset, channels, seq_len, bins_per_day, **over):
+        cfg = {**config(dataset)["model"], "model_seed": 1, **over}
+        return DSSL(channels, seq_len, bins_per_day, device="cpu", **cfg)
+
+    def test_three_levels_have_the_dimensions_the_method_section_claims(self):
+        for dataset, ch, T, bpd in (("hrd", 4, 672, 96), ("globem", 14, 112, 4)):
+            with self.subTest(dataset=dataset):
+                m = self.geometry(dataset, ch, T, bpd)
+                n = m.net
+                x = torch.randn(2, T, ch)
+                z = n.feature_extractor(n.temporal_encoding(n.input_fc(x)))
+                self.assertEqual(tuple(z.shape), (2, T, 320))
+                trend, season = n(x)
+                self.assertEqual(tuple(trend.shape), (2, T, 160))
+                self.assertEqual(tuple(season.shape), (2, T, 160))
+                self.assertEqual(n.trend_dims + n.seasonal_dims, 320)
+
+    def test_band_support_is_geometry_only_and_flags_unreadable_bands(self):
+        # HRD: every band is read at some readout bin; GLOBEM's second band is not, because
+        # its harmonic is the Nyquist bin, which spectral_freqs excludes by design.
+        hrd = self.geometry("hrd", 4, 672, 96)
+        mask, report = band_support(hrd.net)
+        self.assertEqual((report["supported"], report["total"]), (200, 800))
+        self.assertEqual(report["bands_never_read"], [])
+        self.assertEqual(mask.shape, (len(spectral_freqs(672, 96, 4)), 160))
+
+        globem = self.geometry("globem", 14, 112, 4)
+        _, report = band_support(globem.net)
+        self.assertEqual((report["supported"], report["total"]), (160, 320))
+        self.assertEqual(report["bands_never_read"], [[42, 57]])
+        self.assertNotIn(56, spectral_freqs(112, 4, 4))     # Nyquist for T=112
+
+    def test_banded_readout_keeps_exactly_the_supported_coordinates(self):
+        for dataset, ch, T, bpd, expected in (("hrd", 4, 672, 96, 560),
+                                              ("globem", 14, 112, 4, 480)):
+            with self.subTest(dataset=dataset):
+                full = self.geometry(dataset, ch, T, bpd, band_readout=False)
+                band = self.geometry(dataset, ch, T, bpd, band_readout=True)
+                band.net.load_state_dict(full.net.state_dict())
+                mask, _ = band_support(full.net)
+                keep = band_keep(band.net).numpy()
+                np.testing.assert_array_equal(keep, np.flatnonzero(mask.reshape(-1)))
+                self.assertTrue((np.diff(keep) > 0).all())      # bin-major, strictly sorted
+
+                x = np.random.default_rng(0).normal(size=(4, T, ch)).astype(np.float32)
+                a, b = full.encode(x, parts=True), band.encode(x, parts=True)
+                self.assertEqual(b["full"].shape[1], expected)
+                # the banded vector is the full one restricted to those columns, exactly
+                np.testing.assert_array_equal(a["amp"][:, keep], b["amp"])
+                np.testing.assert_array_equal(a["phase"][:, keep], b["phase"])
+                np.testing.assert_array_equal(a["trend"], b["trend"])
+                # blocks() must tile the vector with no gap or overlap
+                edges = sorted(band.blocks().values())
+                self.assertEqual(edges[0][0], 0)
+                self.assertEqual(edges[-1][1], b["full"].shape[1])
+                self.assertTrue(all(edges[i][1] == edges[i + 1][0] for i in range(len(edges) - 1)))
+
+    def test_column_order_does_not_depend_on_seed_and_pairs_stay_aligned(self):
+        a = self.geometry("hrd", 4, 672, 96, band_readout=True, model_seed=1)
+        b = self.geometry("hrd", 4, 672, 96, band_readout=True, model_seed=99)
+        self.assertTrue(torch.equal(band_keep(a.net), band_keep(b.net)))
+        circular = self.geometry("hrd", 4, 672, 96, band_readout=True, phase_readout="circular")
+        start, width = circular.pair_block()
+        amp = circular.blocks()["amplitude"]
+        self.assertEqual(width, amp[1] - amp[0])            # one (cos, sin) pair per amplitude
+        self.assertEqual(start, amp[1])
+        self.assertEqual(circular.blocks()["phase"], (start, start + 2 * width))
+
+    def test_unsupported_coordinates_are_numerical_zero_not_signal(self):
+        """The defect this audit reproduces: coordinates with no band support are at the
+        float32 floor, and per-column standardisation rescales that floor to unit variance."""
+        m = self.geometry("hrd", 4, 672, 96)
+        m.net.eval()                                          # encode() uses eval; dropout off
+        mask, _ = band_support(m.net)
+        x = np.random.default_rng(0).normal(size=(32, 672, 4)).astype(np.float32)
+        parts = m.encode(x, parts=True)
+        flat = mask.reshape(-1)
+        amp_sd = parts["amp"].std(0)
+        self.assertGreater(np.median(amp_sd[flat]), 1e-2)      # supported columns carry signal
+        self.assertLess(np.median(amp_sd[~flat]), 1e-5)        # unsupported ones do not
+        # phase of a ~zero coefficient is not constant, it is atan2 of noise: it varies, but
+        # orders of magnitude below a real phase, so it survives as an apparently live feature.
+        pha_sd = parts["phase"].std(0)
+        self.assertGreater(np.median(pha_sd[flat]), 1.0)
+        self.assertLess(np.median(pha_sd[~flat]), 1e-3)
+        scaled = StandardScaler().fit_transform(parts["amp"])
+        self.assertAlmostEqual(float(np.median(scaled[:, ~flat].std(0))), 1.0, places=3)
+
+    def test_seasonal_loss_is_scale_invariant_while_the_readout_is_not(self):
+        """The objective L2-normalises V^S, so it cannot constrain absolute amplitude; the
+        readout does not normalise, so amplitude survives there. Both are true at once."""
+        m = self.geometry("hrd", 4, 672, 96)
+        m.net.eval()
+        with torch.no_grad():
+            _, season = m.net(torch.randn(8, 672, 4))
+        losses, amps = [], []
+        for c in (1.0, 4.0):
+            scaled = season * c
+            amp_term, phase_term = O.seasonal_loss(scaled, scaled.roll(1, 0),
+                                                   O.CONTRACTED, "circular_amp")
+            losses.append(float(amp_term + phase_term))
+            a, _ = spectral_readout(scaled, 96, "angle", 4)
+            amps.append(float(a.mean()))
+        self.assertAlmostEqual(losses[0], losses[1], places=5)   # invariant
+        self.assertGreater(amps[1], 3 * amps[0])                 # equivariant
+
+    def test_both_views_carry_gradient_but_only_through_the_query_encoder(self):
+        m = DSSL(2, 28, 4, model_seed=1, **TINY)
+        xq = torch.randn(4, 28, 2, requires_grad=True)
+        xk = torch.randn(4, 28, 2, requires_grad=True)
+        m.cost.train()
+        m.cost(xq, xk, update=False).backward()
+        self.assertGreater(float(xq.grad.norm()), 0)
+        # the key view reaches the loss through the seasonal term, which uses encoder_q
+        self.assertGreater(float(xk.grad.norm()), 0)
+        self.assertFalse(any(p.requires_grad for p in m.cost.encoder_k.parameters()))
 
 
 if __name__ == "__main__":
