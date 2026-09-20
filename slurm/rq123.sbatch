@@ -29,9 +29,9 @@ extra=()
 [ -n "${ENCODING:-}" ] && extra+=(--temporal-encoding "$ENCODING")
 [ "${STAGE:-variant}" = reference ] && extra+=(--reference)
 [ -n "${CONFIG:-}" ] && extra+=(--config "$CONFIG")
-# SKIP_REFERENCE with a NEW run name: without this the 15 variant tasks would each try to train
-# the reference and collide on its lock. With an existing run name the reference is cached, and
-# submit.sh's SKIP_REFERENCE just avoids resubmitting that stage.
+# SKIP_REFERENCE: reuse the cached reference instead of retraining it. The rung stays in the
+# ladder; the task just refuses to train a second copy, and errors if the cache is absent. Set it
+# for every variant array submitted after the reference stage has already run for this run name.
 [ -n "${SKIP_REFERENCE:-}" ] && [ "${STAGE:-variant}" != reference ] && extra+=(--skip-reference)
 # DEV_COHORT: architecture development inside locked fold 0's training participants.
 [ -n "${DEV_COHORT:-}" ] && extra+=(--dev-cohort)

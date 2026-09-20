@@ -97,10 +97,10 @@ def parse_args():
                              'machinery inside it. Fold 0 test participants are never seen and the '
                              'locked evaluation is untouched')
     parser.add_argument('--skip-reference', action='store_true',
-                        help='ABLATIONS ONLY: evaluate without the CoST reference rung, which '
-                             'otherwise costs a second full training per task. The scientific '
-                             'matrix always includes it; a run started this way is not comparable '
-                             'to one that has it')
+                        help='reuse the cached CoST reference for this seed x fold instead of '
+                             'training one here, and fail if it is missing. Use it for every '
+                             'variant array after the reference stage has run: the rung stays in '
+                             'the ladder, but no task spends a second full training on it')
     parser.add_argument('--smoke', action='store_true')
     parser.add_argument('--summarize', action='store_true')
     parser.add_argument('--device', choices=['cpu', 'cuda'], default='cuda')
@@ -191,9 +191,14 @@ def train_encoder(kwargs, label, out, data, steps):
     return features, rows, (model.blocks(), model.pair_block())
 
 
-def cost_reference(base, common, model_cfg, data, steps, device):
+def cost_reference(base, common, model_cfg, data, steps, device, cached_only=False):
     """The CoST reference adapter for this seed x fold: loaded when a matching complete copy
-    exists, otherwise trained here under an exclusive lock and cached for every variant."""
+    exists, otherwise trained here under an exclusive lock and cached for every variant.
+
+    `cached_only` requires the cached copy and refuses to train one. That is what a variant
+    array wants when the reference stage was already run: every task reuses the same rung
+    instead of racing to retrain it, and a missing cache is an error rather than a silently
+    shorter baseline ladder."""
     out = base / 'cost_reference' / f"seed_{common['seed']}" / f"fold_{common['fold']['fold']}"
     shared = {k: model_cfg[k] for k in REFERENCE_SHARED if k in model_cfg}
     kwargs = dict(input_dims=data['n_sensors'], seq_len=data['seq_len'],
@@ -212,6 +217,10 @@ def cost_reference(base, common, model_cfg, data, steps, device):
         layout = json.loads((out / 'reference.json').read_text())
         return (stored['cost_reference_adapter'], rows,
                 (layout['blocks'], tuple(layout['pair_block']) if layout['pair_block'] else None))
+    if cached_only:
+        raise FileNotFoundError(
+            f'--skip-reference requires the cached CoST reference, which is missing: {out}. '
+            f'Run the reference stage for this run name first.')
     out.mkdir(parents=True, exist_ok=True)
     lock = out / '.lock'
     try:
@@ -334,8 +343,8 @@ def main():
                   dev_cohort=args.dev_cohort)
     if args.skip_reference and args.reference:
         raise ValueError('--reference trains only the reference; --skip-reference omits it')
-    reference = None if args.skip_reference else cost_reference(base, common, model_cfg, data,
-                                                                steps, args.device)
+    reference = cost_reference(base, common, model_cfg, data, steps, args.device,
+                               cached_only=args.skip_reference)
     if args.reference:
         print(f"CoST reference ready: {base / 'cost_reference'}")
         return
