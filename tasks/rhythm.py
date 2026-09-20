@@ -133,11 +133,28 @@ def personal_baseline(V, pids, R, tdays=None, max_span=None):
     return mu, sd, ok
 
 
-def dscore(V, mu, sd):
+def dscore(V, mu, sd, pair=None):
     """Standardised Euclidean distance to the personal baseline: each dimension divided by
     its own within-person SD, then a plain Euclidean norm. Not Mahalanobis -- there is no
-    inverse covariance, so correlated dimensions are counted once each."""
-    return np.sqrt((((V - mu) / sd) ** 2).mean(1))
+    inverse covariance, so correlated dimensions are counted once each.
+
+    `pair` is (start, width) of a circular phase readout's (cos, sin) columns, as
+    `DSSL.pair_block()` reports them. Those two columns are one point on a unit circle, so
+    scaling them by different standard deviations turns the circle into an ellipse and the
+    distance stops being monotone in the angular gap. Given `pair`, each cos/sin column pair
+    instead shares the RMS of its two standard deviations, which is a uniform scaling and
+    keeps the geometry. This mirrors `IsotropicPairScaler` in the downstream probe; without
+    it the two consumers of the same representation would disagree about its geometry.
+    """
+    scale = np.asarray(sd, dtype=float).copy()
+    if pair is not None:
+        start, width = pair
+        cos = slice(start, start + width)
+        sin = slice(start + width, start + 2 * width)
+        shared = np.sqrt((scale[..., cos] ** 2 + scale[..., sin] ** 2) / 2)
+        scale[..., cos] = shared
+        scale[..., sin] = shared
+    return np.sqrt((((V - mu) / scale) ** 2).mean(1))
 
 
 def raw_deviation(Zw, zbar):

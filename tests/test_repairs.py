@@ -19,7 +19,8 @@ from data_processing.globem_dataset import _to_binary_label, _prep_participant, 
 from evaluation_protocol import logistic_probe, participant_mean
 from tasks.projection import RawProjection
 from tasks.rhythm import (personal_baseline, phase_shift, resolve_phase_levels,
-                          window_start_days, amplitude_scale, cosinor_z, individual_markers)
+                          window_start_days, amplitude_scale, cosinor_z, individual_markers,
+                          dscore)
 from utils import paired_auc_interval
 
 ROOT = Path(__file__).resolve().parents[1]
@@ -244,6 +245,74 @@ class EvaluationRepairs(unittest.TestCase):
                 y_train = np.array([y[pids == p][0] for p in train])
                 probe = logistic_probe(1.0, 3).fit(z_train, y_train)
                 self.assertEqual(probe.predict_proba(z_test).shape, (4, 2))
+
+
+class CircularPhaseGeometry(unittest.TestCase):
+    """Phase is an angle. Linear averaging, subtraction and per-column scaling of a raw angle
+    are wrong across the midnight wrap, and the error is largest exactly for the late-phase
+    participants that a depression study cares about.
+
+    A (cos, sin) readout makes the linear operations correct, because the linear mean of unit
+    vectors is the resultant whose angle is the circular mean, and Euclidean distance on the
+    circle is monotone in the angular gap -- provided the two columns keep one shared scale.
+    """
+
+    def test_linear_mean_of_raw_angles_breaks_at_the_wrap(self):
+        # Two windows two minutes either side of midnight: 0.03 rad apart on the circle.
+        angles = np.array([np.pi - 0.015, -np.pi + 0.015])
+        circular = np.angle(np.exp(1j * angles).mean())
+        self.assertAlmostEqual(abs(circular), np.pi, places=2)   # correct: near the wrap
+        self.assertAlmostEqual(angles.mean(), 0.0, places=6)     # linear: 12 h away
+        gap = abs((angles.mean() - circular + np.pi) % (2 * np.pi) - np.pi)
+        self.assertGreater(gap * 24 / (2 * np.pi), 11.0)         # ~12 h of error
+
+    def test_circular_readout_makes_participant_mean_correct(self):
+        angles = np.array([np.pi - 0.015, -np.pi + 0.015])
+        pairs = np.column_stack([np.cos(angles), np.sin(angles)])
+        pooled = participant_mean(pairs, np.array(["p", "p"]), ["p"])[0]
+        recovered = np.arctan2(pooled[1], pooled[0])
+        circular = np.angle(np.exp(1j * angles).mean())
+        self.assertAlmostEqual(recovered, circular, places=6)
+
+    def test_dscore_keeps_the_circle_a_circle_only_when_pair_aware(self):
+        # One pair of columns, cos varying widely and sin barely: per-column scaling would
+        # stretch the circle, so two points at equal angular distance would score unequally.
+        rng = np.random.default_rng(0)
+        base = rng.normal(size=(64, 2)) * np.array([1.0, 0.05])
+        sd = base.std(0) + 1e-6
+        mu = np.zeros(2)
+        theta = 0.6
+        a = np.array([[np.cos(theta), np.sin(theta)]])
+        b = np.array([[np.cos(-theta), np.sin(-theta)]])
+        naive = (dscore(a, mu, sd)[0], dscore(b, mu, sd)[0])
+        aware = (dscore(a, mu, sd, pair=(0, 1))[0], dscore(b, mu, sd, pair=(0, 1))[0])
+        self.assertAlmostEqual(aware[0], aware[1], places=12)     # symmetric, as it must be
+        self.assertAlmostEqual(naive[0], naive[1], places=12)     # symmetric here too, but...
+        # ...the pair-aware version uses one shared scale, so the two columns are comparable.
+        shared = np.sqrt((sd[0] ** 2 + sd[1] ** 2) / 2)
+        self.assertNotAlmostEqual(sd[0], sd[1], places=2)
+        expected = np.sqrt((((a - mu) / shared) ** 2).mean(1))[0]
+        self.assertAlmostEqual(aware[0], expected, places=12)
+        self.assertNotAlmostEqual(naive[0], expected, places=3)
+
+    def test_rq2_distance_is_rotation_invariant_under_a_circular_readout(self):
+        """Rotating every window of a participant by the same angle is a change of origin,
+        not of within-person deviation, so the personal-baseline distance must not move."""
+        rng = np.random.default_rng(1)
+        angles = rng.uniform(-np.pi, np.pi, size=(12, 3))
+        pids = np.array(["p"] * 12)
+        tdays = np.arange(12, dtype=float) * 7.0
+        for shift in (0.0, 2.5):
+            pairs = np.concatenate([np.cos(angles + shift), np.sin(angles + shift)], axis=1)
+            mu, sd, ok = personal_baseline(pairs, pids, 4, tdays, max_span=21.0)
+            d = dscore(pairs, mu, sd, pair=(0, 3))
+            if shift == 0.0:
+                reference = d[ok]
+            else:
+                # Tolerance is set by the +1e-6 floor personal_baseline adds to each SD,
+                # which rotates with the data; the invariance itself is exact.
+                np.testing.assert_allclose(d[ok], reference, rtol=1e-5, atol=1e-6)
+        self.assertTrue(ok.any())
 
 
 if __name__ == "__main__":

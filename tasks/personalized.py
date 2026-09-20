@@ -16,6 +16,10 @@ def _reference(model, X, physical_X, pids, window_ids, test_ids, bins_per_day):
     """Freeze four preceding contiguous weeks in representation and raw rhythm space."""
     tdays = window_start_days(window_ids)
     representations = model.encode(X, parts=False, batch_size=16)
+    # A circular phase readout stores (cos, sin) pairs; dscore must scale each pair
+    # uniformly or the unit circle becomes an ellipse. None for the angle readout, and for
+    # controls such as the random projection, whose features have no circular structure.
+    pair = model.pair_block() if hasattr(model, "pair_block") else None
     # personal_baseline checks all four reference-to-current gaps are exactly seven days.
     mu, sd, eligible = personal_baseline(
         representations, pids, BASELINE_WEEKS, tdays,
@@ -27,7 +31,7 @@ def _reference(model, X, physical_X, pids, window_ids, test_ids, bins_per_day):
         for j in range(BASELINE_WEEKS, len(idx)):
             zbar[idx[j]] = z[idx[j-BASELINE_WEEKS:j]].mean(0)
     eligible &= np.isin(pids, test_ids)
-    return dict(mu=mu, sd=sd, d0=dscore(representations, mu, sd), z=z,
+    return dict(mu=mu, sd=sd, pair=pair, d0=dscore(representations, mu, sd, pair), z=z,
                 zbar=zbar, g0=raw_deviation(z, zbar), eligible=eligible)
 
 
@@ -51,7 +55,8 @@ def personalized_records(model, method, X, physical_X, pids, window_ids, test_id
     for hours in levels:
         changed = phase_shift(X, hours, X.shape[-1], bin_minutes)
         physical_changed = phase_shift(physical_X, hours, physical_X.shape[-1], bin_minutes)
-        d = dscore(model.encode(changed, parts=False, batch_size=16), ref["mu"], ref["sd"])
+        d = dscore(model.encode(changed, parts=False, batch_size=16),
+                   ref["mu"], ref["sd"], ref["pair"])
         g = raw_deviation(cosinor_z(physical_changed, bins_per_day), ref["zbar"])
         for i in np.flatnonzero(ref["eligible"] & np.isfinite(d) & np.isfinite(g)):
             rows.append(dict(method=method, participant=str(pids[i]), window_id=str(window_ids[i]),
@@ -63,8 +68,10 @@ def personalized_records(model, method, X, physical_X, pids, window_ids, test_id
         high = amplitude_scale(X, 1.0+fraction, X.shape[-1], bins_per_day)
         physical_low = amplitude_scale(physical_X, 1.0-fraction, physical_X.shape[-1], bins_per_day)
         physical_high = amplitude_scale(physical_X, 1.0+fraction, physical_X.shape[-1], bins_per_day)
-        d_low = dscore(model.encode(low, parts=False, batch_size=16), ref["mu"], ref["sd"])
-        d_high = dscore(model.encode(high, parts=False, batch_size=16), ref["mu"], ref["sd"])
+        d_low = dscore(model.encode(low, parts=False, batch_size=16),
+                       ref["mu"], ref["sd"], ref["pair"])
+        d_high = dscore(model.encode(high, parts=False, batch_size=16),
+                        ref["mu"], ref["sd"], ref["pair"])
         g_low = raw_deviation(cosinor_z(physical_low, bins_per_day), ref["zbar"])
         g_high = raw_deviation(cosinor_z(physical_high, bins_per_day), ref["zbar"])
         for i in np.flatnonzero(ref["eligible"] & np.isfinite(d_low) & np.isfinite(d_high)):
