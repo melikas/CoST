@@ -20,10 +20,12 @@ set -euo pipefail
 : "${DATASET:?Export DATASET=hrd or globem when submitting}"
 RUN_NAME="${RUN_NAME:-narval_v2}"
 case "$DATASET" in hrd|globem) ;; *) echo 'Invalid DATASET' >&2; exit 2;; esac
+# FOLDS: folds per seed, as in the config (5; 4 for GLOBEM leave-one-year-out). Tasks = 3 x FOLDS.
+folds=${FOLDS:-5}
 task=${SLURM_ARRAY_TASK_ID:?}
-if (( task < 0 || task >= 15 )); then exit 2; fi
-seed=$((task / 5 + 1))
-fold=$((task % 5))
+if (( task < 0 || task >= 3 * folds )); then exit 2; fi
+seed=$((task / folds + 1))
+fold=$((task % folds))
 extra=()
 [ -n "${BACKBONE:-}" ] && extra+=(--backbone "$BACKBONE")
 [ -n "${ENCODING:-}" ] && extra+=(--temporal-encoding "$ENCODING")

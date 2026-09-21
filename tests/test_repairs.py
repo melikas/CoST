@@ -11,7 +11,7 @@ import pandas as pd
 import torch
 
 from cost import DSSL, spectral_freqs
-from datautils import load_npz, make_folds
+from datautils import load_npz, make_folds, make_year_folds
 from data_processing.hrd_clean import _interpolate_short_gaps, _minute_grid, iter_hrd
 from data_processing.hrd_config import CHANNELS
 from data_processing.hrd_windows import _window_participant
@@ -245,6 +245,26 @@ class EvaluationRepairs(unittest.TestCase):
                 y_train = np.array([y[pids == p][0] for p in train])
                 probe = logistic_probe(1.0, 3).fit(z_train, y_train)
                 self.assertEqual(probe.predict_proba(z_test).shape, (4, 2))
+
+
+class YearFolds(unittest.TestCase):
+    def test_each_year_is_held_out_once_and_never_trained_on(self):
+        pids = np.array([f"p{i}" for i in range(40)])
+        labels = (np.arange(40) // 4) % 2
+        years = {p: str(2018 + i % 4) for i, p in enumerate(pids)}
+        folds = make_year_folds(pids, labels, years, 20260914)
+        self.assertEqual([f.heldout_year for f in folds], ["2018", "2019", "2020", "2021"])
+        for f in folds:
+            self.assertEqual({years[p] for p in f.test_pids}, {f.heldout_year})
+            self.assertNotIn(f.heldout_year, {years[p] for p in f.train_pids})
+        self.assertEqual(sorted(p for f in folds for p in f.test_pids), sorted(pids))
+
+    def test_year_without_both_classes_is_refused(self):
+        pids = np.array([f"p{i}" for i in range(8)])
+        labels = np.array([0, 1, 0, 1, 0, 0, 0, 0])
+        years = {p: "2018" if i < 4 else "2019" for i, p in enumerate(pids)}
+        with self.assertRaises(ValueError):
+            make_year_folds(pids, labels, years, 1)
 
 
 class CircularPhaseGeometry(unittest.TestCase):

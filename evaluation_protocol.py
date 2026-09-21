@@ -574,6 +574,11 @@ def summarize(root, seeds, folds, smoke=False):
                                           difference=r['mean_auc_difference'], low=r['ci95'][0], high=r['ci95'][1]))
     table = pd.DataFrame(rows)
     table.to_csv(root/'summary_by_seed.csv', index=False)
+    # Per held-out fold (for leave-one-year-out: per year), as the GLOBEM benchmark reports it.
+    pd.DataFrame([dict(probe=pr, method=m, seed=sd, fold=f, n=len(g), positives=int(g.label.sum()),
+                       auroc=roc_auc_score(g.label, g.probability))
+                  for (pr, m, sd, f), g in pred.groupby(['probe', 'method', 'seed', 'fold'])
+                  if g.label.nunique() == 2]).to_csv(root/'rq3_by_fold.csv', index=False)
     rq3_intervals = pd.DataFrame(rq3_intervals, columns=['probe','control','n','difference','low','high'])
     rq3_intervals.to_csv(root/'rq3_paired_intervals.csv', index=False)
     # ---- RQ1: paired per-person errors; phase is combined geometrically, not scored as two angles.

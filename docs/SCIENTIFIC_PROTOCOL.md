@@ -115,6 +115,28 @@ The canonical configuration is `configs/hrd.json` and `configs/globem.json`; the
 per dataset. `REPORT_TO_PROFESSOR.md` gives the full specification and the evidence for both
 changes; `FAILED_EXPERIMENTS.md` sections 4 and 6 give the rejected alternatives.
 
+## GLOBEM split amendment, 2026-09-21 (investigator decision, after the 2018-only narval_v2 run)
+
+The primary GLOBEM evaluation becomes **leave-one-year-out** over all four cohorts
+(`configs/globem_loyo.json`, `split: "year"`, 4 folds × 3 seeds). Each fold holds out one study
+year. That year's windows, including its unlabelled participants, are excluded from pretraining,
+from the RQ1 ridge, from the RQ3 probe and from the reference encoder. Training uses the other three
+years. Held-out sizes (labelled / positive): 2018 142/51, 2019 203/87, 2020 135/55, 2021 189/76.
+Model, objective, budget, metrics, probes, thresholds and baselines are unchanged.
+
+- **Why:** the 2018-only analysis used 155 of 702 participant-years. It answers the question "do
+  new people from the same cohort generalise?". The investigator's question is cross-year
+  generalisation, which is also GLOBEM's own benchmark protocol.
+- **Known limitation, not fixed:** identifiers are participant-years. The release links no person
+  across years, and about 205 participant-years belong to people who also appear in another year
+  (702 identifiers vs. about 497 people). A returning student can therefore sit on both sides of a
+  fold. These folds are year-disjoint, not person-disjoint, and results must be reported that way.
+- **Status of the earlier result:** this decision was taken after the 2018-only narval_v2 results
+  were seen. That analysis (`configs/globem.json`) is retained unchanged as the person-disjoint
+  secondary analysis, and its numbers are not replaced or re-selected.
+- **Reporting:** RQ3 is pooled out-of-fold as before. `rq3_by_fold.csv` adds the AUROC for each
+  held-out year.
+
 ## Preservation
 
 Before repairs, 80 current source/manuscript/note files and the root staged/unstaged patches were preserved in `archive/rescue_20260914/before_repairs.zip`; `manifest.json` records source hashes. Raw datasets, historical result directories, caches and checkpoints remain intact. Git retains the reference and older model implementations.

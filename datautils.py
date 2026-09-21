@@ -271,6 +271,31 @@ def make_folds(pids, labels, n_folds=10, n_repeats=3, master_seed=20260906):
     return out
 
 
+def make_year_folds(pids, labels, years, master_seed):
+    """Leave-one-year-out: fold k holds out every participant of the k-th study year and trains on
+    the labelled participants of all other years, as in the GLOBEM cross-year benchmark.
+
+    Identifiers are participant-years. A student enrolled in two years has two unlinked
+    identifiers, so these folds are year-disjoint, not verified person-disjoint."""
+    pids, labels = np.asarray(pids), np.asarray(labels)
+    if len(set(pids.tolist())) != len(pids):
+        raise ValueError("make_year_folds expects one row per participant, not per window")
+    _, rng_model, rng_probe = _streams(master_seed)
+    of = np.array([years[p] for p in pids])
+    out = []
+    for f, year in enumerate(sorted(set(of))):
+        te, tr = of == year, of != year
+        if len(np.unique(labels[te])) < 2 or len(np.unique(labels[tr])) < 2:
+            raise ValueError(f"held-out year {year} needs both classes on each side")
+        out.append(Fold(repeat=0, fold=f, split_seed=master_seed,
+                        model_seed=int(rng_model.integers(1, 2 ** 31 - 1)),
+                        probe_seed=int(rng_probe.integers(1, 2 ** 31 - 1)),
+                        test_pids=tuple(pids[te].tolist()), train_pids=tuple(pids[tr].tolist()),
+                        heldout_year=year))
+    _assert_decoupled(out)
+    return out
+
+
 def _assert_decoupled(folds):
     """The invariant DECISION 3 asked for, enforced rather than documented."""
     for f in folds:

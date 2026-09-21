@@ -26,7 +26,7 @@ import numpy as np
 import pandas as pd
 import torch
 from cost import DSSL, band_support, REFERENCE_SHARED, exact_numerics
-from datautils import load_npz, make_folds
+from datautils import load_npz, make_folds, make_year_folds
 from evaluation_protocol import disentanglement, evaluate, summarize, write_json
 from tasks.personalized import personalized_records
 from tasks.projection import RawProjection
@@ -253,8 +253,11 @@ def main():
     variant = f"{model_cfg['backbone']}_{model_cfg['temporal_encoding']}"
     base = ROOT / 'results' / args.dataset / (f'{args.run_name}_smoke_{args.device}'
                                               if args.smoke else args.run_name)
+    by_year = cfg.get('split') == 'year'
+    if by_year and args.dataset != 'globem':
+        raise ValueError('split=year needs study years; only GLOBEM has them')
     seeds = [1] if args.smoke else cfg['seeds']
-    folds = 2 if args.smoke else cfg['folds']
+    folds = 2 if args.smoke and not by_year else cfg['folds']
     if args.summarize:
         summarize(base / variant, seeds, folds, smoke=args.smoke)
         return
@@ -274,7 +277,13 @@ def main():
     ids, y = c.participants()
     eligible = np.ones(len(c.X), dtype=bool)
     year = None
-    if args.dataset == 'globem':
+    if by_year:
+        # Leave-one-year-out over every cohort. Identifiers are participant-years with no
+        # cross-year person link, so a returning student may sit on both sides of a fold.
+        years = c.participant_years()
+        if len(set(years.values())) != folds:
+            raise ValueError(f"config folds={folds} but the cache has {len(set(years.values()))} years")
+    elif args.dataset == 'globem':
         # No cross-year identity linkage exists. A single cohort prevents that leakage.
         years = c.participant_years()
         year = min(years.values())
@@ -309,18 +318,25 @@ def main():
         blocks = {p: smoke_block(p) for p in ids}
         coverage = np.array([c.observed[blocks[p]].mean((0, 1)).min() if len(blocks[p]) else -1
                              for p in ids])
-        selected = np.concatenate([np.flatnonzero(y == label)[np.argsort(-coverage[y == label],
-                                                                         kind='stable')[:6]]
-                                   for label in (0, 1)])
+        # Year folds need both classes in every year, so the smoke subset is drawn per year.
+        groups = ([np.array([years[p] == v for p in ids]) for v in sorted(set(years.values()))]
+                  if by_year else [np.ones(len(ids), bool)])
+        selected = np.concatenate([np.flatnonzero(g & (y == label))[
+                                       np.argsort(-coverage[g & (y == label)], kind='stable')[:2 if by_year else 6]]
+                                   for g in groups for label in (0, 1)])
         if args.dataset == 'hrd' and any(len(blocks[ids[i]]) < 6 for i in selected):
             raise ValueError('Smoke subset lacks six contiguous weeks for personalized RQ2')
         ids, y = ids[selected], y[selected]
         eligible &= np.isin(c.pids, ids)
-    fold = make_folds(ids, y, n_folds=folds, n_repeats=1, master_seed=cfg['split_seed'])[args.fold]
+    fold = (make_year_folds(ids, y, years, cfg['split_seed']) if by_year else
+            make_folds(ids, y, n_folds=folds, n_repeats=1, master_seed=cfg['split_seed']))[args.fold]
     used = np.concatenate([blocks[p] for p in ids]) if args.smoke else np.flatnonzero(eligible)
     raw, obs, pids, labels = c.raw_X[used], c.observed[used], c.pids[used], c.y[used]
     window_ids = np.asarray(c.window_ids[used])
     training = ~np.isin(pids, fold.test_pids)
+    if by_year:
+        # The whole held-out year leaves training, its unlabelled participants included.
+        training &= np.array([years[p] != fold.heldout_year for p in pids])
     if set(pids[training]) & set(fold.test_pids):
         raise AssertionError('Participant leakage')
     X, normalization = normalize(cfg['normalization'], c, used, raw, obs, pids, training)
@@ -364,7 +380,9 @@ def main():
                                   **{name: __import__('importlib.metadata', fromlist=['version']).version(name)
                                      for name in ['scipy', 'scikit-learn', 'pandas', 'matplotlib',
                                                   'CosinorPy', 'statsmodels', 'seaborn', 'joblib']}),
-                    scientific_scope='retrospective endpoint; GLOBEM first cohort only; no prospective or cross-year claim')
+                    scientific_scope=('retrospective endpoint; GLOBEM leave-one-year-out; year-disjoint, '
+                                      'cross-year person overlap unresolved' if by_year else
+                                      'retrospective endpoint; GLOBEM first cohort only; no prospective or cross-year claim'))
     if (out / 'manifest.json').exists():
         if json.loads((out / 'manifest.json').read_text()) != manifest:
             raise ValueError(f'Existing manifest differs: preserve it and use a new version directory: {out}')
