@@ -178,7 +178,7 @@ RQ3_METHODS = [("dssl", "DSSL (proposed)", BLUE), ("raw", "Raw window", ORANGE),
                ("handcrafted", "Handcrafted rhythm", NEUTRAL),
                ("nonparametric", "Nonparametric (IS, IV, RA)", NEUTRAL),
                ("random_projection", "Random projection", NEUTRAL),
-               ("cost_reference_adapter", "CoST, unmodified", NEUTRAL),
+               ("cost_reference_adapter", "CoST", NEUTRAL),
                ("pca", "PCA", NEUTRAL)]
 
 
