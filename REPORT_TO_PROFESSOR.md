@@ -193,12 +193,12 @@ an absent screen event as an unknown to be interpolated would fabricate phone us
 
 | Property | Value |
 |---|---|
-| Participants | 142 |
+| Participants | 155 (142 labelled), 2018 cohort only; the full release has 702 participant-years (669 labelled; ~497 unique people) across 2018–2021 |
 | Sampling resolution | 4 day-segments per day (6-hour bins) |
 | Window length | 28 days = **112 timesteps** |
 | Window stride | 7 days |
 | Channels | **14** (RAPIDS-derived features: steps, sleep, screen, call-free subset, location) |
-| Cohort policy | Earliest study year only; other years, including unlabelled, excluded |
+| Cohort policy | Earliest study year (2018) only; other years, including unlabelled, excluded, because the release does not link a returning student's identifiers across years, so a pooled split cannot be guaranteed person-disjoint |
 
 GLOBEM's features are sparse (sleep is present only ~33% of the time). Because the encoder's FFT
 layer cannot accept `NaN`, and because the encoder masks a timestep only when *every* channel is
