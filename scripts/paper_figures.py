@@ -88,6 +88,23 @@ RQ2_METHODS = [("dssl", "DSSL", BLUE, "o"), ("cost_reference_adapter", "CoST", A
                ("random_projection", "Random proj.", YELLOW, "^")]
 
 
+
+def always_increase_floor():
+    """Sign agreement of a rule that always predicts that amplification moves a week away from
+    its reference, computed with the same pooled-per-level aggregation as rq2_by_level.csv so it
+    is directly comparable with the plotted curves. The target sign does not depend on alpha,
+    so the value is the same at every level."""
+    import glob
+    per_seed = []
+    for path in sorted(glob.glob(str(ROOT / "results/hrd" / RUN / "seed_*/fold_*/rq2_personalized.csv"))):
+        frame = pd.read_csv(path)
+        frame = frame[(frame.method == "dssl") & (frame.perturbation == "amplitude")
+                      & (frame.raw_delta != 0)]
+        seed = path.replace("\\", "/").split("/seed_")[1].split("/")[0]
+        per_seed.append(frame.assign(seed=seed))
+    rows = pd.concat(per_seed, ignore_index=True)
+    return float(rows.groupby("seed").raw_delta.apply(lambda d: (d > 0).mean()).mean())
+
 def figure_rq2():
     fig = plt.figure(figsize=(6.6, 4.1))
     grid = fig.add_gridspec(2, 2, height_ratios=[1, 1.35], hspace=0.62, wspace=0.28)
@@ -115,9 +132,11 @@ def figure_rq2():
                   borderaxespad=0.0)
 
     levels = pd.read_csv(ROOT / "results/hrd" / RUN / "rq2_by_level.csv")
-    for col, (pert, xlabel, title) in enumerate((
-            ("phase", "Phase shift (hours)", "Detection of phase shifts"),
-            ("amplitude", r"Amplitude change $\alpha$", "Detection of amplitude changes"))):
+    floor = always_increase_floor()
+    for col, (pert, xlabel, title, ylabel) in enumerate((
+            ("phase", "Phase shift (hours)", "Detection of phase shifts", "Concordance"),
+            ("amplitude", r"Amplitude change $\alpha$", "Detection of amplitude changes",
+             "Sign agreement"))):
         ax = fig.add_subplot(grid[1, col])
         block = levels[levels.perturbation == pert]
         for key, label, colour, marker in RQ2_METHODS:
@@ -126,11 +145,16 @@ def figure_rq2():
             ax.errorbar(m.index, m.values, yerr=sd.values, color=colour, marker=marker,
                         markersize=4.5, linewidth=1.6, capsize=0, elinewidth=1.0,
                         label=label, zorder=3 if key == "dssl" else 2)
-        ax.axhline(0.5, color=INK2, linewidth=0.8, linestyle=(0, (3, 2)))
-        ax.text(ax.get_xlim()[0], 0.505, " chance", color=INK2, fontsize=6.8, va="bottom")
+        # The honest reference differs by arm: 0.5 for the rank statistic, but for sign agreement
+        # a rule that always answers "away" already scores the share of weeks moved away.
+        ref, ref_label = (0.5, " chance") if pert == "phase" else (floor, " always-increase rule")
+        ax.axhline(ref, color=INK2, linewidth=0.8, linestyle=(0, (3, 2)))
+        right = pert != "phase"   # amplitude: the open space is on the right, above the floor
+        ax.text(ax.get_xlim()[1 if right else 0], ref + 0.005, ref_label + (" " if right else ""),
+                color=INK2, fontsize=6.8, va="bottom", ha="right" if right else "left")
         ax.set_ylim(0.45, 0.9)
         ax.set_xlabel(xlabel)
-        ax.set_ylabel("Concordance")
+        ax.set_ylabel(ylabel)
         ax.set_title(title, loc="left")
         recessive_grid(ax, "y")
         ax.margins(x=0.08)
@@ -138,8 +162,8 @@ def figure_rq2():
             handles, labels = ax.get_legend_handles_labels()
     fig.legend(handles, labels, frameon=False, loc="upper center", ncol=4,
                bbox_to_anchor=(0.5, 0.02), handlelength=1.8)
-    fig.text(0.0, -0.085, "Points: mean over 3 seeds; bars: seed SD. HRD, 102 (phase) and "
-             "106 (amplitude) participants with a complete four-week reference.",
+    fig.text(0.0, -0.085, "Points: mean over 3 seeds; bars: seed SD. HRD: 102 (phase) and 106 "
+             "(amplitude) participants. All amplitude levels share one target sign per week.",
              color=INK2, fontsize=7)
     fig.savefig(OUT / "rq2_perturbation.pdf")
     plt.close(fig)
