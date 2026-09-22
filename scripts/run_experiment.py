@@ -2,13 +2,16 @@
 
     python scripts/run_experiment.py --dataset hrd --seed 1 --fold 0              # the config's variant
     python scripts/run_experiment.py --dataset hrd --seed 1 --fold 0 --reference  # CoST reference only
+    python scripts/run_experiment.py --dataset hrd --seed 1 --fold 0 --supervised # supervised control only
     python scripts/run_experiment.py --dataset hrd --seed 1 --fold 0 \
         --backbone transformer --temporal-encoding sinusoidal                    # an RQ4 variant
     python scripts/run_experiment.py --dataset hrd --summarize [--backbone ...]
 
-A variant writes results/<dataset>/<run>/<backbone>_<encoding>/seed_<s>/fold_<f>/. The CoST
-reference adapter is trained once per seed x fold into results/<dataset>/<run>/cost_reference/
-and reused by every variant; a variant trains it itself only when it is missing.
+A variant writes results/<dataset>/<run>/<backbone>_<encoding>/seed_<s>/fold_<f>/. Two reference
+encoders are trained once per seed x fold and reused by every variant: the CoST reference adapter
+(results/<dataset>/<run>/cost_reference/) and the supervised control (.../supervised/), which is the
+DSSL encoder trained end to end on the labels of the fold's training participants only. A variant
+trains a reference itself only when it is missing.
 """
 import argparse
 import hashlib
@@ -91,14 +94,16 @@ def parse_args():
     parser.add_argument('--fold', type=int, default=0)
     parser.add_argument('--reference', action='store_true',
                         help='train (or load) only the CoST reference adapter for this seed x fold')
+    parser.add_argument('--supervised', action='store_true',
+                        help='train (or load) only the supervised control for this seed x fold')
     parser.add_argument('--dev-cohort', action='store_true',
                         help='architecture development: restrict every participant to the TRAINING '
                              'set of locked protocol fold 0, then run the normal seed x fold '
                              'machinery inside it. Fold 0 test participants are never seen and the '
                              'locked evaluation is untouched')
     parser.add_argument('--skip-reference', action='store_true',
-                        help='reuse the cached CoST reference for this seed x fold instead of '
-                             'training one here, and fail if it is missing. Use it for every '
+                        help='reuse the cached CoST reference and supervised control for this seed x '
+                             'fold instead of training them here, and fail if either is missing. Use it for every '
                              'variant array after the reference stage has run: the rung stays in '
                              'the ladder, but no task spends a second full training on it')
     parser.add_argument('--smoke', action='store_true')
@@ -165,15 +170,25 @@ def pretext_split(training, val_frac, model_seed):
 
 def train_encoder(kwargs, label, out, data, steps):
     """Fit (resuming from the checkpoint), encode every window, collect RQ2 records, save and
-    re-load the encoder to check the saved weights reproduce the representation."""
+    re-load the encoder to check the saved weights reproduce the representation. A supervised
+    control trains on the labelled training participants' windows only and also saves its
+    head's held-out participant probabilities."""
     X, fit_idx, val_idx = data['X'], data['fit_idx'], data['val_idx']
     model = DSSL(**kwargs)
     checkpoint = out / f'{label}_training.pt'
     if checkpoint.exists():
         model.load_training(checkpoint)
-    model.fit(X[fit_idx], n_iters=steps, val_data=X[val_idx] if len(val_idx) else None,
-              checkpoint_path=checkpoint, checkpoint_every=min(100, steps),
-              log_every=max(1, min(100, steps)))
+    schedule = dict(n_iters=steps, checkpoint_path=checkpoint, checkpoint_every=min(100, steps),
+                    log_every=max(1, min(100, steps)))
+    if model.objective == 'supervised':
+        model.fit(X[data['sup_idx']], labels=data['sup_y'], **schedule)
+        test = np.isin(data['pids'], data['test_ids'])
+        head = pd.DataFrame(dict(participant=data['pids'][test], label=data['labels'][test],
+                                 probability=model.predict_proba(X[test])))
+        head.groupby('participant').mean().reset_index().to_csv(out / f'{label}_head_predictions.csv',
+                                                                index=False)
+    else:
+        model.fit(X[fit_idx], val_data=X[val_idx] if len(val_idx) else None, **schedule)
     features = model.encode(X, batch_size=16)
     rows, _ = personalized_records(model, label, X, data['raw'], data['pids'], data['window_ids'],
                                    data['test_ids'], data['bins_per_day'], data['bin_minutes'])
@@ -191,52 +206,64 @@ def train_encoder(kwargs, label, out, data, steps):
     return features, rows, (model.blocks(), model.pair_block())
 
 
-def cost_reference(base, common, model_cfg, data, steps, device, cached_only=False):
-    """The CoST reference adapter for this seed x fold: loaded when a matching complete copy
-    exists, otherwise trained here under an exclusive lock and cached for every variant.
+# Reference encoders cached per seed x fold: directory name -> method name in every table.
+REFERENCES = {'cost_reference': 'cost_reference_adapter', 'supervised': 'supervised'}
+
+
+def cached_reference(kind, base, common, model_cfg, data, steps, device, cached_only=False):
+    """A reference encoder for this seed x fold: loaded when a matching complete copy exists,
+    otherwise trained here under an exclusive lock and cached for every variant.
+
+    `cost_reference` is upstream CoST behind the shared readout. `supervised` is the DSSL encoder
+    and readout with the variant's own settings, trained end to end on the labels of the fold's
+    training participants: no unlabelled window and no contrastive objective.
 
     `cached_only` requires the cached copy and refuses to train one. That is what a variant
-    array wants when the reference stage was already run: every task reuses the same rung
+    array wants when the reference stages were already run: every task reuses the same rung
     instead of racing to retrain it, and a missing cache is an error rather than a silently
     shorter baseline ladder."""
-    out = base / 'cost_reference' / f"seed_{common['seed']}" / f"fold_{common['fold']['fold']}"
-    shared = {k: model_cfg[k] for k in REFERENCE_SHARED if k in model_cfg}
-    kwargs = dict(input_dims=data['n_sensors'], seq_len=data['seq_len'],
-                  bins_per_day=data['bins_per_day'], method='cost_reference', device=device,
-                  model_seed=common['model_seed'], **shared)
+    label = REFERENCES[kind]
+    out = base / kind / f"seed_{common['seed']}" / f"fold_{common['fold']['fold']}"
+    geometry = dict(input_dims=data['n_sensors'], seq_len=data['seq_len'],
+                    bins_per_day=data['bins_per_day'], device=device, model_seed=common['model_seed'])
+    if kind == 'cost_reference':
+        shared = {k: model_cfg[k] for k in REFERENCE_SHARED if k in model_cfg}
+        kwargs = dict(geometry, method='cost_reference', **shared)
+    else:
+        kwargs = dict(geometry, method='dssl', objective='supervised', **model_cfg)
     config = DSSL(**{**kwargs, 'device': 'cpu'}).config
     manifest = dict(common, resolved_model=config, code_sha256=code_hashes(REFERENCE_SOURCES))
     if (out / 'complete.json').exists():
         if json.loads((out / 'manifest.json').read_text()) != manifest:
-            raise ValueError(f'cached CoST reference differs in data, settings or code: {out}')
+            raise ValueError(f'cached {kind} differs in data, settings or code: {out}')
         stored = np.load(out / 'representations.npz', allow_pickle=True)
         if not np.array_equal(stored['window_ids'].astype(str), np.asarray(data['window_ids']).astype(str)):
-            raise ValueError(f'cached CoST reference covers different windows: {out}')
+            raise ValueError(f'cached {kind} covers different windows: {out}')
         rows = pd.read_csv(out / 'rq2_personalized.csv',
                            dtype={'participant': str, 'window_id': str}).to_dict('records')
         layout = json.loads((out / 'reference.json').read_text())
-        return (stored['cost_reference_adapter'], rows,
+        return (stored[label], rows,
                 (layout['blocks'], tuple(layout['pair_block']) if layout['pair_block'] else None))
     if cached_only:
         raise FileNotFoundError(
-            f'--skip-reference requires the cached CoST reference, which is missing: {out}. '
-            f'Run the reference stage for this run name first.')
+            f'--skip-reference requires the cached {kind}, which is missing: {out}. '
+            f'Run its stage for this run name first.')
     out.mkdir(parents=True, exist_ok=True)
     lock = out / '.lock'
     try:
         handle = os.open(lock, os.O_CREAT | os.O_EXCL | os.O_WRONLY)
     except FileExistsError:
-        raise RuntimeError(f'another task is training the CoST reference ({lock}); submit the '
-                           'reference stage first, and delete the lock only if no task holds it') from None
+        raise RuntimeError(f'another task is training the {kind} ({lock}); submit its stage '
+                           'first, and delete the lock only if no task holds it') from None
     try:
         os.write(handle, f'{socket.gethostname()} pid {os.getpid()}\n'.encode())
         os.close(handle)
         if (out / 'manifest.json').exists() and json.loads((out / 'manifest.json').read_text()) != manifest:
-            raise ValueError(f'existing CoST reference manifest differs; use a new run name: {out}')
+            raise ValueError(f'existing {kind} manifest differs; use a new run name: {out}')
         write_json(out / 'manifest.json', manifest)
-        features, rows, layout = train_encoder(kwargs, 'cost_reference_adapter', out, data, steps)
+        features, rows, layout = train_encoder(kwargs, label, out, data, steps)
         np.savez_compressed(out / 'representations.npz', pids=data['pids'],
-                            window_ids=data['window_ids'], cost_reference_adapter=features)
+                            window_ids=data['window_ids'], **{label: features})
         pd.DataFrame(rows, columns=RQ2_COLUMNS).to_csv(out / 'rq2_personalized.csv', index=False)
         write_json(out / 'reference.json', dict(blocks=layout[0], pair_block=layout[1]))
         write_json(out / 'complete.json', dict(status='execution_smoke_only' if common['smoke'] else 'complete',
@@ -346,9 +373,14 @@ def main():
         steps = 2
     model_seed = int(np.random.SeedSequence([cfg['split_seed'], args.seed, args.fold]).generate_state(1)[0])
     fit_idx, val_idx = pretext_split(training, cfg['val_frac'], model_seed)
+    # Supervised control: windows of the fold's labelled training participants and their labels.
+    sup_idx = np.flatnonzero(np.isin(pids, fold.train_pids))
+    if set(pids[sup_idx]) & set(fold.test_pids) or not training[sup_idx].all():
+        raise AssertionError('Supervised control would see held-out windows')
     data = dict(X=X, raw=raw, pids=pids, window_ids=window_ids, fit_idx=fit_idx, val_idx=val_idx,
                 test_ids=fold.test_pids, n_sensors=c.n_sensors, seq_len=c.seq_len,
-                bins_per_day=c.bins_per_day, bin_minutes=c.bin_minutes)
+                bins_per_day=c.bins_per_day, bin_minutes=c.bin_minutes, labels=labels,
+                sup_idx=sup_idx, sup_y=labels[sup_idx].astype(np.float32))
     common = dict(dataset=args.dataset, seed=args.seed, fold=fold.as_dict(), model_seed=model_seed,
                   steps=steps, val_frac=cfg['val_frac'], smoke=args.smoke, device=args.device,
                   cohort_year=year, cache_sha256=digest(ROOT / cfg['cache']),
@@ -357,13 +389,19 @@ def main():
                   test_ids=list(fold.test_pids), windows=int(len(X)),
                   fit_windows=int(len(fit_idx)), monitor_windows=int(len(val_idx)),
                   dev_cohort=args.dev_cohort)
-    if args.skip_reference and args.reference:
-        raise ValueError('--reference trains only the reference; --skip-reference omits it')
-    reference = cost_reference(base, common, model_cfg, data, steps, args.device,
-                               cached_only=args.skip_reference)
-    if args.reference:
-        print(f"CoST reference ready: {base / 'cost_reference'}")
-        return
+    if args.skip_reference and (args.reference or args.supervised):
+        raise ValueError('--reference/--supervised train one reference; --skip-reference only reuses them')
+    if args.reference and args.supervised:
+        raise ValueError('train one reference per task: --reference or --supervised')
+    for kind, stage in (('cost_reference', args.reference), ('supervised', args.supervised)):
+        if stage:
+            cached_reference(kind, base, common, model_cfg, data, steps, args.device)
+            print(f'{kind} ready: {base / kind}')
+            return
+    reference = cached_reference('cost_reference', base, common, model_cfg, data, steps, args.device,
+                                 cached_only=args.skip_reference)
+    supervised = cached_reference('supervised', base, common, model_cfg, data, steps, args.device,
+                                  cached_only=args.skip_reference)
 
     out = base / variant / f'seed_{args.seed}' / f'fold_{args.fold}'
     out.mkdir(parents=True, exist_ok=True)
@@ -399,17 +437,17 @@ def main():
     features['random_projection'] = projection.encode(X)
     rq2_rows, rq2_status = personalized_records(projection, 'random_projection', X, raw, pids, window_ids,
                                                 fold.test_pids, c.bins_per_day, c.bin_minutes)
-    if reference is not None:
-        features['cost_reference_adapter'], reference_rows, reference_layout = reference
-        rq2_rows.extend(reference_rows)
+    features['cost_reference_adapter'], reference_rows, reference_layout = reference
+    rq2_rows.extend(reference_rows)
+    features['supervised'], supervised_rows, supervised_layout = supervised
+    rq2_rows.extend(supervised_rows)
     features['untrained'] = untrained.encode(X, batch_size=16)
     rows, rq2_status = personalized_records(untrained, 'untrained', X, raw, pids, window_ids,
                                             fold.test_pids, c.bins_per_day, c.bin_minutes)
     rq2_rows.extend(rows)
     # Branch column ranges and circular pairs, per encoder: (DSSL.blocks(), DSSL.pair_block()).
-    layouts = {'untrained': (untrained.blocks(), untrained.pair_block())}
-    if reference is not None:
-        layouts['cost_reference_adapter'] = reference_layout
+    layouts = {'untrained': (untrained.blocks(), untrained.pair_block()),
+               'cost_reference_adapter': reference_layout, 'supervised': supervised_layout}
     del untrained
     features['dssl'], rows, layouts['dssl'] = train_encoder(kwargs, 'dssl', out, data, steps)
     rq2_rows.extend(rows)

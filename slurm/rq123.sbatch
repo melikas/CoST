@@ -9,8 +9,9 @@
 #SBATCH --error=logs/%x_%A_%a.err
 # One task = one seed x fold.
 #   STAGE=reference  trains the CoST reference adapter only (shared by every variant)
+#   STAGE=supervised trains the supervised control only (same encoder, labels only; shared)
 #   STAGE=variant    trains the variant (BACKBONE/ENCODING, default: the config's) and
-#                    evaluates RQ1-RQ3 against the cached reference
+#                    evaluates RQ1-RQ3 against the cached references
 # Up to 3 h a job also fits Narval's 3 h partition, which queues far faster than 12 h.
 # slurm/submit.sh overrides GPU and time (GPU=..., TIME=...); a task that times out resumes
 # from its last checkpoint (every 100 updates) when resubmitted.
@@ -30,11 +31,12 @@ extra=()
 [ -n "${BACKBONE:-}" ] && extra+=(--backbone "$BACKBONE")
 [ -n "${ENCODING:-}" ] && extra+=(--temporal-encoding "$ENCODING")
 [ "${STAGE:-variant}" = reference ] && extra+=(--reference)
+[ "${STAGE:-variant}" = supervised ] && extra+=(--supervised)
 [ -n "${CONFIG:-}" ] && extra+=(--config "$CONFIG")
 # SKIP_REFERENCE: reuse the cached reference instead of retraining it. The rung stays in the
 # ladder; the task just refuses to train a second copy, and errors if the cache is absent. Set it
 # for every variant array submitted after the reference stage has already run for this run name.
-[ -n "${SKIP_REFERENCE:-}" ] && [ "${STAGE:-variant}" != reference ] && extra+=(--skip-reference)
+[ -n "${SKIP_REFERENCE:-}" ] && [ "${STAGE:-variant}" = variant ] && extra+=(--skip-reference)
 # DEV_COHORT: architecture development inside locked fold 0's training participants.
 [ -n "${DEV_COHORT:-}" ] && extra+=(--dev-cohort)
 srun python scripts/run_experiment.py --dataset "$DATASET" --seed "$seed" --fold "$fold" \

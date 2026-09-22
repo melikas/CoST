@@ -19,6 +19,7 @@ LADDER = [
     ('handcrafted_stack', 'Handcrafted', 'NNLS super learner of distribution, nonparametric and Yan cosinor'),
     ('untrained', 'Primary control', 'Identical encoder at initialization (architecture without SSL)'),
     ('cost_reference_adapter', 'Published SSL method', 'CoST reference adapter: same data, budget and readout'),
+    ('supervised', 'Supervised control', 'Same encoder and readout trained end to end on labelled training participants only'),
     ('dssl', 'Proposed', 'DSSL frozen representation'),
 ]
 EXTERNAL = [
@@ -39,7 +40,7 @@ PERTURBATION = {'phase': 'timing (0.5-4 h shifts)', 'amplitude': 'strength (24-h
 DISENTANGLEMENT = {'MESOR': ('MESOR (window mean)', 'trend', 'seasonal amplitude + phase'),
                    'amplitude': ('24-h amplitude', 'seasonal amplitude', 'trend'),
                    'acrophase': ('24-h acrophase', 'seasonal phase', 'trend')}
-DISENTANGLED = ('dssl', 'untrained', 'cost_reference_adapter')
+DISENTANGLED = ('dssl', 'untrained', 'cost_reference_adapter', 'supervised')
 NOTES = ('Intervals are paired participant-bootstrap 95% intervals, conditional on the fitted models '
          '(no retraining uncertainty) and not simultaneous across rows. "inconclusive" means the '
          'interval includes 0: it is not evidence of equivalence. Missing estimates are unavailable, '

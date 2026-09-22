@@ -116,6 +116,48 @@ class CoSTReference(unittest.TestCase):
         self.assertEqual(plain, dssl_settings)
 
 
+class SupervisedControl(unittest.TestCase):
+    """The supervised control is the DSSL encoder and readout, trained only on labels."""
+
+    def data(self, n=16):
+        rng = np.random.default_rng(0)
+        x = rng.normal(size=(n, 28, 2)).astype(np.float32)
+        return x, np.tile([0.0, 1.0], n // 2).astype(np.float32)
+
+    def test_same_encoder_and_representation_as_dssl(self):
+        ssl = DSSL(2, 28, 4, model_seed=3, **TINY)
+        sup = DSSL(2, 28, 4, model_seed=3, objective="supervised", **TINY)
+        self.assertEqual({k: v for k, v in ssl.config.items() if k != "objective"},
+                         {k: v for k, v in sup.config.items() if k != "objective"})
+        self.assertEqual(ssl.blocks(), sup.blocks())
+        self.assertEqual(sum(p.numel() for p in ssl.net.parameters()),
+                         sum(p.numel() for p in sup.net.parameters()))
+        x, _ = self.data()
+        self.assertEqual(ssl.encode(x).shape, sup.encode(x).shape)
+
+    def test_trains_on_labels_and_predicts_probabilities(self):
+        x, y = self.data()
+        sup = DSSL(2, 28, 4, model_seed=3, objective="supervised", **TINY)
+        before = [p.detach().clone() for p in sup.net.parameters()]
+        sup.fit(x, labels=y, n_iters=3, verbose=False)
+        self.assertTrue(any(not torch.equal(a, b) for a, b in zip(before, sup.net.parameters())))
+        self.assertAlmostEqual(float(sup.cost.pos_weight), 1.0)
+        p = sup.predict_proba(x)
+        self.assertEqual(p.shape, (len(x),))
+        self.assertTrue(((p > 0) & (p < 1)).all())
+
+    def test_labels_are_required_and_only_for_the_supervised_objective(self):
+        x, y = self.data()
+        with self.assertRaises(ValueError):
+            DSSL(2, 28, 4, objective="supervised", **TINY).fit(x, n_iters=1, verbose=False)
+        with self.assertRaises(ValueError):
+            DSSL(2, 28, 4, objective="supervised", **TINY).fit(x, labels=np.zeros(len(x)), n_iters=1, verbose=False)
+        with self.assertRaises(ValueError):
+            DSSL(2, 28, 4, **TINY).fit(x, labels=y, n_iters=1, verbose=False)
+        with self.assertRaises(ValueError):
+            DSSL(2, 28, 4, method="cost_reference", objective="supervised", **TINY)
+
+
 class BackboneRegistry(unittest.TestCase):
     def test_registry_and_decoupled_depth(self):
         self.assertEqual(sorted(BACKBONES), ["lstm", "mamba", "mlp", "tcn", "transformer"])

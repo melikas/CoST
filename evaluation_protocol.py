@@ -21,8 +21,9 @@ from sklearn.preprocessing import StandardScaler
 NOT_RQ1 = {'distribution', 'nonparametric', 'yan_cosinor', 'handcrafted'}
 # Manuscript super learner: physical distribution, nonparametric descriptors, Yan et al. cosinor.
 STACK_BLOCKS = ('distribution', 'nonparametric', 'yan_cosinor')
-RQ1_CONTROLS = ('training_mean', 'untrained', 'raw', 'pca', 'random_projection', 'cost_reference_adapter')
-RQ2_CONTROLS = ('untrained', 'random_projection', 'cost_reference_adapter')
+RQ1_CONTROLS = ('training_mean', 'untrained', 'raw', 'pca', 'random_projection', 'cost_reference_adapter',
+                'supervised')
+RQ2_CONTROLS = ('untrained', 'random_projection', 'cost_reference_adapter', 'supervised')
 
 
 def write_json(path, value):
@@ -335,7 +336,8 @@ def figures(root):
 
     def label(method):
         return {'dssl': 'DSSL (ours)', 'untrained': 'Untrained DSSL (same architecture)',
-                'cost_reference_adapter': 'CoST reference', 'raw': 'Raw window',
+                'cost_reference_adapter': 'CoST reference', 'supervised': 'Supervised (same encoder)',
+                'raw': 'Raw window',
                 'pca': 'PCA of raw window', 'random_projection': 'Random projection',
                 'training_mean': 'Population mean', 'training_prevalence': 'Training prevalence',
                 'yan_cosinor': 'Yan cosinor (HRD paper)', 'handcrafted': 'Handcrafted (all)',
@@ -381,7 +383,7 @@ def figures(root):
         absolute = (err.groupby(['seed', 'method', 'participant', 'marker']).family_error.mean()
                     .groupby(['method', 'marker']).mean().unstack('method'))
         absolute.to_csv(root / 'rq1_absolute_error.csv')
-        keep = [m for m in ('dssl', 'untrained', 'cost_reference_adapter', 'raw',
+        keep = [m for m in ('dssl', 'untrained', 'cost_reference_adapter', 'supervised', 'raw',
                             'random_projection', 'training_mean') if m in absolute.columns]
         fig, axes = plt.subplots(1, 2, figsize=(13, 4.2),
                                  gridspec_kw={'width_ratios': [1, max(1, len(absolute) - 1)]})
@@ -427,7 +429,7 @@ def figures(root):
         ent = ent_intervals.set_index(['method', 'target', 'quantity'])
         targets = [t for t in ('MESOR', 'amplitude', 'acrophase')
                    if t in set(ent.index.get_level_values('target'))]
-        methods = [m for m in ('dssl', 'untrained', 'cost_reference_adapter')
+        methods = [m for m in ('dssl', 'untrained', 'cost_reference_adapter', 'supervised')
                    if m in set(ent.index.get_level_values('method'))]
         if targets and methods:
             fig, ax = plt.subplots(figsize=(11, 4.4))

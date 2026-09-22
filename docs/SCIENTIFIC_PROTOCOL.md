@@ -137,6 +137,25 @@ Model, objective, budget, metrics, probes, thresholds and baselines are unchange
 - **Reporting:** RQ3 is pooled out-of-fold as before. `rq3_by_fold.csv` adds the AUROC for each
   held-out year.
 
+## Supervised-control amendment, 2026-09-22 (investigator decision, after narval_v2 and loyo_v1)
+
+Every ladder gains a **supervised control** (`supervised`): the DSSL encoder and readout, configured
+as the variant, trained end to end on the labels of the fold's training participants only.
+- It uses no unlabelled window and no contrastive objective.
+- A non-affine batch normalisation and one linear layer read the representation (trend mean,
+  log amplitude, and phase as cos/sin), trained with class-balanced binary cross-entropy.
+  Every window takes its participant's label.
+- The optimiser, schedule, 6,000-update budget, batch size and augmentations are the SSL ones, so
+  only the objective and the training data differ.
+- It is scored like every other representation: frozen, with the same probes for RQ1–RQ3. Its head's
+  held-out participant probabilities are also saved (`supervised_head_predictions.csv`).
+- There is no early stopping and no selection on test data.
+
+The question it answers: does pretraining on unlabelled weeks add anything over training the same
+encoder on labels alone? It is a reference rung, not part of the pre-registered criteria. The code
+change invalidates cached references, so new run names are required. The narval_v2 and loyo_v1
+results stay as they are.
+
 ## Preservation
 
 Before repairs, 80 current source/manuscript/note files and the root staged/unstaged patches were preserved in `archive/rescue_20260914/before_repairs.zip`; `manifest.json` records source hashes. Raw datasets, historical result directories, caches and checkpoints remain intact. Git retains the reference and older model implementations.

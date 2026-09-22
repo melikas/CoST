@@ -1,8 +1,9 @@
 #!/bin/bash
 # Submit the matrix from the repository root on a login node:
 #   bash slurm/submit.sh ACCOUNT [RUN_NAME]
-# Per dataset: the CoST reference array, then the variant array (starts when every reference
-# task succeeded), then a CPU summary (starts when every variant task succeeded).
+# Per dataset: the CoST reference array and the supervised-control array (in parallel), then the
+# variant array (starts when every task of both succeeded), then a CPU summary (starts when every
+# variant task succeeded).
 #   TIME=12:00:00 bash slurm/submit.sh ...              longer limit per task (default 3 h)
 #   GPU=gpu:a100:1 bash slurm/submit.sh ...             whole A100s instead of 3g.20gb slices
 #   BACKBONE=transformer ENCODING=sinusoidal SKIP_REFERENCE=1 bash slurm/submit.sh ACCOUNT RUN
@@ -23,8 +24,11 @@ for dataset in ${DATASETS:-hrd globem}; do
         reference=$(sbatch --parsable "${gpu_job[@]}" --array="$tasks" \
             --export="$export_vars,DATASET=$dataset,STAGE=reference" slurm/rq123.sbatch)
         reference=${reference%%;*}
-        dependency=(--dependency=afterok:"$reference")
-        echo "$dataset: reference array $reference (tasks $tasks)"
+        supervised=$(sbatch --parsable "${gpu_job[@]}" --array="$tasks" \
+            --export="$export_vars,DATASET=$dataset,STAGE=supervised" slurm/rq123.sbatch)
+        supervised=${supervised%%;*}
+        dependency=(--dependency=afterok:"$reference":"$supervised")
+        echo "$dataset: CoST reference array $reference, supervised array $supervised (tasks $tasks)"
     fi
     array=$(sbatch --parsable "${gpu_job[@]}" --array="$tasks" "${dependency[@]}" \
         --export="$export_vars,DATASET=$dataset,STAGE=variant" slurm/rq123.sbatch)

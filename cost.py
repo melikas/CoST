@@ -115,6 +115,19 @@ class PretrainDataset(Dataset):
         return x + torch.randn(x.size(-1)) * self.shift_sigma
 
 
+class LabelledDataset(PretrainDataset):
+    """One augmented view of a labelled window and its label, for the supervised control:
+    the same augmentations as pretraining, so only the objective and the data differ."""
+
+    def __init__(self, data, labels, **kwargs):
+        super().__init__(data, **kwargs)
+        self.labels = torch.as_tensor(labels, dtype=torch.float)
+
+    def __getitem__(self, item):
+        i = item % self.N
+        return self.transform(self.data[i]), self.labels[i]
+
+
 # --------------------------------------------------------------------------------------
 # Readout
 # --------------------------------------------------------------------------------------
@@ -293,6 +306,35 @@ class CoSTModel(nn.Module):
         return (total, trend, amp + pha) if return_parts else total
 
 
+class SupervisedModel(nn.Module):
+    """Supervised control: the DSSL encoder and readout, trained end to end on window labels.
+
+    The head reads the representation that `DSSL.encode` returns (trend mean, amplitude and
+    phase at the readout bins), with amplitude on a log scale and phase as (cos, sin), through a
+    non-affine batch normalisation and one linear layer. The loss is class-balanced binary
+    cross-entropy: `pos_weight` = negatives / positives of the training windows."""
+
+    def __init__(self, encoder, dim, bins_per_day, harmonics, keep):
+        super().__init__()
+        self.encoder, self.bins_per_day, self.harmonics, self.keep = encoder, bins_per_day, harmonics, keep
+        self.norm = nn.BatchNorm1d(dim, affine=False)
+        self.head = nn.Linear(dim, 1)
+        self.register_buffer("pos_weight", torch.ones(1))
+        self.last_top1 = float("nan")
+
+    def logits(self, x):
+        t, s = self.encoder(x)
+        amp, ang = spectral_readout(s, self.bins_per_day, "angle", self.harmonics, self.keep)
+        f = torch.cat([t.mean(dim=1), torch.log(amp), torch.cos(ang), torch.sin(ang)], dim=-1)
+        return self.head(self.norm(f)).squeeze(-1)
+
+    def forward(self, x, y, update=True):
+        z = self.logits(x)
+        with torch.no_grad():
+            self.last_top1 = float(((z > 0).float() == y).float().mean())   # training accuracy
+        return F.binary_cross_entropy_with_logits(z, y, pos_weight=self.pos_weight)
+
+
 def adjust_learning_rate(optimizer, lr, step, total):
     """Half-cycle cosine decay, as upstream."""
     cur = lr * 0.5 * (1.0 + math.cos(math.pi * step / max(total, 1)))
@@ -332,10 +374,12 @@ class DSSL:
                  phase_readout="angle", phase_mode="circular_amp",
                  weights="contracted", alpha=0.005, moco_k=4096,
                  jitter_sigma=0.1, shift_sigma=0.5, smooth_minutes=75.0, lr=5e-4, batch_size=64,
-                 device="cuda", model_seed=None):
+                 device="cuda", model_seed=None, objective="contrastive"):
         if method not in ("dssl", "cost_reference"):
             raise ValueError("method must be dssl or cost_reference")
-        self.method = method
+        if objective not in ("contrastive", "supervised") or (objective == "supervised" and method != "dssl"):
+            raise ValueError("objective must be contrastive, or supervised with method='dssl'")
+        self.method, self.objective = method, objective
         self.scale_sigma = 0.0
         if method == "cost_reference":
             if n_time_features:
@@ -378,10 +422,16 @@ class DSSL:
         self._keep = band_keep(self.net)
         self.component_dims = self.net.seasonal_dims
 
-        encoder_k = CoSTEncoder(**enc).to(device)
-        self.cost = CoSTModel(
-            self.net, encoder_k, dim=self.net.trend_dims, alpha=alpha, K=moco_k,
-            phase_mode=phase_mode, weights=weights, device=device).to(device)
+        if objective == "supervised":
+            blocks = self.blocks()
+            dim = blocks["trend"][1] + 3 * (blocks["amplitude"][1] - blocks["amplitude"][0])
+            self.cost = SupervisedModel(self.net, dim, bins_per_day, self.net.harmonics,
+                                        self._keep).to(device)
+        else:
+            encoder_k = CoSTEncoder(**enc).to(device)
+            self.cost = CoSTModel(
+                self.net, encoder_k, dim=self.net.trend_dims, alpha=alpha, K=moco_k,
+                phase_mode=phase_mode, weights=weights, device=device).to(device)
         self.n_iters = 0
         self._optimizer = None
         self._permutation = None
@@ -389,7 +439,7 @@ class DSSL:
         self._training_hash = None
         self._horizon = None
         self.history = {"iters": [], "train": [], "val": [], "top1": []}
-        self.config = dict(method=method, input_dims=input_dims, seq_len=seq_len,
+        self.config = dict(method=method, objective=objective, input_dims=input_dims, seq_len=seq_len,
                            bins_per_day=bins_per_day, output_dims=output_dims,
                            hidden_dims=hidden_dims, n_time_features=n_time_features,
                            backbone=backbone, temporal_encoding=temporal_encoding,
@@ -409,18 +459,31 @@ class DSSL:
     # -- training ---------------------------------------------------------------------
     @tf32_convolutions()
     def fit(self, train_data, n_iters=1000, val_data=None, log_every=100, verbose=True,
-            checkpoint_path=None, checkpoint_every=200, stop_after=None):
-        """Pretrain. `train_data` is (N, T, D) float32; no labels are used."""
+            checkpoint_path=None, checkpoint_every=200, stop_after=None, labels=None):
+        """Train. `train_data` is (N, T, D) float32. The contrastive objective uses no labels;
+        the supervised control requires one 0/1 `labels` entry per window."""
         array = np.ascontiguousarray(train_data, dtype=np.float32)
         if array.ndim != 3 or not np.isfinite(array).all():
             raise ValueError("SSL requires finite (windows,time,features) training input")
-        digest = hashlib.sha256(array.tobytes()).hexdigest()
+        supervised = self.objective == "supervised"
+        if supervised:
+            labels = np.asarray(labels, dtype=np.float32)
+            if labels.shape != (len(array),) or set(np.unique(labels)) != {0.0, 1.0}:
+                raise ValueError("supervised training needs one 0/1 label per window, both classes")
+            val_data = None
+        elif labels is not None:
+            raise ValueError("the contrastive objective takes no labels")
+        digest = hashlib.sha256(array.tobytes() + (labels.tobytes() if supervised else b"")).hexdigest()
         if self._training_hash not in (None, digest) or self._horizon not in (None, n_iters):
             raise ValueError("resume requires identical training data/order and planned iteration horizon")
         self._training_hash, self._horizon = digest, n_iters
-        ds = PretrainDataset(torch.from_numpy(array), jitter_sigma=self.jitter_sigma,
-                             shift_sigma=self.shift_sigma, smooth_bins=self.smooth_bins,
-                             scale_sigma=self.scale_sigma)
+        aug = dict(jitter_sigma=self.jitter_sigma, shift_sigma=self.shift_sigma,
+                   smooth_bins=self.smooth_bins, scale_sigma=self.scale_sigma)
+        if supervised:
+            ds = LabelledDataset(torch.from_numpy(array), labels, **aug)
+            self.cost.pos_weight.fill_(float((labels == 0).sum() / (labels == 1).sum()))
+        else:
+            ds = PretrainDataset(torch.from_numpy(array), **aug)
         if len(ds) < self.batch_size:
             raise ValueError(f"{len(ds)} windows is fewer than one batch "
                              f"({self.batch_size}); lower --batch-size or widen the fold")
@@ -508,6 +571,17 @@ class DSSL:
             return None
         start, stop = self.blocks()["phase"]
         return start, (stop - start) // 2
+
+    @torch.no_grad()
+    def predict_proba(self, data, batch_size=256):
+        """Supervised control only: the head's probability for each window."""
+        if self.objective != "supervised":
+            raise ValueError("predict_proba needs the supervised objective")
+        self.cost.eval()
+        X = torch.as_tensor(data, dtype=torch.float)
+        out = [torch.sigmoid(self.cost.logits(X[i:i + batch_size].to(self.device))).cpu()
+               for i in range(0, len(X), batch_size)]
+        return torch.cat(out).numpy()
 
     @torch.no_grad()
     def encode(self, data, batch_size=256, pool="mean", parts=False):
