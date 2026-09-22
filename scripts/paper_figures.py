@@ -9,7 +9,9 @@ Every plotted number uses the same aggregation as the matching manuscript table:
        amplitude: sign agreement averaged within participant, then across participants, from
        rq2_personalized.csv -- the table's aggregation. The floor uses the same aggregation.
   RQ3  oof_predictions.csv (own AUROC, mean over seeds, with a label-stratified participant
-       bootstrap) and rq3_paired_intervals.csv (paired DSSL-minus-method intervals).
+       bootstrap) and rq3_paired_intervals.csv (paired DSSL-minus-method intervals), for HRD,
+       GLOBEM 2018 (narval_v2) and GLOBEM leave-one-year-out (loyo_v1, predictions pooled over
+       the four held-out years).
 Nothing is retrained. Own-AUROC intervals are written to rq3_auroc_ci.csv.
 """
 from __future__ import annotations
@@ -215,10 +217,12 @@ def auroc_interval(frame, draws=2000, seed=0):
 
 
 def figure_rq3():
-    fig, axes = plt.subplots(2, 2, figsize=(6.8, 4.4), sharey="row",
+    fig, axes = plt.subplots(3, 2, figsize=(6.8, 6.6), sharey="row",
                              gridspec_kw=dict(hspace=0.55, wspace=0.12))
-    for row, dataset, name in ((0, "hrd", "HRD"), (1, "globem", "GLOBEM 2018")):
-        run = ROOT / "results" / dataset / RUN
+    for row, dataset, run_name, name in ((0, "hrd", RUN, "HRD"),
+                                         (1, "globem", RUN, "GLOBEM 2018"),
+                                         (2, "globem", "loyo_v1/tcn_none", "GLOBEM, leave one year out")):
+        run = ROOT / "results" / dataset / run_name
         oof = pd.read_csv(run / "oof_predictions.csv", dtype={"participant": str})
         oof = oof[oof.probe == "logistic"]
         paired = pd.read_csv(run / "rq3_paired_intervals.csv")
@@ -245,12 +249,12 @@ def figure_rq3():
         axes[row, 0].set_yticklabels([label for _, label in RQ3_METHODS])
         axes[row, 0].set_xlim(0.3, 0.9)
         axes[row, 1].set_xlim(-0.25, 0.25)
-        axes[row, 0].set_title(f"{'ac'[row]}  {name} ({n} participants): AUROC", loc="left")
-        axes[row, 1].set_title(f"{'bd'[row]}  DSSL minus method (paired)", loc="left")
+        axes[row, 0].set_title(f"{'ace'[row]}  {name} ({n}): AUROC", loc="left")
+        axes[row, 1].set_title(f"{'bdf'[row]}  DSSL minus method (paired)", loc="left")
         for ax in axes[row]:
             recessive_grid(ax)
-    axes[1, 0].set_xlabel("Participant AUROC (dashed: chance)")
-    axes[1, 1].set_xlabel("AUROC difference (positive favours DSSL)")
+    axes[2, 0].set_xlabel("Participant AUROC (dashed: chance)")
+    axes[2, 1].set_xlabel("AUROC difference (positive favours DSSL)")
     fig.savefig(OUT / "rq3_auroc.pdf")
     plt.close(fig)
 
