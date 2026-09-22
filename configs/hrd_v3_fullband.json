@@ -1,6 +1,5 @@
 {
-  "cache": "datasets/cache/globem_rescue_v1.npz",
-  "cohort_policy": "earliest study year only; exclude other years including unlabelled data",
+  "cache": "datasets/cache/hrd_rescue_v1.npz",
   "seeds": [
     1,
     2,
@@ -22,7 +21,7 @@
     "output_dims": 320,
     "hidden_dims": 64,
     "seasonal_frac": 0.5,
-    "seasonal_bands": "harmonics",
+    "seasonal_bands": "single",
     "harmonics": 4,
     "trend_kernel_cap": 64,
     "readout": "pooled",
@@ -33,7 +32,7 @@
     "moco_k": 4096,
     "jitter_sigma": 0.5,
     "shift_sigma": 0.5,
-    "scale_sigma": 0.0,
+    "scale_sigma": 0.5,
     "smooth_minutes": 0.0,
     "lr": 0.0005,
     "batch_size": 64
@@ -44,7 +43,7 @@
     128,
     320
   ],
-  "model_policy": "ablation of globem_v3: identical except no amplitude scaling",
-  "variant_tag": "noscale",
+  "model_policy": "ablation of hrd_v3: identical except one full-spectrum Fourier band (CoST)",
+  "variant_tag": "fullband",
   "selection_from": "tcn_none"
 }

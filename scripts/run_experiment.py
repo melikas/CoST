@@ -18,6 +18,7 @@ import hashlib
 import json
 import os
 import shutil
+import signal
 import socket
 import subprocess
 import sys
@@ -292,6 +293,10 @@ def selected_dims(base, prefix, seed, fold):
 
 
 def main():
+    # Slurm sends SIGTERM before killing a task at its time limit. Exiting normally runs the
+    # `finally` that removes a reference lock, so a resubmitted task resumes from its checkpoint
+    # instead of finding a stale lock.
+    signal.signal(signal.SIGTERM, lambda *_: sys.exit(143))
     args = parse_args()
     cfg = load_config(args)
     model_cfg = cfg['model']

@@ -1,12 +1,13 @@
 {
   "cache": "datasets/cache/globem_rescue_v1.npz",
-  "cohort_policy": "earliest study year only; exclude other years including unlabelled data",
+  "cohort_policy": "leave-one-year-out over all four cohorts; the held-out year, unlabelled records included, never enters training; identifiers are participant-years without cross-year person linkage",
+  "split": "year",
   "seeds": [
     1,
     2,
     3
   ],
-  "folds": 5,
+  "folds": 4,
   "split_seed": 20260914,
   "steps": 6000,
   "val_frac": 0.1,
@@ -22,7 +23,7 @@
     "output_dims": 320,
     "hidden_dims": 64,
     "seasonal_frac": 0.5,
-    "seasonal_bands": "harmonics",
+    "seasonal_bands": "single",
     "harmonics": 4,
     "trend_kernel_cap": 64,
     "readout": "pooled",
@@ -44,5 +45,7 @@
     128,
     320
   ],
-  "model_policy": "CoST objective and augmentations with harmonic bands and 7 trend kernels; representation max-pooled [V^T | V^S]; width selected per fold by inner-CV AUROC"
+  "model_policy": "ablation of globem_loyo_v3: identical except one full-spectrum Fourier band (CoST)",
+  "variant_tag": "fullband",
+  "selection_from": "tcn_none"
 }

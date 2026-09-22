@@ -158,10 +158,19 @@ results stay as they are.
 
 ## Model v3 amendment, 2026-09-22 (investigator decision, after narval_v2 and loyo_v1; fixed before any v3 run)
 
-**Model** (`configs/{hrd,globem,globem_loyo}_v3.json`). Upstream CoST (salesforce/CoST `train.py` and
-`cost.py`) with two changes:
-1. four harmonic Fourier bands instead of one full-spectrum band;
-2. trend kernels 1–64 (7) instead of 1–128 (8).
+**Evaluations.** Two:
+- HRD, 5-fold (`configs/hrd_v3.json`);
+- GLOBEM leave-one-year-out, 4 folds (`configs/globem_loyo_v3.json`).
+
+The GLOBEM 2018-only evaluation is not repeated for v3.
+
+**Model.** Upstream CoST (salesforce/CoST `train.py` and `cost.py`) with two changes:
+1. contiguous Fourier bands centred on the daily harmonics instead of one full-spectrum band. On HRD
+   there are four bands covering bins 1–30 (periods 168 h to 5.6 h); the first band also holds the
+   weekly bin. On GLOBEM there are two, because only the 24 h harmonic lies below Nyquist; the 12 h
+   harmonic is exactly the Nyquist bin;
+2. trend kernels 1–64 (7) instead of 1–128 (8). The trend branch is multi-scale and causal; it is not
+   guaranteed to be low-pass.
 
 Everything else is CoST's:
 - **Loss:** 1 · trend + α · (amplitude + phase)/2, with α = 0.0005 and a raw-phase contrast.
@@ -187,8 +196,13 @@ stays 64.
 **Controls at the selected width.**
 - The untrained encoder.
 - The supervised control (same encoder, labels only).
-- A single-change ablation without amplitude scaling (`*_v3_noscale.json`, variant
-  `tcn_none_noscale_selected`), trained at the same per-fold width.
+- Two single-change ablations, each trained at the same per-fold width:
+  - without amplitude scaling (`*_v3_noscale.json`, variant `tcn_none_noscale_selected`);
+  - with one full-spectrum band as in CoST (`*_v3_fullband.json`, variant
+    `tcn_none_fullband_selected`). This one isolates the effect of the banding.
+
+The CoST reference differs from v3 in bands, kernels and width together, so it measures the combined
+change.
 
 **Primary result:** `tcn_none_selected`. Criteria and metrics are unchanged. narval_v2 and loyo_v1
 remain as reported results of the previous model.

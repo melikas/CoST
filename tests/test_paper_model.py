@@ -120,7 +120,7 @@ class CoSTBandsModel(unittest.TestCase):
     """v3: CoST's objective and augmentations, harmonic bands, 7 trend kernels, pooled [V^T | V^S]."""
 
     def test_v3_configs_differ_from_the_cost_reference_only_in_bands_kernels_and_width(self):
-        for name, T, b, C in (("hrd_v3", 672, 96, 4), ("globem_v3", 112, 4, 14), ("globem_loyo_v3", 112, 4, 14)):
+        for name, T, b, C in (("hrd_v3", 672, 96, 4), ("globem_loyo_v3", 112, 4, 14)):
             model = config(name)["model"]
             m = DSSL(C, T, b, device="cpu", **model).config
             self.assertEqual(m["trend_kernels"], [1, 2, 4, 8, 16, 32, 64])
@@ -131,8 +131,12 @@ class CoSTBandsModel(unittest.TestCase):
             same = {k for k in m if m[k] == ref[k]}
             self.assertEqual(set(m) - same, {"method", "seasonal_bands", "bands", "trend_kernel_cap",
                                             "trend_kernels"})
-            ablation = config(name + "_noscale")
-            self.assertEqual({k for k in model if model[k] != ablation["model"][k]}, {"scale_sigma"})
+            for tag, changed in (("noscale", {"scale_sigma"}), ("fullband", {"seasonal_bands"})):
+                ablation = config(f"{name}_{tag}")
+                self.assertEqual({k for k in model if model[k] != ablation["model"][k]}, changed)
+                self.assertEqual((ablation["variant_tag"], ablation["selection_from"]), (tag, "tcn_none"))
+            full = DSSL(C, T, b, device="cpu", **config(name + "_fullband")["model"]).config
+            self.assertEqual(full["bands"], [[0, T // 2 + 1]])               # CoST's single band
 
     def test_pooled_representation_is_max_over_time_of_trend_and_seasonal(self):
         m = DSSL(2, 28, 4, model_seed=1, readout="pooled", **TINY)

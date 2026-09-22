@@ -1,15 +1,15 @@
 #!/bin/bash
-# The v3 matrix: CoST objective with harmonic bands, width selected per fold. From the repo root:
+# The v3 matrix: CoST objective with harmonic-centred bands, width selected per fold. From the repo root:
 #   bash slurm/submit_v3.sh ACCOUNT RUN_NAME CONFIG [FOLDS]
-#   bash slurm/submit_v3.sh def-plago narval_v3 configs/hrd_v3.json            # HRD, 5 folds
-#   DATASET=globem bash slurm/submit_v3.sh def-plago narval_v3 configs/globem_v3.json
-#   DATASET=globem bash slurm/submit_v3.sh def-plago loyo_v3 configs/globem_loyo_v3.json 4
+#   bash slurm/submit_v3.sh def-plago narval_v3 configs/hrd_v3.json                       # HRD, 5 folds
+#   DATASET=globem bash slurm/submit_v3.sh def-plago loyo_v3 configs/globem_loyo_v3.json 4  # GLOBEM, 4 years
 # Chain for one dataset (each arrow is afterok):
 #   CoST reference ------------------------------------------------+
 #   width sweep: one variant array per width in DIMS (no supervised) +-> select width (CPU)
 #   select --> supervised control at the selected width --> main variant at the selected width
-#   select --> no-scaling ablation at the selected width
-#   summaries: every sweep width, the selected main variant, the ablation (CPU)
+#   select --> ablations at the selected width: no amplitude scaling (<config>_noscale.json) and
+#              one full-spectrum band (<config>_fullband.json)
+#   summaries: every sweep width, the selected main variant, each ablation (CPU)
 #   TIME=12:00:00 / GPU=gpu:a100:1 as in slurm/submit.sh.
 set -euo pipefail
 account="${1:?usage: bash slurm/submit_v3.sh ACCOUNT RUN_NAME CONFIG [FOLDS]}"
@@ -18,8 +18,10 @@ config="${3:?CONFIG}"
 folds="${4:-5}"
 dataset="${DATASET:-hrd}"
 dims="${DIMS:-32 64 128 320}"
-ablation="${config%.json}_noscale.json"
-[ -f "$config" ] && [ -f "$ablation" ] || { echo "missing $config or $ablation" >&2; exit 2; }
+ablations=("${config%.json}_noscale.json" "${config%.json}_fullband.json")
+for f in "$config" "${ablations[@]}"; do
+    [ -f "$f" ] || { echo "missing $f" >&2; exit 2; }
+done
 mkdir -p logs
 tasks="0-$((3 * folds - 1))"
 gpu=(--account="$account" --gres="${GPU:-gpu:a100_3g.20gb:1}" --time="${TIME:-03:00:00}" --array="$tasks")
@@ -44,11 +46,14 @@ sup=$(submit "${gpu[@]}" --dependency=afterok:"$select" \
     --export="$env,CONFIG=$config,STAGE=supervised,OUTPUT_DIMS=selected" slurm/rq123.sbatch)
 main=$(submit "${gpu[@]}" --dependency=afterok:"$sup" \
     --export="$env,CONFIG=$config,STAGE=variant,OUTPUT_DIMS=selected" slurm/rq123.sbatch)
-abl=$(submit "${gpu[@]}" --dependency=afterok:"$select" \
-    --export="$env,CONFIG=$ablation,STAGE=variant,OUTPUT_DIMS=selected,NO_SUPERVISED=1" slurm/rq123.sbatch)
-s1=$(submit "${cpu[@]}" --dependency=afterok:"$main" \
+s=$(submit "${cpu[@]}" --dependency=afterok:"$main" \
     --export="$env,CONFIG=$config,OUTPUT_DIMS=selected" slurm/summarize.sbatch)
-s2=$(submit "${cpu[@]}" --dependency=afterok:"$abl" \
-    --export="$env,CONFIG=$ablation,OUTPUT_DIMS=selected" slurm/summarize.sbatch)
-echo "$dataset: select $select -> supervised $sup -> main $main (summary $s1); ablation $abl (summary $s2)"
-echo "Results: results/$dataset/$run/{tcn_none_d*,tcn_none_selected,tcn_none_noscale_selected}"
+echo "$dataset: select $select -> supervised $sup -> main $main (summary $s)"
+for ab in "${ablations[@]}"; do
+    id=$(submit "${gpu[@]}" --dependency=afterok:"$select" \
+        --export="$env,CONFIG=$ab,STAGE=variant,OUTPUT_DIMS=selected,NO_SUPERVISED=1" slurm/rq123.sbatch)
+    s=$(submit "${cpu[@]}" --dependency=afterok:"$id" \
+        --export="$env,CONFIG=$ab,OUTPUT_DIMS=selected" slurm/summarize.sbatch)
+    echo "$dataset: ablation $ab $id (summary $s)"
+done
+echo "Results: results/$dataset/$run/{tcn_none_d*,tcn_none_selected,tcn_none_noscale_selected,tcn_none_fullband_selected}"
