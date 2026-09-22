@@ -10,6 +10,8 @@
 #   select --> ablations at the selected width: no amplitude scaling (<config>_noscale.json) and
 #              one full-spectrum band (<config>_fullband.json)
 #   summaries: every sweep width, the selected main variant, each ablation (CPU)
+#   main --> dynamics export of the selected variant (CPU array, tasks/dynamics.py), which
+#            scripts/representation_figures.py turns into the representation figures
 #   TIME=12:00:00 / GPU=gpu:a100:1 as in slurm/submit.sh.
 set -euo pipefail
 account="${1:?usage: bash slurm/submit_v3.sh ACCOUNT RUN_NAME CONFIG [FOLDS]}"
@@ -48,7 +50,9 @@ main=$(submit "${gpu[@]}" --dependency=afterok:"$sup" \
     --export="$env,CONFIG=$config,STAGE=variant,OUTPUT_DIMS=selected" slurm/rq123.sbatch)
 s=$(submit "${cpu[@]}" --dependency=afterok:"$main" \
     --export="$env,CONFIG=$config,OUTPUT_DIMS=selected" slurm/summarize.sbatch)
-echo "$dataset: select $select -> supervised $sup -> main $main (summary $s)"
+exp=$(submit "${cpu[@]}" --array="$tasks" --dependency=afterok:"$main" \
+    --export="$env,CONFIG=$config,OUTPUT_DIMS=selected" slurm/export.sbatch)
+echo "$dataset: select $select -> supervised $sup -> main $main (summary $s, dynamics export $exp)"
 for ab in "${ablations[@]}"; do
     id=$(submit "${gpu[@]}" --dependency=afterok:"$select" \
         --export="$env,CONFIG=$ab,STAGE=variant,OUTPUT_DIMS=selected,NO_SUPERVISED=1" slurm/rq123.sbatch)

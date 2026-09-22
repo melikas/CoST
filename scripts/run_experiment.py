@@ -33,6 +33,7 @@ import torch
 from cost import DSSL, band_support, REFERENCE_SHARED, exact_numerics
 from datautils import load_npz, make_folds, make_year_folds
 from evaluation_protocol import disentanglement, evaluate, summarize, write_json
+from tasks.dynamics import export_dynamics
 from tasks.personalized import personalized_records
 from tasks.projection import RawProjection
 from tasks.rhythm import individual_markers, window_rhythm
@@ -102,6 +103,9 @@ def parse_args():
                         help="override model.output_dims (the width of V^T plus V^S): an integer runs "
                              "variant <name>_d<N>; 'selected' uses the width chosen for this seed x fold "
                              "by scripts/select_dims.py and runs variant <name>_selected")
+    parser.add_argument('--export-dynamics', action='store_true',
+                        help="after the variant is complete, write time-resolved V^T / V^S summaries "
+                             "of its encoder (tasks/dynamics.py) to its fold directory as dynamics.npz")
     parser.add_argument('--no-supervised', action='store_true',
                         help='leave the supervised control out of this variant (dimension sweep, ablations)')
     parser.add_argument('--dev-cohort', action='store_true',
@@ -442,6 +446,20 @@ def main():
             cached_reference(kind, base, common, stage_cfg, data, steps, args.device)
             print(f'{kind} ready: {base}')
             return
+    if args.export_dynamics:
+        # Time-resolved V^T / V^S summaries from this variant's saved encoder (tasks/dynamics.py).
+        out = base / variant / f'seed_{args.seed}' / f'fold_{args.fold}'
+        if not (out / 'complete.json').exists():
+            raise FileNotFoundError(f'export needs the completed variant: {out}')
+        model = DSSL(input_dims=c.n_sensors, seq_len=c.seq_len, bins_per_day=c.bins_per_day,
+                     method='dssl', device=args.device, model_seed=model_seed, **model_cfg)
+        model.load(out / 'dssl_encoder.pt')
+        step = next(i for i, name in enumerate(c.sensor_cols) if 'step' in name.lower())
+        dyn = export_dynamics(model, X, pids, window_ids, fold.train_pids, fold.test_pids,
+                              c.bins_per_day, c.bin_minutes, step)
+        np.savez_compressed(out / 'dynamics.npz', **dyn)
+        print(f'Exported: {out / "dynamics.npz"}')
+        return
     reference = cached_reference('cost_reference', base, common, reference_cfg, data, steps, args.device,
                                  cached_only=args.skip_reference)
     supervised = None if args.no_supervised else cached_reference(
