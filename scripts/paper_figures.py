@@ -27,6 +27,8 @@ import pandas as pd
 from sklearn.metrics import roc_auc_score
 
 ROOT = Path(__file__).resolve().parents[1]
+import sys
+sys.path.insert(0, str(ROOT))
 OUT = ROOT / "SSL_Rhythmicity" / "figures"
 RUN = "narval_v2/tcn_none"
 
@@ -73,6 +75,23 @@ def amplitude_agreement(rows):
     a["agree"] = np.where(a.representation_delta == 0, 0.5, same.astype(float))
     return (a.groupby(["method", "level", "seed", "participant"]).agree.mean()
              .groupby(["method", "level", "seed"]).mean().groupby(["method", "level"]).mean())
+
+
+def phase_concordance(rows):
+    """Phase-shift concordance per method and shift size with the table's aggregation: the
+    stratified Mann-Whitney concordance of each participant at that shift, averaged over
+    participants, then over seeds (evaluation_protocol.summarize computes the same per participant
+    over all shifts)."""
+    from tasks.rhythm import stratum_pairs, concordance
+    g = rows[rows.perturbation == "phase"]
+    out = []
+    for (method, level, seed, pid), h in g.groupby(["method", "level", "seed", "participant"]):
+        value = concordance(stratum_pairs(h.representation_delta.to_numpy(), h.raw_delta.to_numpy(),
+                                          np.full(len(h), pid)))
+        if np.isfinite(value):
+            out.append((method, level, seed, value))
+    f = pd.DataFrame(out, columns=["method", "level", "seed", "c"])
+    return f.groupby(["method", "level", "seed"]).c.mean().groupby(["method", "level"]).mean()
 
 
 def always_increase_floor(rows=None):
@@ -163,8 +182,7 @@ def figure_rq2():
         ax.set_ylim(-1.45, 2.3)
         ax.legend(frameon=False, loc="upper left", ncol=3, handlelength=1.6, borderaxespad=0.0)
 
-    phase = pd.read_csv(ROOT / "results/hrd" / RUN / "rq2_by_level.csv")
-    phase = phase[phase.perturbation == "phase"].groupby(["method", "level"]).concordance.mean()
+    phase = phase_concordance(rows)
     amp = amplitude_agreement(rows)
     floor = always_increase_floor(rows)
     for col, (series, xlabel, title, ylabel, ref, ref_label) in enumerate((
@@ -177,8 +195,8 @@ def figure_rq2():
             s = series.loc[key]
             ax.plot(s.index, s.values, color=colour, marker="o", markersize=4, linewidth=1.6,
                     label=label, zorder=3 if key == "dssl" else 2)
-        ax.axhline(ref, color=INK2, linewidth=0.8, linestyle=(0, (3, 2)))
-        ax.text(ax.get_xlim()[1], ref - 0.008, ref_label + " ", color=INK2, fontsize=6.8, va="top", ha="right")
+        ax.axhline(ref, color=INK, linewidth=0.9, linestyle=(0, (1, 1.5)), zorder=1)
+        ax.text(ax.get_xlim()[1], ref - 0.012, ref_label + " ", color=INK, fontsize=6.8, va="top", ha="right")
         ax.set_ylim(0.45, 0.9)
         ax.set_xlabel(xlabel)
         ax.set_ylabel(ylabel)
@@ -196,7 +214,8 @@ def figure_rq2():
 # --------------------------------------------------------------------------------------
 RQ3_METHODS = [("dssl", "DSSL"), ("raw", "Raw window"), ("untrained", "Untrained encoder"),
                ("yan_cosinor", "Cosinor (Yan et al.)"), ("handcrafted", "Handcrafted rhythm"),
-               ("nonparametric", "Nonparametric (IS, IV, RA)"), ("random_projection", "Random projection"),
+               ("nonparametric", "Nonparametric (IS, IV, RA)"), ("distribution", "Channel mean and SD"),
+               ("random_projection", "Random projection"),
                ("cost_reference_adapter", "CoST"), ("pca", "PCA")]
 
 
@@ -248,7 +267,7 @@ def figure_rq3():
         axes[row, 0].set_yticks(ys)
         axes[row, 0].set_yticklabels([label for _, label in RQ3_METHODS])
         axes[row, 0].set_xlim(0.3, 0.9)
-        axes[row, 1].set_xlim(-0.25, 0.25)
+        axes[row, 1].set_xlim(-0.3, 0.3)
         axes[row, 0].set_title(f"{'ace'[row]}  {name} ({n}): AUROC", loc="left")
         axes[row, 1].set_title(f"{'bdf'[row]}  DSSL minus method (paired)", loc="left")
         for ax in axes[row]:
