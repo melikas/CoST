@@ -98,7 +98,7 @@ class CoSTReference(unittest.TestCase):
         ref = DSSL(4, **HRD, method="cost_reference", device="cpu", **shared)
         c = ref.config
         self.assertEqual(c["bands"], [[0, 337]])                           # one full-spectrum band
-        self.assertEqual(c["trend_kernels"], [2 ** i for i in range(9)])   # up to T/2 = 336
+        self.assertEqual(c["trend_kernels"], [2 ** i for i in range(8)])   # upstream 1..128
         self.assertEqual((c["phase_mode"], c["weights"]), ("raw", "paper"))
         self.assertEqual(ref.cost.weights, O.PAPER)
         self.assertEqual((c["jitter_sigma"], c["shift_sigma"], c["scale_sigma"], c["smooth_bins"]),
@@ -114,6 +114,40 @@ class CoSTReference(unittest.TestCase):
                              trend_kernel_cap=2, smooth_minutes=75.0, jitter_sigma=0.1,
                              **tiny).config
         self.assertEqual(plain, dssl_settings)
+
+
+class CoSTBandsModel(unittest.TestCase):
+    """v3: CoST's objective and augmentations, harmonic bands, 7 trend kernels, pooled [V^T | V^S]."""
+
+    def test_v3_configs_differ_from_the_cost_reference_only_in_bands_kernels_and_width(self):
+        for name, T, b, C in (("hrd_v3", 672, 96, 4), ("globem_v3", 112, 4, 14), ("globem_loyo_v3", 112, 4, 14)):
+            model = config(name)["model"]
+            m = DSSL(C, T, b, device="cpu", **model).config
+            self.assertEqual(m["trend_kernels"], [1, 2, 4, 8, 16, 32, 64])
+            self.assertEqual((m["weights"], m["phase_mode"], m["alpha"], m["readout"]), ("paper", "raw", 0.0005, "pooled"))
+            self.assertEqual((m["jitter_sigma"], m["shift_sigma"], m["scale_sigma"], m["smooth_bins"]), (0.5, 0.5, 0.5, 0))
+            ref = DSSL(C, T, b, method="cost_reference", device="cpu",
+                       **{k: model[k] for k in REFERENCE_SHARED if k in model}).config
+            same = {k for k in m if m[k] == ref[k]}
+            self.assertEqual(set(m) - same, {"method", "seasonal_bands", "bands", "trend_kernel_cap",
+                                            "trend_kernels"})
+            ablation = config(name + "_noscale")
+            self.assertEqual({k for k in model if model[k] != ablation["model"][k]}, {"scale_sigma"})
+
+    def test_pooled_representation_is_max_over_time_of_trend_and_seasonal(self):
+        m = DSSL(2, 28, 4, model_seed=1, readout="pooled", **TINY)
+        x = np.random.default_rng(0).normal(size=(3, 28, 2)).astype(np.float32)
+        v = m.encode(x)
+        self.assertEqual(v.shape, (3, 8))
+        self.assertEqual(m.blocks(), {"trend": (0, 4), "seasonal": (4, 8)})
+        self.assertIsNone(m.pair_block())
+        m.net.eval()
+        with torch.no_grad():
+            t, s = m.net(torch.as_tensor(x))
+        np.testing.assert_allclose(v, torch.cat([t.max(1).values, s.max(1).values], -1).numpy(), rtol=1e-6)
+        sup = DSSL(2, 28, 4, model_seed=1, readout="pooled", objective="supervised", **TINY)
+        sup.fit(x.repeat(4, 0), labels=np.tile([0.0, 1.0, 0.0], 4), n_iters=2, verbose=False)
+        self.assertEqual(sup.encode(x).shape, (3, 8))
 
 
 class SupervisedControl(unittest.TestCase):

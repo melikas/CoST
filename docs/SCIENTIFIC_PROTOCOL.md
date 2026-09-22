@@ -156,6 +156,43 @@ encoder on labels alone? It is a reference rung, not part of the pre-registered 
 change invalidates cached references, so new run names are required. The narval_v2 and loyo_v1
 results stay as they are.
 
+## Model v3 amendment, 2026-09-22 (investigator decision, after narval_v2 and loyo_v1; fixed before any v3 run)
+
+**Model** (`configs/{hrd,globem,globem_loyo}_v3.json`). Upstream CoST (salesforce/CoST `train.py` and
+`cost.py`) with two changes:
+1. four harmonic Fourier bands instead of one full-spectrum band;
+2. trend kernels 1–64 (7) instead of 1–128 (8).
+
+Everything else is CoST's:
+- **Loss:** 1 · trend + α · (amplitude + phase)/2, with α = 0.0005 and a raw-phase contrast.
+- **Augmentations:** jitter, per-channel scaling and shift, each σ = 0.5 with p = 0.5, and no
+  smoothing.
+- **Representation:** CoST's full-series representation, [V^T ‖ V^S] max-pooled over time, used for
+  RQ1–RQ3. The trend and seasonal blocks replace the amplitude/phase blocks in the RQ1 separation
+  analysis.
+- **Training budget, shared by every encoder:** 6,000 updates, batch 64, lr 5e-4, MoCo queue 4,096.
+
+The CoST reference becomes exact upstream as well: trend kernels 1–128, α = 0.0005 and the pooled
+representation. Its width stays 320.
+
+**Width.** output_dims ∈ {32, 64, 128, 320}. V^T and V^S are each half of it; the TCN hidden width
+stays 64.
+- One encoder is trained per width, seed and fold.
+- For each seed × fold, the width with the highest inner-CV AUROC of the DSSL logistic probe is
+  selected (`scripts/select_dims.py`). That score uses stratified 3-fold CV over that fold's
+  training participants only. Ties go to the smaller width.
+- The selected variant (`tcn_none_selected`) reuses that width's trained encoder bit for bit.
+- All sweep widths are reported as a sensitivity analysis; none of them is chosen by test results.
+
+**Controls at the selected width.**
+- The untrained encoder.
+- The supervised control (same encoder, labels only).
+- A single-change ablation without amplitude scaling (`*_v3_noscale.json`, variant
+  `tcn_none_noscale_selected`), trained at the same per-fold width.
+
+**Primary result:** `tcn_none_selected`. Criteria and metrics are unchanged. narval_v2 and loyo_v1
+remain as reported results of the previous model.
+
 ## Preservation
 
 Before repairs, 80 current source/manuscript/note files and the root staged/unstaged patches were preserved in `archive/rescue_20260914/before_repairs.zip`; `manifest.json` records source hashes. Raw datasets, historical result directories, caches and checkpoints remain intact. Git retains the reference and older model implementations.

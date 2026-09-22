@@ -17,6 +17,7 @@ import argparse
 import hashlib
 import json
 import os
+import shutil
 import socket
 import subprocess
 import sys
@@ -96,6 +97,12 @@ def parse_args():
                         help='train (or load) only the CoST reference adapter for this seed x fold')
     parser.add_argument('--supervised', action='store_true',
                         help='train (or load) only the supervised control for this seed x fold')
+    parser.add_argument('--output-dims', default=None,
+                        help="override model.output_dims (the width of V^T plus V^S): an integer runs "
+                             "variant <name>_d<N>; 'selected' uses the width chosen for this seed x fold "
+                             "by scripts/select_dims.py and runs variant <name>_selected")
+    parser.add_argument('--no-supervised', action='store_true',
+                        help='leave the supervised control out of this variant (dimension sweep, ablations)')
     parser.add_argument('--dev-cohort', action='store_true',
                         help='architecture development: restrict every participant to the TRAINING '
                              'set of locked protocol fold 0, then run the normal seed x fold '
@@ -223,7 +230,9 @@ def cached_reference(kind, base, common, model_cfg, data, steps, device, cached_
     instead of racing to retrain it, and a missing cache is an error rather than a silently
     shorter baseline ladder."""
     label = REFERENCES[kind]
-    out = base / kind / f"seed_{common['seed']}" / f"fold_{common['fold']['fold']}"
+    # One supervised control per width: it is the DSSL encoder at the variant's own width.
+    folder = f"{kind}_d{model_cfg['output_dims']}" if kind == 'supervised' else kind
+    out = base / folder / f"seed_{common['seed']}" / f"fold_{common['fold']['fold']}"
     geometry = dict(input_dims=data['n_sensors'], seq_len=data['seq_len'],
                     bins_per_day=data['bins_per_day'], device=device, model_seed=common['model_seed'])
     if kind == 'cost_reference':
@@ -273,20 +282,47 @@ def cached_reference(kind, base, common, model_cfg, data, steps, device, cached_
     return features, rows, layout
 
 
+def selected_dims(base, prefix, seed, fold):
+    """The output width chosen for one seed x fold by scripts/select_dims.py."""
+    table = pd.read_csv(base / f'{prefix}_selection.csv')
+    row = table[(table.seed == seed) & (table.fold == fold)]
+    if len(row) != 1:
+        raise ValueError(f'no selected width for seed {seed} fold {fold} in {prefix}_selection.csv')
+    return int(row.selected_dims.iloc[0])
+
+
 def main():
     args = parse_args()
     cfg = load_config(args)
     model_cfg = cfg['model']
-    variant = f"{model_cfg['backbone']}_{model_cfg['temporal_encoding']}"
+    # The CoST reference keeps the configuration's own width whatever a variant overrides.
+    reference_cfg = dict(model_cfg)
+    prefix = f"{model_cfg['backbone']}_{model_cfg['temporal_encoding']}"
+    if cfg.get('variant_tag'):
+        prefix += f"_{cfg['variant_tag']}"
+    selection_from = cfg.get('selection_from', prefix)
     base = ROOT / 'results' / args.dataset / (f'{args.run_name}_smoke_{args.device}'
                                               if args.smoke else args.run_name)
+    variant, reuse_encoder = prefix, None
+    if args.output_dims == 'selected':
+        variant = f'{prefix}_selected'
+        if not args.summarize:
+            model_cfg['output_dims'] = selected_dims(base, selection_from, args.seed, args.fold)
+            if selection_from == prefix:
+                # The selected width's encoder was already trained in the sweep; reuse it exactly.
+                reuse_encoder = (base / f"{prefix}_d{model_cfg['output_dims']}" / f'seed_{args.seed}'
+                                 / f'fold_{args.fold}' / 'dssl_training.pt')
+    elif args.output_dims is not None:
+        model_cfg['output_dims'] = int(args.output_dims)
+        variant = f"{prefix}_d{model_cfg['output_dims']}"
     by_year = cfg.get('split') == 'year'
     if by_year and args.dataset != 'globem':
         raise ValueError('split=year needs study years; only GLOBEM has them')
     seeds = [1] if args.smoke else cfg['seeds']
     folds = 2 if args.smoke and not by_year else cfg['folds']
     if args.summarize:
-        summarize(base / variant, seeds, folds, smoke=args.smoke)
+        summarize(base / variant, seeds, folds, smoke=args.smoke,
+                  vary=('output_dims',) if args.output_dims == 'selected' else ())
         return
     if args.seed not in seeds or not 0 <= args.fold < folds:
         raise ValueError('Requested seed/fold is outside the declared matrix')
@@ -393,15 +429,18 @@ def main():
         raise ValueError('--reference/--supervised train one reference; --skip-reference only reuses them')
     if args.reference and args.supervised:
         raise ValueError('train one reference per task: --reference or --supervised')
-    for kind, stage in (('cost_reference', args.reference), ('supervised', args.supervised)):
+    if args.supervised and args.no_supervised:
+        raise ValueError('--supervised and --no-supervised contradict each other')
+    stages = (('cost_reference', args.reference, reference_cfg), ('supervised', args.supervised, model_cfg))
+    for kind, stage, stage_cfg in stages:
         if stage:
-            cached_reference(kind, base, common, model_cfg, data, steps, args.device)
-            print(f'{kind} ready: {base / kind}')
+            cached_reference(kind, base, common, stage_cfg, data, steps, args.device)
+            print(f'{kind} ready: {base}')
             return
-    reference = cached_reference('cost_reference', base, common, model_cfg, data, steps, args.device,
+    reference = cached_reference('cost_reference', base, common, reference_cfg, data, steps, args.device,
                                  cached_only=args.skip_reference)
-    supervised = cached_reference('supervised', base, common, model_cfg, data, steps, args.device,
-                                  cached_only=args.skip_reference)
+    supervised = None if args.no_supervised else cached_reference(
+        'supervised', base, common, model_cfg, data, steps, args.device, cached_only=args.skip_reference)
 
     out = base / variant / f'seed_{args.seed}' / f'fold_{args.fold}'
     out.mkdir(parents=True, exist_ok=True)
@@ -439,16 +478,23 @@ def main():
                                                 fold.test_pids, c.bins_per_day, c.bin_minutes)
     features['cost_reference_adapter'], reference_rows, reference_layout = reference
     rq2_rows.extend(reference_rows)
-    features['supervised'], supervised_rows, supervised_layout = supervised
-    rq2_rows.extend(supervised_rows)
+    if supervised is not None:
+        features['supervised'], supervised_rows, supervised_layout = supervised
+        rq2_rows.extend(supervised_rows)
     features['untrained'] = untrained.encode(X, batch_size=16)
     rows, rq2_status = personalized_records(untrained, 'untrained', X, raw, pids, window_ids,
                                             fold.test_pids, c.bins_per_day, c.bin_minutes)
     rq2_rows.extend(rows)
     # Branch column ranges and circular pairs, per encoder: (DSSL.blocks(), DSSL.pair_block()).
     layouts = {'untrained': (untrained.blocks(), untrained.pair_block()),
-               'cost_reference_adapter': reference_layout, 'supervised': supervised_layout}
+               'cost_reference_adapter': reference_layout}
+    if supervised is not None:
+        layouts['supervised'] = supervised_layout
     del untrained
+    if reuse_encoder is not None and not (out / 'dssl_training.pt').exists():
+        if not reuse_encoder.exists():
+            raise FileNotFoundError(f'selected-width encoder is missing: {reuse_encoder}')
+        shutil.copyfile(reuse_encoder, out / 'dssl_training.pt')
     features['dssl'], rows, layouts['dssl'] = train_encoder(kwargs, 'dssl', out, data, steps)
     rq2_rows.extend(rows)
     pairs = {m: pair for m, (_, pair) in layouts.items() if pair}

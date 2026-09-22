@@ -14,5 +14,11 @@ extra=()
 [ -n "${BACKBONE:-}" ] && extra+=(--backbone "$BACKBONE")
 [ -n "${ENCODING:-}" ] && extra+=(--temporal-encoding "$ENCODING")
 [ -n "${CONFIG:-}" ] && extra+=(--config "$CONFIG")
+[ -n "${OUTPUT_DIMS:-}" ] && extra+=(--output-dims "$OUTPUT_DIMS")
+# SELECT=1: first choose the width per seed x fold from the completed sweep (scripts/select_dims.py).
+if [ -n "${SELECT:-}" ]; then
+    srun python scripts/select_dims.py --dataset "$DATASET" --run-name "${RUN_NAME:?}"
+    exit 0
+fi
 srun python scripts/run_experiment.py --dataset "$DATASET" --summarize \
     --run-name "${RUN_NAME:-narval_v2}" "${extra[@]}"

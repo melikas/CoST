@@ -33,6 +33,9 @@ extra=()
 [ "${STAGE:-variant}" = reference ] && extra+=(--reference)
 [ "${STAGE:-variant}" = supervised ] && extra+=(--supervised)
 [ -n "${CONFIG:-}" ] && extra+=(--config "$CONFIG")
+# OUTPUT_DIMS: an integer (width sweep) or 'selected' (the width chosen per seed x fold).
+[ -n "${OUTPUT_DIMS:-}" ] && extra+=(--output-dims "$OUTPUT_DIMS")
+[ -n "${NO_SUPERVISED:-}" ] && extra+=(--no-supervised)
 # SKIP_REFERENCE: reuse the cached reference instead of retraining it. The rung stays in the
 # ladder; the task just refuses to train a second copy, and errors if the cache is absent. Set it
 # for every variant array submitted after the reference stage has already run for this run name.

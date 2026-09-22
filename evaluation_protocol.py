@@ -246,6 +246,8 @@ def disentanglement(features, layouts, window, pids, window_ids, test_ids, chann
             y = np.asarray(np.stack([window['phase_cos'], window['phase_sin']], -1) if target == 'acrophase'
                            else window[target][..., None], dtype=float)      # windows x channels x 1|2
             for role, names in zip(('own', 'leakage'), roles):
+                # A pooled readout has one seasonal block where the spectral readout has two.
+                names = list(dict.fromkeys(n if n in blocks else 'seasonal' for n in names))
                 lo, hi = blocks[names[0]][0], blocks[names[-1]][1]
                 local = (pair[0] - lo, pair[1]) if pair and lo <= pair[0] < hi else None
                 z = features[method][:, lo:hi].astype(float)             # encode() returns float32
@@ -507,8 +509,12 @@ def paired_interval(diff, rng, n_boot):
                 low=float(np.quantile(boot, .025)), high=float(np.quantile(boot, .975)))
 
 
-def summarize(root, seeds, folds, smoke=False):
-    """Require complete OOF data; paired participant bootstrap, never treat folds as people."""
+def summarize(root, seeds, folds, smoke=False, vary=()):
+    """Require complete OOF data; paired participant bootstrap, never treat folds as people.
+
+    `vary` names model settings allowed to differ between folds: a variant whose width was
+    selected per fold (scripts/select_dims.py) has a different output_dims in each fold, and
+    everything else must still agree."""
     from utils import paired_auc_interval
     from result_report import LADDER, write_report
     import matplotlib
@@ -530,7 +536,9 @@ def summarize(root, seeds, folds, smoke=False):
                                             'code_version','versions']}
             # Legitimately per fold: the model seed and training-fitted normalization moments.
             current['resolved_model'] = {k: v for k, v in current['resolved_model'].items()
-                                         if k != 'model_seed'}
+                                         if k != 'model_seed' and k not in vary}
+            current['config'] = dict(current['config'], model={k: v for k, v in current['config']['model'].items()
+                                                               if k not in vary})
             current['normalization'] = current['normalization']['policy']
             if manifest['smoke'] != smoke:
                 raise ValueError('Cannot mix smoke and scientific results')

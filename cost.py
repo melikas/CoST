@@ -314,9 +314,10 @@ class SupervisedModel(nn.Module):
     non-affine batch normalisation and one linear layer. The loss is class-balanced binary
     cross-entropy: `pos_weight` = negatives / positives of the training windows."""
 
-    def __init__(self, encoder, dim, bins_per_day, harmonics, keep):
+    def __init__(self, encoder, dim, bins_per_day, harmonics, keep, readout="spectral"):
         super().__init__()
         self.encoder, self.bins_per_day, self.harmonics, self.keep = encoder, bins_per_day, harmonics, keep
+        self.readout = readout
         self.norm = nn.BatchNorm1d(dim, affine=False)
         self.head = nn.Linear(dim, 1)
         self.register_buffer("pos_weight", torch.ones(1))
@@ -324,6 +325,9 @@ class SupervisedModel(nn.Module):
 
     def logits(self, x):
         t, s = self.encoder(x)
+        if self.readout == "pooled":        # the representation DSSL.encode returns
+            f = torch.cat([t.max(dim=1).values, s.max(dim=1).values], dim=-1)
+            return self.head(self.norm(f)).squeeze(-1)
         amp, ang = spectral_readout(s, self.bins_per_day, "angle", self.harmonics, self.keep)
         f = torch.cat([t.mean(dim=1), torch.log(amp), torch.cos(ang), torch.sin(ang)], dim=-1)
         return self.head(self.norm(f)).squeeze(-1)
@@ -350,7 +354,7 @@ WEIGHTS = {"paper": O.PAPER, "contracted": O.CONTRACTED}
 # The only settings the CoST reference adapter takes from the experiment configuration: the
 # shared readout, geometry and budget. Everything else is fixed to upstream CoST below.
 REFERENCE_SHARED = ("output_dims", "hidden_dims", "tcn_depth", "harmonics", "seasonal_frac",
-                    "phase_readout", "alpha", "moco_k", "lr", "batch_size", "mask_mode")
+                    "phase_readout", "readout", "alpha", "moco_k", "lr", "batch_size", "mask_mode")
 
 
 class DSSL:
@@ -374,18 +378,24 @@ class DSSL:
                  phase_readout="angle", phase_mode="circular_amp",
                  weights="contracted", alpha=0.005, moco_k=4096,
                  jitter_sigma=0.1, shift_sigma=0.5, smooth_minutes=75.0, lr=5e-4, batch_size=64,
-                 device="cuda", model_seed=None, objective="contrastive"):
+                 device="cuda", model_seed=None, objective="contrastive", readout="spectral",
+                 scale_sigma=0.0):
         if method not in ("dssl", "cost_reference"):
             raise ValueError("method must be dssl or cost_reference")
         if objective not in ("contrastive", "supervised") or (objective == "supervised" and method != "dssl"):
             raise ValueError("objective must be contrastive, or supervised with method='dssl'")
-        self.method, self.objective = method, objective
-        self.scale_sigma = 0.0
+        if readout not in ("spectral", "pooled"):
+            raise ValueError(f"readout must be 'spectral' or 'pooled', got {readout!r}")
+        self.method, self.objective, self.readout = method, objective, readout
+        self.scale_sigma = float(scale_sigma)
         if method == "cost_reference":
             if n_time_features:
                 raise ValueError("the CoST reference adapter is sensor-only")
+            # Upstream CoST (salesforce/CoST train.py and cost.py): one full-spectrum band, trend
+            # kernels 1..128, raw-phase contrast, loss 1 * trend + alpha * (amp + phase) / 2, and
+            # jitter, scaling and shift augmentation, each sigma 0.5 with p 0.5.
             backbone, temporal_encoding, seasonal_bands, band_readout = "tcn", "none", "single", False
-            trend_kernel_cap, phase_mode, weights = max(1, seq_len // 2), "raw", "paper"
+            trend_kernel_cap, phase_mode, weights = 128, "raw", "paper"
             jitter_sigma, shift_sigma, smooth_minutes = 0.5, 0.5, 0.0
             self.scale_sigma = 0.5
         if trend_kernel_cap is None:
@@ -424,9 +434,10 @@ class DSSL:
 
         if objective == "supervised":
             blocks = self.blocks()
-            dim = blocks["trend"][1] + 3 * (blocks["amplitude"][1] - blocks["amplitude"][0])
+            dim = (output_dims if readout == "pooled" else
+                   blocks["trend"][1] + 3 * (blocks["amplitude"][1] - blocks["amplitude"][0]))
             self.cost = SupervisedModel(self.net, dim, bins_per_day, self.net.harmonics,
-                                        self._keep).to(device)
+                                        self._keep, readout).to(device)
         else:
             encoder_k = CoSTEncoder(**enc).to(device)
             self.cost = CoSTModel(
@@ -449,7 +460,7 @@ class DSSL:
                            harmonics=harmonics, trend_kernel_cap=trend_kernel_cap,
                            trend_kernels=self.net.kernels, seasonal_frac=seasonal_frac,
                            band_readout=band_readout, mask_mode=mask_mode,
-                           phase_readout=phase_readout, phase_mode=phase_mode,
+                           readout=readout, phase_readout=phase_readout, phase_mode=phase_mode,
                            weights=weights_name, alpha=alpha,
                            moco_k=moco_k, jitter_sigma=jitter_sigma, shift_sigma=shift_sigma,
                            scale_sigma=self.scale_sigma, smooth_minutes=smooth_minutes,
@@ -556,9 +567,12 @@ class DSSL:
                                 self._keep)
 
     def blocks(self):
-        """Column range (start, stop) of each branch in `encode` output: the trend readout,
-        then the seasonal amplitude block, then the phase block (twice as wide if circular)."""
+        """Column range (start, stop) of each branch in `encode` output. Spectral readout: the
+        trend readout, then the seasonal amplitude block, then the phase block (twice as wide if
+        circular). Pooled readout: the trend branch, then the seasonal branch."""
         t = self.net.trend_dims
+        if self.readout == "pooled":
+            return {"trend": (0, t), "seasonal": (t, t + self.net.seasonal_dims)}
         a = (len(self._keep) if self._keep is not None else
              len(spectral_freqs(self.seq_len, self.bins_per_day, self.net.harmonics)) * self.net.seasonal_dims)
         p = 2 * a if self.phase_readout == "circular" else a
@@ -567,7 +581,7 @@ class DSSL:
     def pair_block(self):
         """(start, width) of the (cos, sin) phase columns in `encode` output, or None when the
         readout emits raw angles. Probes scale this block isotropically."""
-        if self.phase_readout != "circular":
+        if self.readout == "pooled" or self.phase_readout != "circular":
             return None
         start, stop = self.blocks()["phase"]
         return start, (stop - start) // 2
@@ -585,11 +599,22 @@ class DSSL:
 
     @torch.no_grad()
     def encode(self, data, batch_size=256, pool="mean", parts=False):
-        """Frozen representation [trend | amp | phase], one row per window. The trend branch
-        is pooled over time (`pool`); the seasonal branch is read in the frequency domain,
-        because its time mean is exactly zero. With `parts`, also returns each block."""
+        """Frozen representation, one row per window. Spectral readout: [trend | amp | phase],
+        the trend branch pooled over time (`pool`) and the seasonal branch read in the frequency
+        domain, because its time mean is exactly zero. Pooled readout: [V^T | V^S] max-pooled over
+        time, CoST's full-series representation (upstream `_eval_with_pooling`, max_pool1d).
+        With `parts`, also returns each block."""
         self.net.eval()
         X = torch.as_tensor(data, dtype=torch.float)
+        if self.readout == "pooled":
+            outs = {"trend": [], "seasonal": []}
+            for i in range(0, len(X), batch_size):
+                t, s = self.net(X[i:i + batch_size].to(self.device))
+                outs["trend"].append(t.max(dim=1).values.cpu())
+                outs["seasonal"].append(s.max(dim=1).values.cpu())
+            cat = {k: torch.cat(v).numpy() for k, v in outs.items()}
+            full = np.concatenate([cat["trend"], cat["seasonal"]], axis=-1)
+            return {"full": full, **cat} if parts else full
         outs = {"trend": [], "amp": [], "phase": []}
         for i in range(0, len(X), batch_size):
             t, s = self.net(X[i:i + batch_size].to(self.device))
