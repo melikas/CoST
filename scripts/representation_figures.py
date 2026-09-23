@@ -285,19 +285,31 @@ def spectrum(ds, out, bands):
 
 
 def rq2_movement(d, out):
+    # Widths can differ between folds (the width is selected per fold), so distances are computed
+    # inside each fold and only the scalars are pooled.
     rq2 = d["rq2"]
-    parts = np.concatenate([r["rq2_participant"] for r in rq2])
-    get = lambda k: np.concatenate([r[f"rq2_{k}"] for r in rq2])
-    ref, cur, sh, up, dn = get("ref"), get("current"), get("shifted"), get("scaled_up"), get("scaled_down")
     hours, alpha = rq2[0]["rq2_shift_hours"], rq2[0]["rq2_alpha"]
-    mu, sd = ref.mean(1), ref.std(1, ddof=1) + 1e-6
-    dist = lambda v: np.sqrt((((v - mu[:, None]) / sd[:, None]) ** 2).mean(-1))
-    base = np.sqrt((((cur - mu) / sd) ** 2).mean(-1))
-    # Example: fixed rule, the participant with the most exported windows (ties: first by id).
-    counts = d["windows"].groupby("participant").size().reindex(parts).fillna(0)
-    ex = int(np.argmax(counts.to_numpy()))
-    pts = np.vstack([ref[ex], cur[ex][None], sh[ex], up[ex], dn[ex]])
-    z = (pts - mu[ex]) / sd[ex]
+    parts, dist_sh, dist_up, dist_dn, base, example = [], [], [], [], [], None
+    for r in rq2:
+        ref, cur = r["rq2_ref"], r["rq2_current"]
+        mu, sd = ref.mean(1), ref.std(1, ddof=1) + 1e-6
+        dist = lambda v: np.sqrt((((v - mu[:, None]) / sd[:, None]) ** 2).mean(-1))
+        parts.append(r["rq2_participant"])
+        dist_sh.append(dist(r["rq2_shifted"]))
+        dist_up.append(dist(r["rq2_scaled_up"]))
+        dist_dn.append(dist(r["rq2_scaled_down"]))
+        base.append(np.sqrt((((cur - mu) / sd) ** 2).mean(-1)))
+        counts = d["windows"].groupby("participant").size().reindex(r["rq2_participant"]).fillna(0).to_numpy()
+        if example is None or counts.max() > example[0]:
+            i = int(np.argmax(counts))
+            example = (counts.max(), np.vstack([ref[i], cur[i][None], r["rq2_shifted"][i],
+                                                r["rq2_scaled_up"][i], r["rq2_scaled_down"][i]]),
+                       mu[i], sd[i])
+    parts = np.concatenate(parts)
+    sh, up, dn = np.vstack(dist_sh), np.vstack(dist_up), np.vstack(dist_dn)
+    base = np.concatenate(base)
+    _, pts, mu_ex, sd_ex = example
+    z = (pts - mu_ex) / sd_ex
     z = z - z[4]                                    # everything relative to the unperturbed week
     # Axes: the direction the largest shift moves the week, and the part of the largest
     # amplification orthogonal to it. Both in units of the participant's own week-to-week SD.
@@ -330,8 +342,8 @@ def rq2_movement(d, out):
               handlelength=1.4, columnspacing=0.9)
     recessive_grid(ax, "both")
     for ax, (vals, xs, xlabel, title, colour) in zip(axes[1:], (
-            (dist(sh), hours, "Shift (hours)", "b  Timing change", BLUE),
-            (np.stack([dist(up), dist(dn)]), alpha, r"Strength change $\alpha$", "c  Strength change", AQUA))):
+            (sh, hours, "Shift (hours)", "b  Timing change", BLUE),
+            (np.stack([up, dn]), alpha, r"Strength change $\alpha$", "c  Strength change", AQUA))):
         if vals.ndim == 3:
             for v, style, lab in ((vals[0], "-", r"$1+\alpha$"), (vals[1], (0, (3, 2)), r"$1-\alpha$")):
                 m, lo, hi = mean_band(v - base[:, None])

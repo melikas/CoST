@@ -180,13 +180,28 @@ def pretext_split(training, val_frac, model_seed):
     return pre[perm[n_val:]], pre[perm[:n_val]]
 
 
-def train_encoder(kwargs, label, out, data, steps):
+def train_encoder(kwargs, label, out, data, steps, pretrained=None):
     """Fit (resuming from the checkpoint), encode every window, collect RQ2 records, save and
     re-load the encoder to check the saved weights reproduce the representation. A supervised
     control trains on the labelled training participants' windows only and also saves its
-    head's held-out participant probabilities."""
+    head's held-out participant probabilities.
+
+    `pretrained` reads an encoder trained elsewhere instead of training one. A readout is applied
+    when a representation is read and never during training (models/losses.py normalises
+    independently of it), so the same weights can be read with another readout; DSSL.load refuses
+    weights that differ in anything else."""
     X, fit_idx, val_idx = data['X'], data['fit_idx'], data['val_idx']
     model = DSSL(**kwargs)
+    if pretrained is not None:
+        model.load(pretrained)
+        if model.n_iters != steps:
+            raise ValueError(f'{pretrained} stopped at {model.n_iters} of {steps} updates')
+        features = model.encode(X, batch_size=16)
+        rows, _ = personalized_records(model, label, X, data['raw'], data['pids'], data['window_ids'],
+                                       data['test_ids'], data['bins_per_day'], data['bin_minutes'])
+        write_json(out / f'{label}_model.json', dict(config=model.config, reused=str(pretrained),
+                   parameters=sum(p.numel() for p in model.net.parameters())))
+        return features, rows, (model.blocks(), model.pair_block())
     checkpoint = out / f'{label}_training.pt'
     if checkpoint.exists():
         model.load_training(checkpoint)
@@ -222,7 +237,8 @@ def train_encoder(kwargs, label, out, data, steps):
 REFERENCES = {'cost_reference': 'cost_reference_adapter', 'supervised': 'supervised'}
 
 
-def cached_reference(kind, base, common, model_cfg, data, steps, device, cached_only=False):
+def cached_reference(kind, base, common, model_cfg, data, steps, device, cached_only=False,
+                     tag='', pretrained=None):
     """A reference encoder for this seed x fold: loaded when a matching complete copy exists,
     otherwise trained here under an exclusive lock and cached for every variant.
 
@@ -235,8 +251,11 @@ def cached_reference(kind, base, common, model_cfg, data, steps, device, cached_
     instead of racing to retrain it, and a missing cache is an error rather than a silently
     shorter baseline ladder."""
     label = REFERENCES[kind]
-    # One supervised control per width: it is the DSSL encoder at the variant's own width.
+    # One supervised control per width: it is the DSSL encoder at the variant's own width. A
+    # variant tag keeps caches of different readouts or objectives apart.
     folder = f"{kind}_d{model_cfg['output_dims']}" if kind == 'supervised' else kind
+    if tag:
+        folder = f'{kind}_{tag}' + folder[len(kind):]
     out = base / folder / f"seed_{common['seed']}" / f"fold_{common['fold']['fold']}"
     geometry = dict(input_dims=data['n_sensors'], seq_len=data['seq_len'],
                     bins_per_day=data['bins_per_day'], device=device, model_seed=common['model_seed'])
@@ -262,6 +281,8 @@ def cached_reference(kind, base, common, model_cfg, data, steps, device, cached_
         raise FileNotFoundError(
             f'--skip-reference requires the cached {kind}, which is missing: {out}. '
             f'Run its stage for this run name first.')
+    if pretrained is not None and not Path(pretrained).exists():
+        raise FileNotFoundError(f'{kind} reuses weights that are missing: {pretrained}')
     out.mkdir(parents=True, exist_ok=True)
     lock = out / '.lock'
     try:
@@ -275,7 +296,7 @@ def cached_reference(kind, base, common, model_cfg, data, steps, device, cached_
         if (out / 'manifest.json').exists() and json.loads((out / 'manifest.json').read_text()) != manifest:
             raise ValueError(f'existing {kind} manifest differs; use a new run name: {out}')
         write_json(out / 'manifest.json', manifest)
-        features, rows, layout = train_encoder(kwargs, label, out, data, steps)
+        features, rows, layout = train_encoder(kwargs, label, out, data, steps, pretrained=pretrained)
         np.savez_compressed(out / 'representations.npz', pids=data['pids'],
                             window_ids=data['window_ids'], **{label: features})
         pd.DataFrame(rows, columns=RQ2_COLUMNS).to_csv(out / 'rq2_personalized.csv', index=False)
@@ -313,6 +334,8 @@ def main():
     base = ROOT / 'results' / args.dataset / (f'{args.run_name}_smoke_{args.device}'
                                               if args.smoke else args.run_name)
     variant, reuse_encoder = prefix, None
+    reuse = cfg.get('reuse_weights', {})     # method -> variant directory holding trained weights
+    tag = cfg.get('variant_tag', '')
     if args.output_dims == 'selected':
         variant = f'{prefix}_selected'
         if not args.summarize:
@@ -440,10 +463,17 @@ def main():
         raise ValueError('train one reference per task: --reference or --supervised')
     if args.supervised and args.no_supervised:
         raise ValueError('--supervised and --no-supervised contradict each other')
+    def weights_of(label, folder):
+        """Trained weights this variant reuses instead of training its own, if the config says so."""
+        if label not in reuse:
+            return None
+        return base / reuse[label] / f'seed_{args.seed}' / f'fold_{args.fold}' / f'{folder}_encoder.pt'
+
     stages = (('cost_reference', args.reference, reference_cfg), ('supervised', args.supervised, model_cfg))
     for kind, stage, stage_cfg in stages:
         if stage:
-            cached_reference(kind, base, common, stage_cfg, data, steps, args.device)
+            cached_reference(kind, base, common, stage_cfg, data, steps, args.device, tag=tag,
+                             pretrained=weights_of(REFERENCES[kind], REFERENCES[kind]))
             print(f'{kind} ready: {base}')
             return
     if args.export_dynamics:
@@ -453,7 +483,8 @@ def main():
             raise FileNotFoundError(f'export needs the completed variant: {out}')
         model = DSSL(input_dims=c.n_sensors, seq_len=c.seq_len, bins_per_day=c.bins_per_day,
                      method='dssl', device=args.device, model_seed=model_seed, **model_cfg)
-        model.load(out / 'dssl_encoder.pt')
+        # A variant that reuses weights keeps none of its own; read them where they were trained.
+        model.load(weights_of('dssl', 'dssl') or out / 'dssl_encoder.pt')
         step = next(i for i, name in enumerate(c.sensor_cols) if 'step' in name.lower())
         dyn = export_dynamics(model, X, pids, window_ids, fold.train_pids, fold.test_pids,
                               c.bins_per_day, c.bin_minutes, step)
@@ -461,9 +492,11 @@ def main():
         print(f'Exported: {out / "dynamics.npz"}')
         return
     reference = cached_reference('cost_reference', base, common, reference_cfg, data, steps, args.device,
-                                 cached_only=args.skip_reference)
+                                 cached_only=args.skip_reference, tag=tag,
+                                 pretrained=weights_of('cost_reference_adapter', 'cost_reference_adapter'))
     supervised = None if args.no_supervised else cached_reference(
-        'supervised', base, common, model_cfg, data, steps, args.device, cached_only=args.skip_reference)
+        'supervised', base, common, model_cfg, data, steps, args.device, cached_only=args.skip_reference,
+        tag=tag, pretrained=weights_of('supervised', 'supervised'))
 
     out = base / variant / f'seed_{args.seed}' / f'fold_{args.fold}'
     out.mkdir(parents=True, exist_ok=True)
@@ -471,6 +504,7 @@ def main():
                   method='dssl', device=args.device, model_seed=model_seed, **model_cfg)
     untrained = DSSL(**kwargs)
     manifest = dict(common, variant=variant, skip_reference=args.skip_reference, config=cfg,
+                    reuse_weights=reuse,
                     resolved_model=untrained.config,
                     # Derived from the geometry, not part of the model's identity: how much of
                     # this run's own seasonal readout the band structure can actually support.
@@ -518,7 +552,8 @@ def main():
         if not reuse_encoder.exists():
             raise FileNotFoundError(f'selected-width encoder is missing: {reuse_encoder}')
         shutil.copyfile(reuse_encoder, out / 'dssl_training.pt')
-    features['dssl'], rows, layouts['dssl'] = train_encoder(kwargs, 'dssl', out, data, steps)
+    features['dssl'], rows, layouts['dssl'] = train_encoder(kwargs, 'dssl', out, data, steps,
+                                                            pretrained=weights_of('dssl', 'dssl'))
     rq2_rows.extend(rows)
     pairs = {m: pair for m, (_, pair) in layouts.items() if pair}
     np.savez_compressed(out / 'representations.npz', pids=pids, window_ids=window_ids,

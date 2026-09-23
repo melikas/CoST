@@ -643,10 +643,23 @@ class DSSL:
                     "phase_readout_at_construction": self.phase_readout,
                     "config": self.config}, path)
 
+    #: Settings that do not belong to the weights: the readout is applied when a representation is
+    #: read, never during training, and the seed only chose the initialisation these weights replace.
+    #: Everything else must match, or the checkpoint is a different model.
+    READOUT_ONLY = ("readout", "phase_readout", "band_readout", "model_seed")
+
     def load(self, path):
-        """Load weights. The caller's `phase_readout` is kept: the readout is chosen at
-        encode time and never comes from the checkpoint."""
+        """Load weights. The caller's readout is kept: the readout is chosen at encode time and
+        never comes from the checkpoint. Any other difference in configuration is an error,
+        because it would mean these weights belong to a different model."""
         ck = torch.load(path, map_location=self.device, weights_only=True)
+        saved = ck.get("config", {})
+        if saved:
+            strip = lambda c: {k: v for k, v in c.items() if k not in self.READOUT_ONLY}
+            if strip(saved) != strip(self.config):
+                differs = {k for k in set(saved) | set(self.config)
+                           if k not in self.READOUT_ONLY and saved.get(k) != self.config.get(k)}
+                raise ValueError(f"checkpoint is a different model; differs in {sorted(differs)}")
         self.net.load_state_dict(ck["net"])
         self.n_iters = ck.get("n_iters", 0)
         return self

@@ -207,6 +207,26 @@ change.
 **Primary result:** `tcn_none_selected`. Criteria and metrics are unchanged. narval_v2 and loyo_v1
 remain as reported results of the previous model.
 
+## Readout re-read amendment, 2026-09-22 (after the v3 results; fixed before the re-read)
+
+**Finding that prompts it.** With the pooled readout (max over time of [V^T | V^S]), RQ2's timing arm
+is at chance (0.510 against 0.759 for the previous model) while its strength arm is the best measured
+so far (0.752). Max over time keeps how much and discards when, so the pooled representation cannot
+carry phase. This is a property of the readout, not of training.
+
+**What is re-read.** The objective never uses the readout (models/losses.py normalises
+independently), so the v3 encoders are read again with the amplitude/phase readout and nothing is
+retrained: `configs/{hrd,globem_loyo}_v3_spectral.json` differ from the v3 configs in `readout` only
+and name the weights they reuse (`reuse_weights`). DSSL.load accepts weights that differ only in the
+readout and refuses any other difference, including a different width or model seed. The supervised
+control is retrained, because its head reads the representation. Widths stay the ones already chosen
+per fold; the new variant is `tcn_none_spec_selected` inside the same run.
+
+**How the readout will be decided.** The comparison between the pooled and the amplitude/phase
+readout is made on RQ1 and RQ2, which use no labels, never on RQ3. Both readouts are reported. If the
+re-read restores RQ2 timing, that is evidence about the readout, not a new model: the encoder,
+objective, data and splits are identical.
+
 ## Preservation
 
 Before repairs, 80 current source/manuscript/note files and the root staged/unstaged patches were preserved in `archive/rescue_20260914/before_repairs.zip`; `manifest.json` records source hashes. Raw datasets, historical result directories, caches and checkpoints remain intact. Git retains the reference and older model implementations.

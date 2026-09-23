@@ -1,0 +1,55 @@
+{
+  "cache": "datasets/cache/globem_rescue_v1.npz",
+  "cohort_policy": "leave-one-year-out over all four cohorts; the held-out year, unlabelled records included, never enters training; identifiers are participant-years without cross-year person linkage",
+  "split": "year",
+  "seeds": [
+    1,
+    2,
+    3
+  ],
+  "folds": 4,
+  "split_seed": 20260914,
+  "steps": 6000,
+  "val_frac": 0.1,
+  "normalization": "within_person",
+  "marker_coverage": 0.7,
+  "model": {
+    "backbone": "tcn",
+    "temporal_encoding": "none",
+    "tcn_depth": null,
+    "n_layers": 4,
+    "n_heads": 4,
+    "bidirectional": true,
+    "output_dims": 320,
+    "hidden_dims": 64,
+    "seasonal_frac": 0.5,
+    "seasonal_bands": "harmonics",
+    "harmonics": 4,
+    "trend_kernel_cap": 64,
+    "readout": "spectral",
+    "phase_readout": "angle",
+    "phase_mode": "raw",
+    "weights": "paper",
+    "alpha": 0.0005,
+    "moco_k": 4096,
+    "jitter_sigma": 0.5,
+    "shift_sigma": 0.5,
+    "scale_sigma": 0.5,
+    "smooth_minutes": 0.0,
+    "lr": 0.0005,
+    "batch_size": 64
+  },
+  "dims_sweep": [
+    32,
+    64,
+    128,
+    320
+  ],
+  "model_policy": "re-read of globem_loyo_v3: the same trained encoders, read with the amplitude/phase readout instead of the pooled one",
+  "variant_tag": "spec",
+  "selection_from": "tcn_none",
+  "reuse_weights": {
+    "dssl": "tcn_none_selected",
+    "cost_reference_adapter": "cost_reference"
+  }
+}

@@ -138,6 +138,36 @@ class CoSTBandsModel(unittest.TestCase):
             full = DSSL(C, T, b, device="cpu", **config(name + "_fullband")["model"]).config
             self.assertEqual(full["bands"], [[0, T // 2 + 1]])               # CoST's single band
 
+    def test_weights_can_be_re_read_with_another_readout_but_not_another_model(self):
+        """The objective never uses the readout, so a trained encoder may be re-read with a
+        different one; any other difference means the weights belong to another model."""
+        with tempfile.TemporaryDirectory() as d:
+            path = Path(d) / "encoder.pt"
+            trained = DSSL(2, 28, 4, model_seed=7, readout="pooled", **TINY)
+            trained.save(path)
+            other = DSSL(2, 28, 4, model_seed=7, readout="spectral", **TINY)
+            other.load(path)                                   # allowed: only the readout differs
+            for a, b in zip(trained.net.parameters(), other.net.parameters()):
+                self.assertTrue(torch.equal(a, b))
+            x = np.random.default_rng(0).normal(size=(2, 28, 2)).astype(np.float32)
+            self.assertEqual(other.encode(x).shape[1], sum(hi - lo for lo, hi in other.blocks().values()))
+            with self.assertRaises(ValueError):                # different width: refused
+                DSSL(2, 28, 4, model_seed=7, readout="spectral", **{**TINY, "output_dims": 16}).load(path)
+            # The seed only chose the initialisation that loading replaces, so it does not block.
+            DSSL(2, 28, 4, model_seed=11, readout="spectral", **TINY).load(path)
+            with self.assertRaises(ValueError):                # different objective: refused
+                DSSL(2, 28, 4, model_seed=7, readout="spectral", objective="supervised", **TINY).load(path)
+
+    def test_spectral_configs_reuse_the_v3_encoders_and_change_only_the_readout(self):
+        for name in ("hrd_v3", "globem_loyo_v3"):
+            base, spec = config(name), config(name + "_spectral")
+            self.assertEqual({k for k in base["model"] if base["model"][k] != spec["model"][k]},
+                             {"readout"})
+            self.assertEqual(spec["model"]["readout"], "spectral")
+            self.assertEqual(spec["reuse_weights"],
+                             {"dssl": "tcn_none_selected", "cost_reference_adapter": "cost_reference"})
+            self.assertEqual((spec["variant_tag"], spec["selection_from"]), ("spec", "tcn_none"))
+
     def test_pooled_representation_is_max_over_time_of_trend_and_seasonal(self):
         m = DSSL(2, 28, 4, model_seed=1, readout="pooled", **TINY)
         x = np.random.default_rng(0).normal(size=(3, 28, 2)).astype(np.float32)
